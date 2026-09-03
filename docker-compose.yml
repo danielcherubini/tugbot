@@ -1,0 +1,22 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres
+    ports:
+      - 5432:5432
+    volumes:
+      # A bind mount at /var/lib/postgresql/data (as in the Rust repo's
+      # compose) is rejected by postgres >= 18's entrypoint. A named volume
+      # is the supported layout. Swap to a host bind at /var/lib/postgresql
+      # (not .../data) if persistence outside Docker is required.
+      - pgdata:/var/lib/postgresql
+    environment:
+      # The selftest / documented URL is postgres:postgres@localhost:5432/tugbot
+      # (see `make selftest` and the --selftest flag help text).
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=tugbot
+
+volumes:
+  pgdata:

@@ -1,0 +1,13 @@
+# The built Go binary (the name produced by `make build`)
+/tugbot
+
+# Vendored dependencies
+/vendor/
+
+# Local environment (real tokens / credentials)
+.env
+
+# Test artifacts
+/test-artifacts/
+*.test
+coverage.out

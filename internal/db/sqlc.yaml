@@ -1,0 +1,19 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema:
+      - ../../migrations/000001_baseline.up.sql
+    queries:
+      - queries/*.sql
+    gen:
+      go:
+        package: db
+        sql_package: pgx/v5
+        out: .
+        emit_prepared_queries: false
+        emit_interface: false
+        overrides:
+          - db_type: timestamp
+            go_type: '"time".Time'
+          - db_type: timestamptz
+            go_type: '"time".Time'

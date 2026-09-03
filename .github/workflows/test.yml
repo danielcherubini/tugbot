@@ -1,0 +1,39 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: vet, lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+
+      - name: run tests
+        run: go test ./...
+
+      - name: build (Linux)
+        run: go build -o tugbot ./cmd/tugbot
+
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tugbot-linux
+          path: tugbot

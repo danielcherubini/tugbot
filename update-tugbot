@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# Tugbot Discord Bot - Update Script
+# Pulls latest from GitHub, migrates, rebuilds, and restarts the Go
+# service. Mirror of the Rust repo's scripts/update.sh (diesel
+# migration run → `go run ./cmd/migrate`, cargo install →
+# `go build -o /opt/tugbot/tugbot`).
+
+set -e
+
+INSTALL_DIR="/opt/tugbot"
+SERVICE_NAME="tugbot-go"
+
+echo "Updating Tugbot Discord Bot..."
+
+if [[ ! -d "$INSTALL_DIR" ]]; then
+  echo "Error: $INSTALL_DIR not found. Run install-tugbot first."
+  exit 1
+fi
+
+cd "$INSTALL_DIR"
+
+export PATH="/usr/local/go/bin:$PATH"
+
+echo "[1/4] Pulling latest changes..."
+git fetch --all
+git reset --hard origin/main
+
+echo "[2/4] Running database migrations..."
+go run ./cmd/migrate
+
+echo "[3/4] Building and installing the updated binary..."
+go build -o "$INSTALL_DIR/tugbot" ./cmd/tugbot
+
+echo "[4/4] Restarting service..."
+systemctl restart "${SERVICE_NAME}.service"
+
+echo ""
+echo "Done! Bot updated."
+systemctl status "${SERVICE_NAME}.service" --no-pager

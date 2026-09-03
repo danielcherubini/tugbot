@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# Tugbot Discord Bot - Install Script
+# Run this AFTER cloning the repo.
+#
+# Usage:
+#   git clone git@github.com:seanpxc/tugbot.git /opt/tugbot
+#   bash /opt/tugbot/scripts/install-tugbot   # or: bash /opt/tugbot/install-tugbot
+#
+
+set -e
+
+INSTALL_DIR="/opt/tugbot"
+SERVICE_NAME="tugbot-go"
+
+echo "==================================="
+echo " Tugbot Discord Bot Installer"
+echo "==================================="
+echo ""
+
+# Check root
+if [[ $EUID -ne 0 ]]; then
+  echo "Error: Run as root"
+  exit 1
+fi
+
+# Check repo exists
+if [[ ! -d "$INSTALL_DIR/.git" ]]; then
+  echo "Error: Repo not found at $INSTALL_DIR"
+  echo ""
+  echo "Clone first:"
+  echo "  git clone git@github.com:seanpxc/tugbot.git $INSTALL_DIR"
+  exit 1
+fi
+
+cd "$INSTALL_DIR"
+
+# Install dependencies
+echo "[1/6] Installing system dependencies..."
+apt-get update -qq
+apt-get install -y -qq curl git ca-certificates gnupg libpq-dev pkg-config
+
+# Install the Go toolchain
+echo "[2/6] Installing Go toolchain..."
+if ! command -v go &>/dev/null; then
+  GO_VERSION=1.22.5
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  tar -C /usr/local -xzf /tmp/go.tgz
+  rm /tmp/go.tgz
+fi
+export PATH="/usr/local/go/bin:$PATH"
+echo "       Go $(go version | awk '{print $3}') installed"
+
+# Check for the .env file
+echo "[3/6] Checking environment configuration..."
+if [[ ! -f "$INSTALL_DIR/.env" ]]; then
+  echo "Error: .env file not found!"
+  echo ""
+  echo "Create $INSTALL_DIR/.env with:"
+  echo "  DISCORD_TOKEN=your_token_here"
+  echo "  APPLICATION_ID=your_app_id_here"
+  echo "  DATABASE_URL=postgres://user:pass@host/database"
+  exit 1
+fi
+echo "       .env file found"
+
+# Run migrations
+echo "[4/6] Running database migrations..."
+go run ./cmd/migrate
+
+# Build and install the tugbot binary
+echo "[5/6] Building the tugbot binary..."
+go build -o "$INSTALL_DIR/tugbot" ./cmd/tugbot
+echo "       Binary installed to: $INSTALL_DIR/tugbot"
+
+# Install the systemd service
+echo "[6/6] Installing systemd service..."
+cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
+[Unit]
+Description=Tugbot Service (Go port)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/tugbot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start the service
+systemctl daemon-reload
+systemctl enable ${SERVICE_NAME}.service
+systemctl start ${SERVICE_NAME}.service
+
+# Create symlink for easy updates (mirrors the Rust install.sh step 7)
+echo "       Creating update command symlink..."
+ln -sf "$INSTALL_DIR/update-tugbot" /usr/local/bin/update-tugbot
+chmod +x "$INSTALL_DIR/update-tugbot"
+echo "       update-tugbot command installed"
+
+echo ""
+echo "==================================="
+echo " Installation complete!"
+echo "==================================="
+echo ""
+echo " Status:  systemctl status tugbot-go"
+echo " Logs:    journalctl -u tugbot-go -f"
+echo " Stop:    systemctl stop tugbot-go"
+echo " Start:   systemctl start tugbot-go"
+echo " Update:  update-tugbot"
+echo ""
