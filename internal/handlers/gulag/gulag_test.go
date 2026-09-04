@@ -711,7 +711,7 @@ func TestHandleGulagOptionValueShapes(t *testing.T) {
 	pool := gatePool(t)
 	g := newGulag(&discordgo.Session{}, pool)
 	g.discordSurface = &fakeGulagSurface{
-		roles:  []*discordgo.Role{{ID: "900", Name: "admin"}, {ID: "777", Name: "gulag"}},
+		roles: []*discordgo.Role{{ID: "900", Name: "admin"}, {ID: "777", Name: "gulag"}},
 		// invokerMember hands back this fetched member — it must
 		// carry the admin role or the role gate rejects before the
 		// options are ever parsed.
@@ -723,8 +723,8 @@ func TestHandleGulagOptionValueShapes(t *testing.T) {
 	i.Member = &discordgo.Member{User: &discordgo.User{ID: "5"}, Roles: []string{"900"}}
 	data := i.Data.(discordgo.ApplicationCommandInteractionData)
 	data.Options = []*discordgo.ApplicationCommandInteractionDataOption{
-		{Name: "user", Value: "899"},        // snowflake string
-		{Name: "reason", Value: "be kind"}, // string option
+		{Name: "user", Value: "899"},         // snowflake string
+		{Name: "reason", Value: "be kind"},   // string option
 		{Name: "length", Value: float64(60)}, // JSON number
 	}
 	i.Data = data
