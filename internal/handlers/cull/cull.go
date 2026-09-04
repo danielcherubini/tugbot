@@ -274,7 +274,7 @@ func cullStartedResponse(total int) string {
 
 // commandOption finds an option by name (Rust's `options.iter().find`).
 func commandOption(i *discordgo.Interaction, name string) *discordgo.ApplicationCommandInteractionDataOption {
-	data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData)
+	data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
 	if !ok {
 		return nil
 	}

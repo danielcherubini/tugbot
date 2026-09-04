@@ -151,6 +151,25 @@ func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	}
 }
 
+// TestDiscordgoToken pins the Rust->discordgo token-contract
+// adaptation: the .env holds the RAW token (discord-rs convention),
+// discordgo needs the "Bot " prefix in the Authorization header, and an
+// already-prefixed value must not be double-prefixed.
+func TestDiscordgoToken(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"rawtoken.part.1", "Bot rawtoken.part.1"},
+		{"Bot rawtoken.part.1", "Bot rawtoken.part.1"},
+	}
+	for _, tt := range tests {
+		if got := discordgoToken(tt.in); got != tt.want {
+			t.Errorf("discordgoToken(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestSelftestBoundedPoolStart locks the I5 contract at the selftest
 // site: with the compose PG unreachable, runSelftest must FAIL FAST on
 // the 30s pool deadline — the unbounded context.Background() version

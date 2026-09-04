@@ -69,7 +69,7 @@ func (h *Feat) SetupCommand() *discordgo.ApplicationCommand {
 func (h *Feat) HandleInteraction(i *discordgo.Interaction) Response {
 	ctx := context.Background()
 	var firstOpt *discordgo.ApplicationCommandInteractionDataOption
-	if data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); ok && len(data.Options) > 0 {
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok && len(data.Options) > 0 {
 		firstOpt = data.Options[0]
 	}
 

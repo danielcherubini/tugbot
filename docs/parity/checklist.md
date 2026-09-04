@@ -1,5 +1,10 @@
 # tugbot Go port — behavior parity checklist
 
+## interaction dispatch (main wiring)
+- [ ] `InteractionCreate` guard: `Type == 2` (application command) + `Data != nil`; **discordgo v0.29.0 stores `Interaction.Data` as a VALUE** (`UnmarshalJSON` does `i.Data = v`) — the assertion must be the value form `i.Data.(discordgo.ApplicationCommandInteractionData)`; the pointer form `(*...)` ALWAYS fails and silently drops every command ("The application did not respond", zero bot logs — proven live at cutover)
+- [ ] dispatch by `Data.Name` in the pinned Rust order; one goroutine per interaction (handler arms do REST)
+- [ ] `command received` INFO log per application command (name + guild) — a Go-side observability addition; Rust mod.rs was SILENT at `interaction_create`, do not revert it as a parity deviation
+
 ## teh
 - [ ] gated on the `teh` feature flag via silent `IsEnabled` (Rust `Features::is_enabled`, false on DB error) (src: teh.rs:12)
 - [ ] trigger = message content lowercased contains the substring "teh" (no regex, no word boundary) (src: teh.rs:12)

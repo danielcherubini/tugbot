@@ -90,7 +90,7 @@ func (h *PrefixHandler) SetupCommand(name, description string) *discordgo.Applic
 func (h *PrefixHandler) HandleInteraction(i *discordgo.Interaction) Response {
 	ctx := context.Background()
 	var name string
-	if data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); ok {
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok {
 		name = data.Name
 	}
 	prefix := FeatureKey(name)

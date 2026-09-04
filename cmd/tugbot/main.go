@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,6 +78,22 @@ func botIntents() discordgo.Intent {
 		discordgo.IntentGuildMessageReactions |
 		discordgo.IntentGuildMessagePolls |
 		discordgo.IntentGuildPresences
+}
+
+// discordgoToken adapts the .env DISCORD_TOKEN to discordgo's contract.
+// The Rust bot stores the RAW token (discord-rs builds
+// "Authorization: Bot <token>" itself); discordgo instead uses the
+// session token VERBATIM in the Authorization header, so it expects the
+// "Bot " prefix already present. Both bots share the same .env
+// convention (cutover runbook: one app, one server), so the raw token
+// is prefixed here instead of editing .env (a prefixed .env would
+// break the Rust rollback binary). A token that already carries the
+// prefix passes through unchanged.
+func discordgoToken(token string) string {
+	if !strings.HasPrefix(token, "Bot ") {
+		return "Bot " + token
+	}
+	return token
 }
 
 // handlers is the fully-wired handler set, constructed exactly once per
@@ -244,7 +261,7 @@ func runSelftest() int {
 	defer pool.Close()
 	slog.Info("selftest: database pool connected", "module", "main")
 
-	d, err := discordgo.New(cfg.Token)
+	d, err := discordgo.New(discordgoToken(cfg.Token))
 	if err != nil {
 		slog.Error("Failed to create Discord session", "module", "main", "error", err)
 		return 1
@@ -274,16 +291,18 @@ func (h *handlers) guildSetup() []error {
 	if h.guildSetupFu != nil {
 		return h.guildSetupFu()
 	}
-	return h.gulag.SetupCommand(h.app.D)
+	return h.gulag.SetupCommand(h.app.D, h.app.Cfg.ApplicationID)
 }
 
 // applyShape runs one non-gulag shape registration: the injected seam
-// when set, else the concrete ApplicationCommandCreate.
+// when set, else the concrete ApplicationCommandCreate with
+// CONFIG's APPLICATION_ID (an empty app id would 404 on
+// /applications//guilds/<id>/commands).
 func (h *handlers) applyShape(gid string, cmd *discordgo.ApplicationCommand) error {
 	if h.applyShapeFu != nil {
 		return h.applyShapeFu(gid, cmd.Name)
 	}
-	_, err := h.app.D.ApplicationCommandCreate("", gid, cmd)
+	_, err := h.app.D.ApplicationCommandCreate(h.app.Cfg.ApplicationID, gid, cmd)
 	return err
 }
 
@@ -324,7 +343,7 @@ func run() {
 	}
 
 	// 4. The Discord session with exactly the six privileged() intents.
-	d, derr := discordgo.New(cfg.Token)
+	d, derr := discordgo.New(discordgoToken(cfg.Token))
 	if derr != nil {
 		slog.Error("Failed to create Discord session", "module", "main", "error", derr)
 		os.Exit(1)
@@ -388,9 +407,14 @@ func run() {
 			return
 		}
 		// The Rust Command arm only matches application-command data.
-		if _, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); !ok {
+		data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
+		if !ok {
 			return
 		}
+		// LOG ENGAGEMENT: one line per command so an un-responded
+		// interaction is visible in journalctl (the Rust bot was silent
+		// here; this is a Go-side observability addition).
+		slog.Info("command received", "module", "main", "name", data.Name, "guild", i.GuildID)
 		go func() {
 			h.respond(i, h.dispatchCommand(i))
 		}()
@@ -477,7 +501,7 @@ type reply struct {
 // Implemented" WITHOUT a defer (Rust defer_response: None).
 func (h *handlers) dispatchCommand(i *discordgo.Interaction) reply {
 	name := ""
-	if data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); ok {
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok {
 		name = data.Name
 	}
 	switch name {

@@ -111,10 +111,11 @@ func (g *Gulag) commandShapes() []*discordgo.ApplicationCommand {
 // SetupCommand mirrors Rust ready(): registers exactly these four
 // shapes onto every configured guild from the servers table (NOT a
 // hardcoded guild list — matching `for server in servers {
-// server.guild_id.set_commands(&ctx.http, vec![...]) }`). A
-// registration failure is collected, not fatal: one missing guild does
-// not skip the others.
-func (g *Gulag) SetupCommand(d *discordgo.Session) []error {
+// server.guild_id.set_commands(&ctx.http, vec![...]) }` — the Rust
+// call implied the app id through http; discordgo requires it
+// explicitly, hence the appID parameter). A registration failure is
+// collected, not fatal: one missing guild does not skip the others.
+func (g *Gulag) SetupCommand(d *discordgo.Session, appID string) []error {
 	ctx := context.Background()
 	var guildIDs []int64
 	if g.pool != nil {
@@ -139,7 +140,7 @@ func (g *Gulag) SetupCommand(d *discordgo.Session) []error {
 	for _, gid := range guildIDs {
 		guildID := strconv.FormatInt(gid, 10)
 		for _, cmd := range g.commandShapes() {
-			if _, err := d.ApplicationCommandCreate("", guildID, cmd); err != nil {
+			if _, err := d.ApplicationCommandCreate(appID, guildID, cmd); err != nil {
 				errs = append(errs, fmt.Errorf("register %q in guild %s: %w", cmd.Name, guildID, err))
 			}
 		}
@@ -173,7 +174,7 @@ func (g *Gulag) HandleCommandCreate(i *discordgo.Interaction) Response {
 // name on an application-command interaction; non-command interactions
 // fall to the default arm).
 func interactionCommandName(i *discordgo.Interaction) string {
-	if data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); ok {
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok {
 		return data.Name
 	}
 	return ""
@@ -181,7 +182,7 @@ func interactionCommandName(i *discordgo.Interaction) string {
 
 // commandOptionByName mirrors Rust's options find by name.
 func commandOptionByName(i *discordgo.Interaction, name string) *discordgo.ApplicationCommandInteractionDataOption {
-	data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData)
+	data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
 	if !ok {
 		return nil
 	}
@@ -195,7 +196,7 @@ func commandOptionByName(i *discordgo.Interaction, name string) *discordgo.Appli
 
 // firstCommandOption mirrors Rust's options.first().
 func firstCommandOption(i *discordgo.Interaction) *discordgo.ApplicationCommandInteractionDataOption {
-	data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData)
+	data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
 	if !ok || len(data.Options) == 0 {
 		return nil
 	}
@@ -489,7 +490,7 @@ func (g *Gulag) handleAddGulagVote(ctx context.Context, i *discordgo.Interaction
 	if !features.IsEnabled(ctx, g.pool, FeatureKey) {
 		return ephemeralResponse("Gulag feature is currently disabled.")
 	}
-	data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData)
+	data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
 	if !ok || data.TargetID == "" {
 		return ephemeralResponse("No target message found.")
 	}

@@ -711,7 +711,7 @@ func TestAddGulagVoteIntegration(t *testing.T) {
 	g := newGulag(&discordgo.Session{}, pool)
 
 	mkInteraction := func(targetID string, resolved map[string]*discordgo.Message, guildID string) *discordgo.Interaction {
-		data := &discordgo.ApplicationCommandInteractionData{Name: "Add Gulag Vote", TargetID: targetID}
+		data := discordgo.ApplicationCommandInteractionData{Name: "Add Gulag Vote", TargetID: targetID}
 		if resolved != nil {
 			data.Resolved = &discordgo.ApplicationCommandInteractionDataResolved{Messages: resolved}
 		}
@@ -784,7 +784,7 @@ func TestSetupCommandRegistersPerServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discordgo.New: %v", err)
 	}
-	errs := g.SetupCommand(sess)
+	errs := g.SetupCommand(sess, "123456789012345678")
 	if len(errs) == 0 {
 		t.Fatal("expected per-guild registration errors from the invalid-token session")
 	}
@@ -799,6 +799,6 @@ func commandInteraction(name string) *discordgo.Interaction {
 	return &discordgo.Interaction{
 		GuildID: "1",
 		Member:  &discordgo.Member{User: &discordgo.User{ID: "1"}},
-		Data:    &discordgo.ApplicationCommandInteractionData{Name: name},
+		Data:    discordgo.ApplicationCommandInteractionData{Name: name},
 	}
 }

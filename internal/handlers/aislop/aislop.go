@@ -158,7 +158,7 @@ func (h *AiSlop) HandleInteraction(i *discordgo.Interaction) Response {
 	// — a HashMap() iteration, so the choice is arbitrary; Go's map
 	// iteration is likewise arbitrary (parity pinned in the checklist).
 	var targetMessage *discordgo.Message
-	if data, ok := i.Data.(*discordgo.ApplicationCommandInteractionData); ok && data.Resolved != nil && len(data.Resolved.Messages) > 0 {
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok && data.Resolved != nil && len(data.Resolved.Messages) > 0 {
 		for _, m := range data.Resolved.Messages {
 			targetMessage = m
 			break
