@@ -430,7 +430,7 @@ func (h *Cull) HandleInteraction(i *discordgo.Interaction) Response {
 	}
 
 	// i. Query inactive users (last_message_at < now − days).
-	inactive, err := st.selectInactiveUserIDs(ctx, parseID(guildID), inactiveCutoff(time.Now(), days))
+	inactive, err := st.selectInactiveUserIDs(ctx, parseID(guildID), inactiveCutoff(time.Now().UTC(), days))
 	if err != nil {
 		postToCatHerd(d, "Error querying inactive users: "+err.Error())
 		return gateResponse("Failed to query inactive users: " + err.Error())
@@ -649,7 +649,7 @@ func (h *Cull) runScanLoop(guildID, username string) {
 	}
 
 	guildIDInt, _ := strconv.ParseInt(guildID, 10, 64)
-	cutoff := scanCutoff(time.Now())
+	cutoff := scanCutoff(time.Now().UTC())
 	var allUserIDs []int64
 	seen := map[int64]bool{}
 	totalMsgCount := 0

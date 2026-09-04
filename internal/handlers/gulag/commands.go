@@ -422,7 +422,7 @@ func (g *Gulag) handleGulagList(ctx context.Context, i *discordgo.Interaction) R
 		return ephemeralResponse("No users currently in the Gulag.")
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	var userlist string
 	for _, guser := range gulagUsers {
 		userID := strconv.FormatInt(guser.UserID, 10)

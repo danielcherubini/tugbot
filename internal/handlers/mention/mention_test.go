@@ -75,7 +75,7 @@ func TestCooldownDecision(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			blocking, remaining := cooldownDecision(tt.lastUse, tt.limit)
+			blocking, remaining := cooldownDecision(tt.lastUse, now, tt.limit)
 			if blocking != tt.wantBlock {
 				t.Errorf("blocking = %v, want %v", blocking, tt.wantBlock)
 			}

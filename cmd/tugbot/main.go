@@ -64,8 +64,16 @@ func selftestURL() string {
 	if u := os.Getenv("TUGBOT_TEST_SELFTEST_DATABASE_URL"); u != "" {
 		return u
 	}
-	return "postgres://postgres:postgres@localhost:5432/tugbot"
+	return "postgres://postgres:postgres@localhost:5432/tugbot?timezone=UTC"
 }
+
+// interactionAckBudget is the ACK-deadline fallback threshold: Discord
+// requires an acknowledgement (reply or defer) within 3s of the event.
+// Work that outlives this budget (2s, leaving 1s for the defer call
+// itself) first ACKs via a matching defer, then delivers the result as
+// a follow-up — the standard "bot is thinking…" pattern. Fast
+// commands take the plain-reply path unchanged.
+var interactionAckBudget = 2 * time.Second
 
 // botIntents pins exactly the six privileged() intents from config.rs —
 // NOT discordgo's default headless intents (which are missing
@@ -121,6 +129,9 @@ type handlers struct {
 	// checkGuildFu substitutes for the verify-arm d.Guild (Rust's
 	// ctx.http.get_guild).
 	checkGuildFu func(guildID string) (bool, error)
+	// deferAckFu substitutes for the defer-ACK + follow-up message
+	// pair of the ACK-deadline fallback (see finishInteraction).
+	deferAckFu func(ephemeral bool) error
 	// guildSetupFu substitutes for the four-shape
 	// Gulag.SetupCommand(d) registration.
 	guildSetupFu func() []error
@@ -416,7 +427,8 @@ func run() {
 		// here; this is a Go-side observability addition).
 		slog.Info("command received", "module", "main", "name", data.Name, "guild", i.GuildID)
 		go func() {
-			h.respond(i, h.dispatchCommand(i))
+			workStart := time.Now()
+			h.finishInteraction(i, h.dispatchCommand(i), workStart)
 		}()
 	})
 
@@ -475,6 +487,53 @@ func run() {
 	}
 	<-openErr
 	slog.Info("Tugbot stopped", "module", "main")
+}
+
+// finishInteraction applies the ACK-deadline rule (see
+// interactionAckBudget): a defer response (cull's contract) ACKs on
+// its own; a fresh result is sent as the plain reply; a stale result
+// first ACKs via a matching (ephemeral-preserving) defer, then sends
+// the result as a follow-up. Without it the heaviest command (the
+// /gulag-release chain: seven REST round-trips from the prod host ≈
+// 4.4s) outlives the 3s deadline and dies with 10062 "Unknown
+// interaction" (proven live at cutover).
+func (h *handlers) finishInteraction(i *discordgo.Interaction, r reply, workStart time.Time) {
+	if r.deferResp {
+		h.respond(i, r)
+		return
+	}
+	if time.Since(workStart) > interactionAckBudget {
+		slog.Warn("slash command outlived its ACK budget — deferring, then follow-up", "module", "main", "ms", time.Since(workStart).Milliseconds())
+		if h.deferAckFu != nil {
+			if err := h.deferAckFu(r.ephemeral); err != nil {
+				slog.Error("Cannot defer slash command (ACK)", "module", "main", "error", err)
+			}
+			return
+		}
+		ack := &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{},
+		}
+		if r.ephemeral {
+			ack.Data.Flags = discordgo.MessageFlagsEphemeral
+		}
+		if err := h.app.D.InteractionRespond(i, ack); err != nil {
+			slog.Error("Cannot defer slash command (ACK)", "module", "main", "error", err)
+			return
+		}
+		// WebhookParams.Flags may carry MessageFlagsEphemeral ONLY via
+		// this Followup-Message-Create endpoint (the deferred
+		// interaction is what makes the visibility stick).
+		fm := &discordgo.WebhookParams{Content: r.content}
+		if r.ephemeral {
+			fm.Flags = discordgo.MessageFlagsEphemeral
+		}
+		if _, err := h.app.D.FollowupMessageCreate(i, false, fm); err != nil {
+			slog.Error("Cannot follow up slash command", "module", "main", "error", err)
+		}
+		return
+	}
+	h.respond(i, r)
 }
 
 // isContextErr folds the loop-drain arms: a ctx-canceled loop is a

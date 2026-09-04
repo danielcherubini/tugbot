@@ -5,6 +5,11 @@
 - [ ] dispatch by `Data.Name` in the pinned Rust order; one goroutine per interaction (handler arms do REST)
 - [ ] `command received` INFO log per application command (name + guild) — a Go-side observability addition; Rust mod.rs was SILENT at `interaction_create`, do not revert it as a parity deviation
 - [ ] OPTION-VALUE SHAPE (same class as the Data-shape trap above): discordgo decodes `Option.Value` into `interface{}` VERBATIM as Discord delivers it — USER options = the user's snowflake STRING, INTEGER options = JSON numbers (→ `float64`), string options = `string`, bool options = `bool`. Assertions of the form `.(*discordgo.User)` / `.(int)` / `.(int64)` always fail: the `*discordgo.User` case silently made every /gulag invocation fail with "Please provide a valid user" and the `int64` case silently defaulted the length to the 300s default (both proven live at cutover; test-pinned in TestHandleGulagOptionValueShapes)
+- [ ] ACK-DEADLINE FALLBACK: a command whose work finishes > 2s (interactionAckBudget) first ACKs via a defer preserving the ephemeral flag, then sends the result as a follow-up (standard "bot is thinking…"); fresh results take the plain reply path so fast commands keep full Rust parity; a defer response (cull's contract) ACKs on its own and never double-defers. Without the fallback the /gulag-release chain (seven REST round-trips ≈ 4.4s from the prod host) dies with 10062 "Unknown interaction" (proven live at cutover; test-pinned in TestFinishInteractionAckFallback)
+
+## naive-timestamp frame (all timestamp columns)
+- [ ] ALL timestamp columns are `timestamp without time zone`; the frame is the UTC WALL CLOCK (the Rust `SystemTime` frame — diesel/SystemTime converts exactly to the UTC wall, carries no zone). pgx decodes a naive value as UTC-labeled; the DATABASE_URL carries `?timezone=UTC` so DB-side `now()` writes and the naive encode of `time.Time` land in the same UTC wall frame
+- [ ] Go writes use `time.Now().UTC()`; every comparison of a decoded naive value against "now" uses `time.Now().UTC()` — a plain `time.Now()` / `time.Since(decoded)` on the CEST prod host leaked a +2h offset (the /gulag-list "releases in 2h 0m 54s" for a 1-minute gulag, proven live at cutover)
 
 ## teh
 - [ ] gated on the `teh` feature flag via silent `IsEnabled` (Rust `Features::is_enabled`, false on DB error) (src: teh.rs:12)

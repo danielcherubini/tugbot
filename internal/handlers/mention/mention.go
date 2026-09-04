@@ -331,7 +331,7 @@ func (h *Mention) flow(m *discordgo.Message) {
 			limit = SlowCooldownSeconds
 		}
 		if lastUse, ok := h.store.usageLastUsed(ctx, userID, guildID); ok {
-			if blocking, remaining := cooldownDecision(lastUse, time.Duration(limit)*time.Second); blocking {
+			if blocking, remaining := cooldownDecision(lastUse, time.Now().UTC(), time.Duration(limit)*time.Second); blocking {
 				// Mapping (Rust line 196): slow user → "Easy there,
 				// {mention} — give it a rest for {t}"; everyone else →
 				// "I'm still waking up — try again in {t}".

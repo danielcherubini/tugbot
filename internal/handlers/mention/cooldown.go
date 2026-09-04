@@ -14,8 +14,14 @@ import (
 // last_used_at counts as 0 elapsed, exactly like Rust's
 // unwrap_or_default()). Blocking when elapsed < limit, with
 // remaining = limit - elapsed on whole seconds.
-func cooldownDecision(lastUse time.Time, limit time.Duration) (blocking bool, remaining time.Duration) {
-	elapsed := time.Since(lastUse)
+func cooldownDecision(lastUse, now time.Time, limit time.Duration) (blocking bool, remaining time.Duration) {
+	// now arrives as time.Now().UTC() from the caller: lastUse is a
+	// NAIVE DB timestamp that pgx decodes as a UTC-labeled wall clock
+	// ("timestamp without time zone" — the Rust SystemTime frame is
+	// likewise the UTC wall clock), so the subtraction must use the
+	// UTC-labeled now or the CEST host offset (2h at cutover) leaks
+	// into every cooldown. time.Since(lastUse) did exactly that.
+	elapsed := now.Sub(lastUse)
 	secs := int64(elapsed / time.Second) // truncates towards zero for negatives → floor for positive elapsed
 	if secs < 0 {
 		secs = 0

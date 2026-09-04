@@ -18,7 +18,7 @@ func testDBURL() string {
 	if u := os.Getenv("TUGBOT_TEST_DATABASE_URL"); u != "" {
 		return u
 	}
-	return "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test"
+	return "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test?timezone=UTC"
 }
 
 // setupTestDB returns a pool to a reset servers table, or nil (and marks
@@ -148,6 +148,35 @@ func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 		if shapes[i] != want[i] {
 			t.Errorf("shape %d: got %q, want %q (Rust mod.rs vector order: AI Slop, horny, phony, feature, cull)", i, shapes[i], want[i])
 		}
+	}
+}
+
+// TestFinishInteractionAckFallback pins the ACK-deadline rule (see
+// interactionAckBudget in main.go): a fresh result is sent as the
+// plain reply (no defer — the bad-token session's 401 is logged, not
+// asserted); a stale result (work outlived the budget) goes via the
+// defer-ACK + follow-up pair (the seam), with the ephemeral flag
+// passed through; a defer response (cull's contract) ACKs on its own
+// and NEVER takes the fallback.
+func TestFinishInteractionAckFallback(t *testing.T) {
+	s, err := discordgo.New("123456789012345678")
+	if err != nil {
+		t.Fatalf("discordgo.New: %v", err)
+	}
+	h := &handlers{app: app.NewApp(nil, nil, s)}
+	var stubCalls []bool
+	h.deferAckFu = func(ephemeral bool) error {
+		stubCalls = append(stubCalls, ephemeral)
+		return nil
+	}
+	i := &discordgo.Interaction{ID: "1", Type: discordgo.InteractionApplicationCommand}
+
+	h.finishInteraction(i, reply{content: "fresh"}, time.Now())
+	h.finishInteraction(i, reply{content: "cull", deferResp: true, ephemeral: true}, time.Now())
+	h.finishInteraction(i, reply{content: "stale", ephemeral: true}, time.Now().Add(-3*time.Second))
+
+	if len(stubCalls) != 1 || stubCalls[0] != true {
+		t.Fatalf("stubCalls = %v, want [true] (only the stale result, ephemeral passthrough)", stubCalls)
 	}
 }
 

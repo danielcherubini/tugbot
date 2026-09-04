@@ -301,7 +301,7 @@ const staleRunningVoteResetSQL = `UPDATE message_votes SET job_status = 'created
 // selectGulagUsersReleasable mirrors the Task-1 sqlc query (byte-identical
 // to select_gulag_users_releasable).
 func (g *Gulag) selectGulagUsersReleasable(ctx context.Context) ([]db.GulagUser, error) {
-	rows, err := g.pool.Query(ctx, selectGulagUsersReleasableSQL, time.Now())
+	rows, err := g.pool.Query(ctx, selectGulagUsersReleasableSQL, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}

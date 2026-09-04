@@ -441,7 +441,7 @@ func (g *Gulag) sendToGulag(ctx context.Context, p GulagParams, length int32, us
 		return db.GulagUser{}, err
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	row := db.GulagUser{
 		UserID:      userID,
 		GuildID:     guildID,
