@@ -27,6 +27,13 @@ git fetch --all
 git reset --hard origin/main
 
 echo "[2/4] Running database migrations..."
+# cmd/migrate reads os.Getenv directly (no godotenv), so export the
+# value from .env for this step.
+export DATABASE_URL="$(grep -E '^DATABASE_URL=' "${INSTALL_DIR}/.env" | head -1 | cut -d= -f2- | tr -d '\"')"
+if [[ -z "$DATABASE_URL" ]]; then
+  echo "Error: DATABASE_URL not found in ${INSTALL_DIR}/.env"
+  exit 1
+fi
 go run ./cmd/migrate
 
 echo "[3/4] Building and installing the updated binary..."

@@ -66,6 +66,13 @@ echo "       .env file found"
 
 # Run migrations
 echo "[4/6] Running database migrations..."
+# cmd/migrate reads os.Getenv directly (no godotenv), so export the
+# value from .env the same way the systemd unit's environment would.
+export DATABASE_URL="$(grep -E '^DATABASE_URL=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- | tr -d '\"')"
+if [[ -z "$DATABASE_URL" ]]; then
+  echo "Error: DATABASE_URL not found in $INSTALL_DIR/.env"
+  exit 1
+fi
 go run ./cmd/migrate
 
 # Build and install the tugbot binary
