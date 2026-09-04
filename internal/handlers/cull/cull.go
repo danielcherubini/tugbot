@@ -349,8 +349,12 @@ func (h *Cull) HandleInteraction(i *discordgo.Interaction) Response {
 	// likewise the default).
 	days := DefaultDays
 	if o := commandOption(i, "days"); o != nil {
-		if v, ok := o.Value.(int); ok {
-			days = v
+		// INTEGER option: JSON numbers decode to float64 through
+		// interface{} — an .(int) assertion always failed and the
+		// option was (per Rust parity) silently treated as the
+		// default no matter what the user passed.
+		if v, ok := o.Value.(float64); ok {
+			days = int(v)
 		}
 	}
 	if !validateDays(days) {

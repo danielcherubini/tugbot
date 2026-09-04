@@ -671,6 +671,79 @@ func TestAddToGulagErrorCasing(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Option-value shape (discordgo decodes Option.Value into interface{} as
+// delivered by Discord: USER options = the user's snowflake STRING,
+// INTEGER options = JSON numbers → float64, string options = string).
+// ---------------------------------------------------------------------------
+
+type fakeGulagSurface struct {
+	roles  []*discordgo.Role
+	member *discordgo.Member
+}
+
+func (f *fakeGulagSurface) GuildChannels(_ string, _ ...discordgo.RequestOption) ([]*discordgo.Channel, error) {
+	return nil, nil
+}
+
+func (f *fakeGulagSurface) GuildRoles(_ string, _ ...discordgo.RequestOption) ([]*discordgo.Role, error) {
+	return f.roles, nil
+}
+
+func (f *fakeGulagSurface) GuildMember(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Member, error) {
+	return f.member, nil
+}
+
+func (f *fakeGulagSurface) GuildMemberRoleAdd(_ string, _ string, _ string, _ ...discordgo.RequestOption) error {
+	return nil
+}
+
+// TestHandleGulagOptionValueShapes pins the raw option-value contract:
+// a USER option arrives as the user's snowflake string and an INTEGER
+// option arrives as a JSON number (float64). The old port asserted
+// *discordgo.User / int64 — both always failed, so every /gulag
+// invocation died with "Please provide a valid user" and the length
+// option silently fell through to the 300s default (proven live at
+// cutover). Pinned: the string user value + float64 length reach the
+// success arm (non-ephemeral, with-reason text), and a non-string user
+// value still yields the non-ephemeral "Please provide a valid user".
+func TestHandleGulagOptionValueShapes(t *testing.T) {
+	pool := gatePool(t)
+	g := newGulag(&discordgo.Session{}, pool)
+	g.discordSurface = &fakeGulagSurface{
+		roles:  []*discordgo.Role{{ID: "900", Name: "admin"}, {ID: "777", Name: "gulag"}},
+		// invokerMember hands back this fetched member — it must
+		// carry the admin role or the role gate rejects before the
+		// options are ever parsed.
+		member: &discordgo.Member{User: &discordgo.User{ID: "5"}, Roles: []string{"900"}},
+	}
+	i := commandInteraction("gulag")
+	i.GuildID = "100"
+	i.ChannelID = "101"
+	i.Member = &discordgo.Member{User: &discordgo.User{ID: "5"}, Roles: []string{"900"}}
+	data := i.Data.(discordgo.ApplicationCommandInteractionData)
+	data.Options = []*discordgo.ApplicationCommandInteractionDataOption{
+		{Name: "user", Value: "899"},        // snowflake string
+		{Name: "reason", Value: "be kind"}, // string option
+		{Name: "length", Value: float64(60)}, // JSON number
+	}
+	i.Data = data
+
+	resp := g.handleGulag(context.Background(), i)
+	const want = "Sending <@899> to the Gulag for 60 minutes, because be kind"
+	if resp.Content != want || resp.Ephemeral {
+		t.Fatalf("success arm = %+v, want non-ephemeral %q", resp, want)
+	}
+
+	// A non-string user value still pins the old arm's text.
+	data.Options[0].Value = 899
+	i.Data = data
+	resp = g.handleGulag(context.Background(), i)
+	if resp.Content != "Please provide a valid user" || resp.Ephemeral {
+		t.Fatalf("bad user value = %+v, want non-ephemeral %q", resp, "Please provide a valid user")
+	}
+}
+
 // TestSendToGulagAndMessageMissingRoleCasing pins the role-miss text
 // of the shared vote path (Rust mod.rs:293 with_context parity):
 // capital-first, log-only surface.

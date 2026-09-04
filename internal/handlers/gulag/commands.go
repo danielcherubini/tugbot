@@ -220,7 +220,7 @@ func (g *Gulag) invokerMember(i *discordgo.Interaction) *discordgo.Member {
 	if i.GuildID == "" {
 		return &discordgo.Member{User: candidate}
 	}
-	fetched, err := g.d.GuildMember(i.GuildID, candidate.ID)
+	fetched, err := g.discord().GuildMember(i.GuildID, candidate.ID)
 	if err != nil || fetched == nil || fetched.User == nil {
 		return nil
 	}
@@ -277,7 +277,12 @@ func (g *Gulag) handleGulag(ctx context.Context, i *discordgo.Interaction) Respo
 	// (0, 10080] minutes -> *60 seconds (Rust lines 96-112).
 	var gulagLength uint32 = 300
 	if lengthOption.Value != nil {
-		if length, ok := lengthOption.Value.(int64); ok {
+		// Discord sends INTEGER option values as JSON numbers,
+		// which decode to float64 through interface{} (never
+		// int/int64 — an .(int64) assertion would always miss and
+		// silently fall through to the 300s default).
+		if lf, ok := lengthOption.Value.(float64); ok {
+			length := int64(lf)
 			if length > 0 && length <= 10080 {
 				gulagLength = uint32(length * 60)
 			} else if length <= 0 {
@@ -288,8 +293,13 @@ func (g *Gulag) handleGulag(ctx context.Context, i *discordgo.Interaction) Respo
 		}
 	}
 
-	user, ok := userOption.Value.(*discordgo.User)
-	if !ok {
+	// Discord sends USER option values as the user's snowflake
+	// string (NOT a user object — discordgo decodes Option.Value
+	// verbatim into interface{}; an .(*discordgo.User)
+	// assertion would always fail → "Please provide a valid user"
+	// for every invocation, proven live at cutover).
+	userID, ok := userOption.Value.(string)
+	if !ok || userID == "" {
 		return Response{Content: "Please provide a valid user"}
 	}
 
@@ -300,7 +310,7 @@ func (g *Gulag) handleGulag(ctx context.Context, i *discordgo.Interaction) Respo
 
 	gulagUser, err := g.AddToGulag(ctx, GulagParams{
 		GuildID:     guildID,
-		UserID:      user.ID,
+		UserID:      userID,
 		GulagRoleID: gulagRole.ID,
 		GulagLength: gulagLength,
 		ChannelID:   channelID,
@@ -314,11 +324,11 @@ func (g *Gulag) handleGulag(ctx context.Context, i *discordgo.Interaction) Respo
 	// into the message; the {} is the CUMULATIVE length (the DB row's
 	// add branch extends it), not the raw option.
 	if reason, ok := reasonOption.Value.(string); ok {
-		return Response{Content: fmt.Sprintf("Sending %s to the Gulag for %d minutes, because %s",
-			user.Mention(), gulagUser.GulagLength/60, reason)}
+		return Response{Content: fmt.Sprintf("Sending <@%s> to the Gulag for %d minutes, because %s",
+			userID, gulagUser.GulagLength/60, reason)}
 	}
-	return Response{Content: fmt.Sprintf("Sending %s to the Gulag for %d minutes",
-		user.Mention(), gulagUser.GulagLength/60)}
+	return Response{Content: fmt.Sprintf("Sending <@%s> to the Gulag for %d minutes",
+		userID, gulagUser.GulagLength/60)}
 }
 
 // handleGulagRelease mirrors gulag_remove_handler.rs:14-173. NOTE: NO
@@ -341,8 +351,10 @@ func (g *Gulag) handleGulagRelease(ctx context.Context, i *discordgo.Interaction
 	if userOption == nil {
 		return ephemeralResponse("Expected user option")
 	}
-	user, ok := userOption.Value.(*discordgo.User)
-	if !ok {
+	// Same USER-option contract as /gulag: Discord sends the
+	// snowflake string, not a user object.
+	userID, ok := userOption.Value.(string)
+	if !ok || userID == "" {
 		return Response{Content: "Please provide a valid user"}
 	}
 	if invokerIsEmpty(i) {
@@ -354,7 +366,7 @@ func (g *Gulag) handleGulagRelease(ctx context.Context, i *discordgo.Interaction
 		return sendError("Couldn't find gulag Role")
 	}
 
-	userIDi, convErr := DiscordID("user", user.ID)
+	userIDi, convErr := DiscordID("user", userID)
 	if convErr != nil {
 		return sendError("Couldn't find user in Database")
 	}
@@ -372,11 +384,11 @@ func (g *Gulag) handleGulagRelease(ctx context.Context, i *discordgo.Interaction
 		return sendError("Couldn't find Gulag Channel")
 	}
 
-	targetMember, memberErr := g.d.GuildMember(guildID, user.ID)
+	targetMember, memberErr := g.d.GuildMember(guildID, userID)
 	if memberErr != nil || targetMember == nil || targetMember.User == nil {
 		return sendError("Couldn't get member")
 	}
-	if err := g.d.GuildMemberRoleRemove(guildID, user.ID, gulagRole.ID); err != nil {
+	if err := g.d.GuildMemberRoleRemove(guildID, userID, gulagRole.ID); err != nil {
 		return sendError("Couldn't remove role")
 	}
 	message := "Freeing " + targetMember.Mention() + " from the gulag"

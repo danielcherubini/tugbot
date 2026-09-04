@@ -4,6 +4,7 @@
 - [ ] `InteractionCreate` guard: `Type == 2` (application command) + `Data != nil`; **discordgo v0.29.0 stores `Interaction.Data` as a VALUE** (`UnmarshalJSON` does `i.Data = v`) — the assertion must be the value form `i.Data.(discordgo.ApplicationCommandInteractionData)`; the pointer form `(*...)` ALWAYS fails and silently drops every command ("The application did not respond", zero bot logs — proven live at cutover)
 - [ ] dispatch by `Data.Name` in the pinned Rust order; one goroutine per interaction (handler arms do REST)
 - [ ] `command received` INFO log per application command (name + guild) — a Go-side observability addition; Rust mod.rs was SILENT at `interaction_create`, do not revert it as a parity deviation
+- [ ] OPTION-VALUE SHAPE (same class as the Data-shape trap above): discordgo decodes `Option.Value` into `interface{}` VERBATIM as Discord delivers it — USER options = the user's snowflake STRING, INTEGER options = JSON numbers (→ `float64`), string options = `string`, bool options = `bool`. Assertions of the form `.(*discordgo.User)` / `.(int)` / `.(int64)` always fail: the `*discordgo.User` case silently made every /gulag invocation fail with "Please provide a valid user" and the `int64` case silently defaulted the length to the 300s default (both proven live at cutover; test-pinned in TestHandleGulagOptionValueShapes)
 
 ## teh
 - [ ] gated on the `teh` feature flag via silent `IsEnabled` (Rust `Features::is_enabled`, false on DB error) (src: teh.rs:12)
