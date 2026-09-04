@@ -151,32 +151,56 @@ func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	}
 }
 
-// TestFinishInteractionAckFallback pins the ACK-deadline rule (see
-// interactionAckBudget in main.go): a fresh result is sent as the
-// plain reply (no defer — the bad-token session's 401 is logged, not
-// asserted); a stale result (work outlived the budget) goes via the
-// defer-ACK + follow-up pair (the seam), with the ephemeral flag
-// passed through; a defer response (cull's contract) ACKs on its own
-// and NEVER takes the fallback.
-func TestFinishInteractionAckFallback(t *testing.T) {
+// TestDeliverInteractionACKRace pins the in-flight ACK-deadline race
+// (see deliverInteraction in main.go): fast work is delivered as the
+// plain reply (the bad-token session's 401 is logged, not asserted);
+// a fast defer response (cull's contract) ACKs on its own without
+// touching the watchdog seams; slow work (work outlives
+// interactionAckBudget) first ACKs via the watchdog's defer, then
+// delivers the result via the follow-up stub, with the ephemeral
+// flag passed through.
+func TestDeliverInteractionACKRace(t *testing.T) {
 	s, err := discordgo.New("123456789012345678")
 	if err != nil {
 		t.Fatalf("discordgo.New: %v", err)
 	}
 	h := &handlers{app: app.NewApp(nil, nil, s)}
-	var stubCalls []bool
-	h.deferAckFu = func(ephemeral bool) error {
-		stubCalls = append(stubCalls, ephemeral)
+	var ackCalls, followups []bool
+	h.deferAckFu = func() error {
+		ackCalls = append(ackCalls, true)
+		return nil
+	}
+	h.followupFu = func(content string, ephemeral bool) error {
+		followups = append(followups, ephemeral)
 		return nil
 	}
 	i := &discordgo.Interaction{ID: "1", Type: discordgo.InteractionApplicationCommand}
 
-	h.finishInteraction(i, reply{content: "fresh"}, time.Now())
-	h.finishInteraction(i, reply{content: "cull", deferResp: true, ephemeral: true}, time.Now())
-	h.finishInteraction(i, reply{content: "stale", ephemeral: true}, time.Now().Add(-3*time.Second))
+	// Shrink the budget for the test (5x margin over the fast paths
+	// keeps the race deterministic even under scheduling load).
+	old := interactionAckBudget
+	interactionAckBudget = 30 * time.Millisecond
+	defer func() { interactionAckBudget = old }()
 
-	if len(stubCalls) != 1 || stubCalls[0] != true {
-		t.Fatalf("stubCalls = %v, want [true] (only the stale result, ephemeral passthrough)", stubCalls)
+	// Fast: plain reply, watchdog untouched.
+	h.deliverInteraction(i, func() reply { return reply{content: "fresh"} })
+	if len(ackCalls) != 0 || len(followups) != 0 {
+		t.Fatalf("fast: ack=%v followup=%v, want none", ackCalls, followups)
+	}
+	// Fast defer response: its own ACK, watchdog untouched.
+	h.deliverInteraction(i, func() reply { return reply{content: "cull", deferResp: true, ephemeral: true} })
+	if len(ackCalls) != 0 || len(followups) != 0 {
+		t.Fatalf("fast deferResp: ack=%v followup=%v, want none", ackCalls, followups)
+	}
+	// Slow: watchdog ACK, then follow-up (non-ephemeral content).
+	h.deliverInteraction(i, func() reply { time.Sleep(150 * time.Millisecond); return reply{content: "slow"} })
+	if len(ackCalls) != 1 || len(followups) != 1 || followups[0] != false {
+		t.Fatalf("slow: ack=%v followup=%v, want [true], [false]", ackCalls, followups)
+	}
+	// Slow ephemeral: the follow-up carries the flag through.
+	h.deliverInteraction(i, func() reply { time.Sleep(150 * time.Millisecond); return reply{content: "slow e", ephemeral: true} })
+	if len(followups) != 2 || followups[1] != true {
+		t.Fatalf("slow ephemeral: followup=%v, want [false true]", followups)
 	}
 }
 
