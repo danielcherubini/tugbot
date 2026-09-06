@@ -13,13 +13,16 @@ package derpies
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/danielcherubini/tugbot/internal/app"
 	"github.com/danielcherubini/tugbot/internal/features"
@@ -66,6 +69,11 @@ type store interface {
 	// addGimmick — idempotent upsert: INSERT ... ON CONFLICT (word)
 	// DO NOTHING.
 	addGimmick(ctx context.Context, word, source string) error
+	// promptText — the live prompt template (derpies_prompt, one row;
+	// per-message fetch like the flag and the list). Row absent / any
+	// error -> error — the flow's fallback engages (code default), so
+	// the filter never runs with a broken prompt.
+	promptText(ctx context.Context) (string, error)
 }
 
 type discordOps interface {
@@ -105,6 +113,12 @@ func (p *poolStore) addGimmick(ctx context.Context, word, source string) error {
 	return err
 }
 
+func (p *poolStore) promptText(ctx context.Context) (string, error) {
+	var body string
+	err := p.pool.QueryRow(ctx, `SELECT body FROM derpies_prompt LIMIT 1`).Scan(&body)
+	return body, err
+}
+
 // realOps is the production Discord REST surface (the flow's single
 // outgoing REST call).
 type realOps struct{ d *discordgo.Session }
@@ -125,14 +139,32 @@ const punctB = "`{|}~"
 
 var punctTrim = punctA + punctB
 
-// tokensForMatch: lowercase the content, strings.Fields, trim leading and
-// trailing punctuation off each token; keys of the result map.
-// "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft}.
+// foldToASCII lowers and reduces a token to ASCII: NFD decompose, drop
+// combining marks (Mn). "świft" -> "swift", "žwift" -> "zwift". Letters
+// that don't decompose to a base (e.g. Cyrillic lookalikes) stay — they
+// remain wordValid-ineligible and are only catchable via the LLM naming an
+// ASCII form.
+func foldToASCII(s string) string {
+	var b strings.Builder
+	for _, r := range norm.NFD.String(s) {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.ToLower(b.String())
+}
+
+// tokensForMatch: fold each fielded token (foldToASCII — which includes the
+// lowercasing), trim leading and trailing punctuation off each FOLDED
+// token; keys of the result map are the folded tokens.
+// "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft} (ASCII —
+// unchanged). "A świft cog" -> {a, swift, cog}.
 func tokensForMatch(content string) map[string]bool {
-	tokens := strings.Fields(strings.ToLower(content))
+	tokens := strings.Fields(content)
 	out := make(map[string]bool, len(tokens))
 	for _, tok := range tokens {
-		out[strings.Trim(tok, punctTrim)] = true
+		out[strings.Trim(foldToASCII(tok), punctTrim)] = true
 	}
 	return out
 }
@@ -179,47 +211,102 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// gimmickPrompt: the prompt below, with the content substituted and the
-// KNOWN gimmick words injected (sorted, one per line). The LLM judges the
-// residue the fast path missed: the list lets it pattern-match respellings
-// against the known family AND recognize fresh gimmicks in the same roster
-// style (the roster rotates, so old anchor words stay relevant). The pi RPC
-// always appends the anti-injection system fallback on top of this.
-func gimmickPrompt(content string, known []string) string {
-	set := make(map[string]bool, len(known))
-	for _, k := range known {
-		set[k] = true
+// defaultPromptTemplate — the code-pinned default (exact text of the plan's
+// "defaultPromptTemplate" block: from "A Discord message was just posted by
+// a user…" through the "…the innocent reading is obvious." protocol block).
+// It is the fallback the flow uses when the DB template is missing/invalid —
+// the filter never runs with a broken prompt.
+const defaultPromptTemplate = `A Discord message was just posted by a user with a documented history of spamming this server with a ROTATING ROSTER of short, repetitive, annoying gimmicks — and of evading, over and over, the word filters built to catch them. He is notorious for this.
+
+HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge CLEAN only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between the two: GIMMICK. His messages are the filter's only queue, so err toward catching the roster, never toward letting it through.
+
+{content}
+
+Techniques he uses — in any combination; judge on ALL of them at once:
+- RESPPELLING: letters swapped/added/dropped/reordered, or bent — including unicode lookalikes (a z or s with a diacritic, ß, ø, ς, and the like), all-caps, or letters spelled out. Examples: zwift, schwift, žwift, s1ft. A bent letter does NOT change the word: "žwift" IS the swift-thing.
+- NON-ENGLISH LETTERS: a known word written in Cyrillic, Greek, or any other lookalike script (з = z, и = i, о = o, ο = o, ς = s, and the like) IS that known word. Judge by what it spells, not by which script it is wearing.
+- WEIRD SPELLINGS OF EVERY KIND: any spelling of a known word that a reasonable reader can still see through — letter transpositions, doubled letters, "wrong" but recognizable spellings. If it is recognizably the known word, judge it.
+- PUNCTUATION / DASHES EVERYWHERE: punctuation, dashes, dots, slashes, brackets, or symbols wedged INTO a known word (sw-ift, s.w.i.f.t, s/w/i/f/t, s(w)i(f)t), or between its letters — punctuation does not break the word.
+- SPLIT: a known word spread over spaces or symbols between its letters (g i v e, s w i f t with dots/dashes between the letters).
+- HIDDEN IN OTHER WORDS: a known word buried inside a longer word it is not a token of (a "swift"-like string stitched into another word, a known word straddling a word boundary, or known words jammed together into one token) — it still counts; the anchor is the token containing it, AS IT APPEARS.
+- SQUEEZED/CONCATENATED: a known word fused into or onto another word without the space (a "swiftin…"-style blend), one or more known words jammed together, or extra letters sprinkled through a known word.
+- ASK-PHRASING (the core of the roster): asking OTHER users to buy/give him something — a Zwift subscription, a free bicycle, a "gift" keyed to a known word — OR a fresh short repetitive solicitation in the same style (a FRESH gimmick in the roster style counts).
+- QUOTING/REFERENCING: replying to or quoting one of his own earlier messages so the gimmick lives in the quote (quoted text counts as part of the message).
+- IMAGES: the gimmick inside an attached/quoted screenshot or pasted image (images arrive with the message for you to read; a word visible in an image counts as if it were written).
+
+{{IMAGES}}
+{{REF}}
+
+His gimmicks are short, repetitive solicitations he posts over and over. Example from the roster: trying to get other users to buy HIM a Zwift subscription, or to give him a free bicycle. The roster rotates — old gimmicks come back — so the known-word list below spans EVERY past gimmick, not just the current one.
+
+Known gimmick words (each was the anchor word of a past gimmick; respellings of them are how he dodges the fast filter):
+{known}
+
+Judgement rules (these override politeness):
+- A known word or any respelling of one — even when the surrounding text looks mildly innocent — is GIMMICK.
+- A known word hidden inside another word, written in non-English letters, or shot full of punctuation and dashes is GIMMICK — dressing does not launder the word.
+- An anchor word embedded inside a squeeze/blend is GIMMICK; the anchor word is the most distinctive token of the blend AS IT APPEARS.
+- If you have to imagine an innocent reading to call it CLEAN, you are probably wrong — he is very good at making solicitations look like questions.
+- When you are torn: GIMMICK.
+
+Reply with EXACTLY one line, one of:
+  GIMMICK:<word>
+  CLEAN
+where <word> is the anchor word: the as-appears respelled token for a known-gimmick trace, or the single most distinctive word of the fresh gimmick. The rules for <word>:
+- It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift").
+- For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "GIMMICK:swift" for it is the INVALID answer. Never answer a known word that is not in the message.
+- When the anchor word lives ONLY in an image, answer the most distinctive word of that image as if it were in the message.
+- CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
+
+// validTemplate: the two MANDATORY literal markers are present. Absent
+// optional markers ({{IMAGES}} / {{REF}}) are fine — the element is simply
+// omitted.
+func validTemplate(t string) bool {
+	return strings.Contains(t, "{content}") && strings.Contains(t, "{known}")
+}
+
+// gimmickPrompt substitutes the FOUR markers with a TWO-PHASE pass so a
+// payload can never re-trigger a later marker scan. Pass 1 runs on the
+// TEMPLATE ONLY (before any payload exists): each marker becomes a unique
+// inert placeholder wrapped in NUL bytes. Pass 2 swaps the placeholders
+// for the real payloads. The payloads are NUL-free — content / refText are
+// Discord message text (Discord content cannot contain U+0000), and known
+// words pass wordValid's ^[a-z0-9]{2,32}$ charset — so a message that
+// literally contains "{known}" / "{{IMAGES}}" / "{{REF}}" survives
+// verbatim instead of pulling the known block inside the untrusted fence
+// or having its marker bytes silently deleted (the single-pass ReplaceAll
+// ordering this replaces re-scanned the already-inserted content). The
+// fence and the images line / referenced block bytes are code-pinned — the
+// template carries only the bare markers.
+// (`known` arrives sorted from the flow — sortedKeys — and is joined one
+// per line; the pi RPC always appends the anti-injection system fallback on
+// top of this.)
+func gimmickPrompt(tmpl string, content string, known []string, nImages int, refText string) string {
+	// Pass 1: markers -> NUL-wrapped placeholders, template only.
+	marked := tmpl
+	marked = strings.ReplaceAll(marked, "{content}", "\x00CONTENT\x00")
+	marked = strings.ReplaceAll(marked, "{known}", "\x00KNOWN\x00")
+	marked = strings.ReplaceAll(marked, "{{IMAGES}}", "\x00IMAGES\x00")
+	marked = strings.ReplaceAll(marked, "{{REF}}", "\x00REF\x00")
+
+	// Pass 2: placeholders -> payloads (all NUL-free, so no re-trigger).
+	out := strings.ReplaceAll(marked, "\x00CONTENT\x00",
+		"\n<<<UNTRUSTED MESSAGE\n"+content+"\n               UNTRUSTED MESSAGE>>>\n")
+	knownBlock := ""
+	if len(known) > 0 {
+		knownBlock = "-----< known gimmick words (sorted ascending) >-----\n" + strings.Join(known, "\n")
 	}
-	return "A Discord message was just posted by a user with a " +
-		"documented history of spamming this server with a ROTATING " +
-		"ROSTER of repetitive annoying gimmicks, and of evading the " +
-		"word filters built against them via respellings. He is " +
-		"notorious for this.\n\n" +
-		"<<<UNTRUSTED MESSAGE\n" +
-		content +
-		"\nUNTRUSTED MESSAGE>>>\n\n" +
-		"His gimmicks are short, repetitive solicitations he posts over " +
-		"and over. Example from the roster: trying to get other users " +
-		"to buy HIM a Zwift subscription, or to give him a free " +
-		"bicycle. The roster rotates — old gimmicks come back — so " +
-		"the known-word list below spans EVERY past gimmick, not just " +
-		"the current one.\n\n" +
-		"Known gimmick words (each was the anchor word of a past " +
-		"gimmick; respellings of them are how he dodges the fast " +
-		"filter):\n" +
-		strings.Join(sortedKeys(set), "\n") +
-		"\n\n" +
-		"Judge the message. Is it (a) a respelling of a known gimmick " +
-		"word, (b) another instance of a known gimmick that dodged the " +
-		"filter some other way, or (c) a FRESH gimmick — a new " +
-		"repetitive solicitation in the same style as the roster? " +
-		"Reply with EXACTLY one line, one of:\n" +
-		"  GIMMICK:<word>\n" +
-		"  CLEAN\n" +
-		"where <word> is the anchor word: the respelled known word for " +
-		"(a)/(b), or the single most distinctive word of the fresh " +
-		"gimmick for (c) (lowercase, no punctuation, must appear in the " +
-		"message).\n"
+	out = strings.ReplaceAll(out, "\x00KNOWN\x00", knownBlock)
+	var imagesBlock string
+	if nImages > 0 {
+		imagesBlock = fmt.Sprintf("The message also has %d attached image(s) (screenshots or pasted images — a text filter would not see their content). Judge the text AND the images. If the anchor word appears in an image rather than the message text, name it as if it were in the message.", nImages)
+	}
+	out = strings.ReplaceAll(out, "\x00IMAGES\x00", imagesBlock)
+	var refBlock string
+	if refText != "" {
+		refBlock = "<<<REFERENCED MESSAGE\n" + refText + "\nREFERENCED MESSAGE>>>\nThe message replies to a previous message (often the author's own) — the quoted content is above between the REFERENCED MESSAGE markers. Judge the posted text / images AND the quoted content together; a respelling may live in the quote rather than the new message."
+	}
+	return strings.ReplaceAll(out, "\x00REF\x00", refBlock)
 }
 
 // ---------------------------------------------------------------------------
@@ -278,10 +365,23 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 6-7. One ask (the 300s deadline lives in the pi package).
-	text, err := h.app.Pi.Ask(ctx, gimmickPrompt(m.Content, sortedKeys(list)))
-	if err != nil {
-		slog.Error("derpies pi ask failed", "module", module, "error", err)
+	// 6-7. One ask (the 300s deadline lives in the pi package). The template
+	//     comes from the DB seam — a fetch error OR an invalid row (missing
+	//     mandatory marker) falls back to the code default so the filter
+	//     never runs with a broken prompt. (This plan's build has no
+	//     images/referenced input — the call is the 0/"" form; the pending
+	//     images plan re-pins this block when it lands.)
+	tmpl, err := h.store.promptText(ctx)
+	if err != nil || !validTemplate(tmpl) {
+		tmpl = defaultPromptTemplate
+		if err != nil {
+			slog.Warn("derpies prompt template unavailable — using default", "module", module, "error", err)
+		}
+	}
+	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), 0, "")
+	text, askErr := h.app.Pi.Ask(ctx, prompt)
+	if askErr != nil {
+		slog.Error("derpies pi ask failed", "module", module, "error", askErr)
 		return
 	}
 
@@ -296,26 +396,34 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 9. SANITY before learning: charset/length AND the word must have
-	//    appeared as a token in the submitted message (same tokenization as
-	//    the fast path). A hallucinated word can never enter the list.
-	if !wordValid(word) {
+	// 9. SANITY before learning: charset/length — judged on the FOLDED
+	//    verdict word (a unicode respelling folds to its ASCII base, so
+	//    "GIMMICK:žwift" evaluates as "zwift") — AND the folded word must
+	//    have appeared as a folded token of the message (same tokenization as the fast path — unicode
+	//    respellings in the text fold identically) — the SHIPPED gate shape
+	//    holds, no form change: `wordValid` then token-in-message, both now
+	//    over FOLDED values. A hallucinated word can never enter the list.
+	fw := foldToASCII(word)
+	if !wordValid(fw) {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
-	if !toks[word] {
+	if !toks[fw] {
 		slog.Warn("derpies verdict word not in the message — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
 
-	// 10. Learn, then delete. A delete failure is LOG ONLY — the word was
-	//     actually used and stays learned (the next occurrence is a fast hit).
-	if err := h.store.addGimmick(ctx, word, SourceLLM); err != nil {
-		slog.Error("derpies add gimmick failed", "module", module, "word", word, "error", err)
+	// 10. Learn, then delete. Learn the FOLDED word (the list is a
+	//     pure-ASCII token space — the fast path's tokens fold identically,
+	//     so the next occurrence of the respelling is a fast hit). A delete
+	//     failure is LOG ONLY — the word was actually used and stays learned
+	//     (the next occurrence is a fast hit).
+	if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
+		slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
 	}
 	if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
-		slog.Error("derpies delete (llm) failed", "module", module, "word", word, "channel", m.ChannelID, "message", m.ID, "error", err)
+		slog.Error("derpies delete (llm) failed", "module", module, "word", fw, "channel", m.ChannelID, "message", m.ID, "error", err)
 	} else {
-		slog.Info("derpies delete (llm) learned", "module", module, "word", word, "channel", m.ChannelID, "message", m.ID)
+		slog.Info("derpies delete (llm) learned", "module", module, "word", fw, "channel", m.ChannelID, "message", m.ID)
 	}
 }
