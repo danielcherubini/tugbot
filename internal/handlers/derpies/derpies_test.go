@@ -54,6 +54,10 @@ func (s *fakeStore) promptText(_ context.Context) (string, error) {
 type fakeOps struct {
 	deleted [][]string // each {channelID, messageID}
 	delErr  error
+	// channelMessageRetrieve returns ref/refErr; refCalls counts calls.
+	ref      *discordgo.Message
+	refErr   error
+	refCalls int
 }
 
 func (o *fakeOps) deleteMessage(channelID, messageID string) error {
@@ -64,13 +68,25 @@ func (o *fakeOps) deleteMessage(channelID, messageID string) error {
 	return nil
 }
 
+func (o *fakeOps) channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error) {
+	o.refCalls++
+	return o.ref, o.refErr
+}
+
 // fakePi implements ALL THREE app.PiBackend methods (a fake with only
-// Ask will not compile as App.Pi).
+// Ask will not compile as App.Pi). AskWithImages tracks its OWN counters
+// (imageAsks / imagePrompts / images) so the flow tests can tell the
+// image ask path apart from the text ask path — `asks`/`prompts` belong
+// to Ask alone (the pre-existing flow tests assert those).
 type fakePi struct {
 	resp    string
 	askErr  error
 	asks    int
 	prompts []string
+
+	imageAsks    int
+	imagePrompts []string
+	images       [][]app.PiImage
 }
 
 func (f *fakePi) Ask(_ context.Context, prompt string) (string, error) {
@@ -79,9 +95,10 @@ func (f *fakePi) Ask(_ context.Context, prompt string) (string, error) {
 	return f.resp, f.askErr
 }
 
-func (f *fakePi) AskWithImages(_ context.Context, prompt string, _ []app.PiImage) (string, error) {
-	f.asks++
-	f.prompts = append(f.prompts, prompt)
+func (f *fakePi) AskWithImages(_ context.Context, prompt string, images []app.PiImage) (string, error) {
+	f.imageAsks++
+	f.imagePrompts = append(f.imagePrompts, prompt)
+	f.images = append(f.images, images)
 	return f.resp, f.askErr
 }
 

@@ -13,11 +13,15 @@ package derpies
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/bwmarrin/discordgo"
@@ -77,8 +81,15 @@ type store interface {
 }
 
 type discordOps interface {
-	// deleteMessage — the flow's ONLY outgoing REST call.
+	// deleteMessage — the flow's ONLY outgoing REST call that takes an
+	// action (the referenced fetch is a data GET, not a bot action).
 	deleteMessage(channelID, messageID string) error
+	// channelMessageRetrieve — the one-hop referenced-message fetch
+	// (mention parity): a REST GET of the earlier message behind a
+	// reply/quote-reply. A failure (already deleted, rate limit) is
+	// handled by the CALLER as "no reference" — log and continue, never
+	// abort the flow.
+	channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error)
 }
 
 // poolStore is the production store (raw SQL over the shared pool).
@@ -125,6 +136,10 @@ type realOps struct{ d *discordgo.Session }
 
 func (o *realOps) deleteMessage(channelID, messageID string) error {
 	return o.d.ChannelMessageDelete(channelID, messageID)
+}
+
+func (o *realOps) channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error) {
+	return o.d.ChannelMessage(channelID, messageID)
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +224,155 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// The image leg (mention mirror — attachments + embeds, isSafeURL-guarded,
+// extension→MIME, per-URL failure logged + skipped; the ONLY differences
+// from mention's versions are the slog module tag and the downloadPlan /
+// downloadImages split so the current+referenced plans can merge before a
+// single download pass)
+// ---------------------------------------------------------------------------
+
+// imagePlanEntry is the planned (url, mime, source) triple before download.
+type imagePlanEntry struct {
+	url    string
+	mime   string
+	source string // "attachment" | "embed"
+}
+
+// imageURLPlan mirrors mention's plan: attachment urls with an image/* content
+// type (empty content_type falls back to application/octet-stream and is
+// skipped, like mention), then embed image/thumbnail urls deduped against the
+// ATTACHMENT urls and MIME'd by extension (query/fragment stripped first:
+// png→image/png, gif→image/gif, webp→image/webp, else image/jpeg). Every url
+// must pass isSafeURL.
+func imageURLPlan(m *discordgo.Message) []imagePlanEntry {
+	if m == nil {
+		return nil
+	}
+	var plan []imagePlanEntry
+	var attachmentURLs []string
+	for _, a := range m.Attachments {
+		attachmentURLs = append(attachmentURLs, a.URL)
+		contentType := a.ContentType
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		if !strings.HasPrefix(contentType, "image/") {
+			continue
+		}
+		if !isSafeURL(a.URL) {
+			slog.Info("Skipping unsafe URL: "+a.URL, "module", module)
+			continue
+		}
+		plan = append(plan, imagePlanEntry{url: a.URL, mime: contentType, source: "attachment"})
+	}
+	for _, e := range m.Embeds {
+		var url string
+		if e.Image != nil {
+			url = e.Image.URL
+		}
+		if url == "" && e.Thumbnail != nil {
+			url = e.Thumbnail.URL
+		}
+		if url == "" {
+			continue
+		}
+		deduped := false
+		for _, du := range attachmentURLs {
+			if du == url {
+				deduped = true
+				break
+			}
+		}
+		if deduped {
+			continue
+		}
+		if !isSafeURL(url) {
+			slog.Info("Skipping unsafe embed URL: "+url, "module", module)
+			continue
+		}
+		plan = append(plan, imagePlanEntry{url: url, mime: mimeForURL(url), source: "embed"})
+	}
+	return plan
+}
+
+// isSafeURL: http:// or https:// prefix only.
+func isSafeURL(url string) bool {
+	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
+}
+
+// mimeForURL: extension map (png/gif/webp; everything else image/jpeg),
+// query/fragment stripped first.
+func mimeForURL(url string) string {
+	path := url
+	for _, sep := range []string{"?", "#"} {
+		if i := strings.Index(path, sep); i >= 0 {
+			path = path[:i]
+		}
+	}
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		path = path[i+1:]
+	}
+	ext := ""
+	if i := strings.LastIndex(path, "."); i >= 0 && i < len(path)-1 {
+		ext = path[i+1:]
+	}
+	switch ext {
+	case "png":
+		return "image/png"
+	case "gif":
+		return "image/gif"
+	case "webp":
+		return "image/webp"
+	default:
+		return "image/jpeg"
+	}
+}
+
+// downloadPlan is the per-URL GET leg: request with the explicit-timeout
+// client, io.ReadAll, base64 standard-alphabet encoded. A failed download
+// (request error or non-nil ReadAll error) is logged (module derpies) and
+// that URL is skipped — the flow continues with the rest. Attachment
+// downloads log the url + mime; embed downloads log the url. 5xx/4xx
+// responses are NOT an error here (mention parity: the body is read whatever
+// the status carries) — mirror mention EXACTLY.
+func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, client *http.Client) []app.PiImage {
+	var images []app.PiImage
+	for _, entry := range plan {
+		if entry.source == "attachment" {
+			slog.Info("Downloading image: "+entry.url+" ("+entry.mime+")", "module", module)
+		} else {
+			slog.Info("Downloading embed image: "+entry.url, "module", module)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, entry.url, nil)
+		if err != nil {
+			slog.Error("Failed to download image", "module", module, "url", entry.url, "error", err)
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Error("Failed to download image", "module", module, "url", entry.url, "error", err)
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			slog.Error("Failed to read image bytes", "module", module, "url", entry.url, "error", err)
+			continue
+		}
+		images = append(images, app.PiImage{
+			MimeType: entry.mime,
+			Data:     base64.StdEncoding.EncodeToString(body),
+		})
+	}
+	return images
+}
+
+// downloadImages mirrors mention's one-message shape: plan then download.
+func (h *Derpies) downloadImages(ctx context.Context, m *discordgo.Message, client *http.Client) []app.PiImage {
+	return h.downloadPlan(ctx, imageURLPlan(m), client)
 }
 
 // defaultPromptTemplate — the code-pinned default (exact text of the plan's
@@ -340,13 +504,35 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	}
 	slog.Info("derpies message from filtered user", "module", module, "user", m.Author.ID, "guild", m.GuildID)
 
-	// 4. Fast path: one list SELECT; exact token match.
+	// 3.5 Referenced message (reply/quote-reply): one REST GET (mention
+	//     parity, via the discordOps seam). On failure (already deleted,
+	//     rate limit) log and continue WITHOUT a reference — never abort
+	//     the flow (mention's step-7 discipline).
+	var referenced *discordgo.Message
+	if m.MessageReference != nil && m.MessageReference.MessageID != "" {
+		ref, err := h.ops.channelMessageRetrieve(m.ChannelID, m.MessageReference.MessageID)
+		if err != nil {
+			slog.Error("derpies referenced fetch failed", "module", module, "message", m.ID, "error", err)
+		} else {
+			referenced = ref
+		}
+	}
+
+	// 4. Fast path: one list SELECT; exact token match. The token set is
+	//     the UNION of the posted message and, when a referenced message
+	//     was fetched, its content (a reply re-quoting a seeded word hits
+	//     here without retyping).
 	list, err := h.store.listGimmicks(ctx)
 	if err != nil {
 		slog.Error("derpies gimmick list fetch failed", "module", module, "error", err)
 		return
 	}
 	toks := tokensForMatch(m.Content)
+	if referenced != nil {
+		for t := range tokensForMatch(referenced.Content) {
+			toks[t] = true
+		}
+	}
 	for tok := range toks {
 		if list[tok] {
 			if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
@@ -358,6 +544,27 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		}
 	}
 
+	// 4.5 Images (mention parity: attachments + embeds, isSafeURL-guarded,
+	//     10s client, per-URL failure logged + skipped — the flow degrades
+	//     to a text-only ask when nothing downloads). The plan is the union
+	//     of the posted message and, when present, the referenced message,
+	//     URL-deduped (the same screenshot in both must not double the
+	//     base64 payload).
+	imgPlan := imageURLPlan(m)
+	if referenced != nil {
+		imgPlan = append(imgPlan, imageURLPlan(referenced)...)
+	}
+	var uniqPlan []imagePlanEntry
+	seenURLs := map[string]bool{}
+	for _, e := range imgPlan {
+		if seenURLs[e.url] {
+			continue
+		}
+		seenURLs[e.url] = true
+		uniqPlan = append(uniqPlan, e)
+	}
+	images := h.downloadPlan(ctx, uniqPlan, &http.Client{Timeout: 10 * time.Second})
+
 	// 5. Slow path: pi unavailable -> silent return (the mention feature's
 	//    degradation path, same shape).
 	if h.app.Pi == nil {
@@ -365,12 +572,13 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 6-7. One ask (the 300s deadline lives in the pi package). The template
-	//     comes from the DB seam — a fetch error OR an invalid row (missing
+	// 6-7. One ask (the 300s deadline lives in the pi package). AskWithImages
+	//     when images downloaded; plain Ask otherwise (in production the two
+	//     are equivalent — PiRpc.Ask is askWithImages(ctx, prompt, nil) — the
+	//     branch keeps the text path's test seam clean). The template comes
+	//     from the DB seam — a fetch error OR an invalid row (missing
 	//     mandatory marker) falls back to the code default so the filter
-	//     never runs with a broken prompt. (This plan's build has no
-	//     images/referenced input — the call is the 0/"" form; the pending
-	//     images plan re-pins this block when it lands.)
+	//     never runs with a broken prompt.
 	tmpl, err := h.store.promptText(ctx)
 	if err != nil || !validTemplate(tmpl) {
 		tmpl = defaultPromptTemplate
@@ -378,8 +586,20 @@ func (h *Derpies) flow(m *discordgo.Message) {
 			slog.Warn("derpies prompt template unavailable — using default", "module", module, "error", err)
 		}
 	}
-	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), 0, "")
-	text, askErr := h.app.Pi.Ask(ctx, prompt)
+	refContent := ""
+	if referenced != nil {
+		refContent = referenced.Content
+	}
+	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), refContent)
+	var (
+		text   string
+		askErr error
+	)
+	if len(images) > 0 {
+		text, askErr = h.app.Pi.AskWithImages(ctx, prompt, images)
+	} else {
+		text, askErr = h.app.Pi.Ask(ctx, prompt)
+	}
 	if askErr != nil {
 		slog.Error("derpies pi ask failed", "module", module, "error", askErr)
 		return
@@ -396,19 +616,28 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 9. SANITY before learning: charset/length — judged on the FOLDED
-	//    verdict word (a unicode respelling folds to its ASCII base, so
-	//    "GIMMICK:žwift" evaluates as "zwift") — AND the folded word must
-	//    have appeared as a folded token of the message (same tokenization as the fast path — unicode
-	//    respellings in the text fold identically) — the SHIPPED gate shape
-	//    holds, no form change: `wordValid` then token-in-message, both now
-	//    over FOLDED values. A hallucinated word can never enter the list.
+	// 9. SANITY before learning: charset/length — on the FOLDED verdict word
+	//    (shipped form) — AND, when the (union of posted + referenced) text
+	//    has tokens, the folded word must have appeared as a folded token of
+	//    that text (same tokenization as the fast path). A message with NO
+	//    text tokens at all (image-only, or empty text with an empty/absent
+	//    reference) is bounded by wordValid alone: the verdict word may come
+	//    from image text (the message is being filtered — a wrong word can
+	//    only delete the gated user's own future message containing that
+	//    word). A hallucinated word can never enter the list.
 	fw := foldToASCII(word)
 	if !wordValid(fw) {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
-	if !toks[fw] {
+	hasTextTokens := false
+	for tok := range toks {
+		if tok != "" {
+			hasTextTokens = true
+			break
+		}
+	}
+	if hasTextTokens && !toks[fw] {
 		slog.Warn("derpies verdict word not in the message — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
