@@ -38,6 +38,11 @@ type Config struct {
 	// instead of 5m) and trigger the auto-gulag on bot mention. Default: empty.
 	SlowUserIDs map[int64]struct{}
 
+	// DerpiesUserIDs are the Discord user IDs whose messages the derpies
+	// filter watches (fast-path word match + pi RPC fallback). Kept as a
+	// map like the other lists. Default: empty.
+	DerpiesUserIDs map[int64]struct{}
+
 	// SkillsDir is the resolved skills directory (see parseSkillsDir). The
 	// TUGBOT_SKILLS_DIR var may point at the repo root or at the skills dir
 	// itself. Default: the directory of os.Executable(); if that directory
@@ -102,6 +107,10 @@ func LoadConfig() (*Config, error) {
 	// SLOW_USER_IDS — same parsing as the exemption list.
 	slow := parseIDList(os.Getenv("SLOW_USER_IDS"))
 
+	// TUGBOT_DERPIES_USER_IDS — comma-separated Discord user IDs; same
+	// parsing as SLOW_USER_IDS (malformed parts skipped).
+	derpies := parseIDList(os.Getenv("TUGBOT_DERPIES_USER_IDS"))
+
 	return &Config{
 		Token:                 token,
 		ApplicationID:         appIDStr,
@@ -109,6 +118,7 @@ func LoadConfig() (*Config, error) {
 		AdminUserID:           adminUserID,
 		CooldownExemptUserIDs: exempt,
 		SlowUserIDs:           slow,
+		DerpiesUserIDs:        derpies,
 		SkillsDir:             parseSkillsDir(os.Getenv("TUGBOT_SKILLS_DIR")),
 		LogLevel:              parseLogLevel(os.Getenv("RUST_LOG")),
 	}, nil

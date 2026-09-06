@@ -51,8 +51,16 @@ migrate:
 
 # Start the compose PG, run the DB-touching tests against it (the DB's
 # own credentials are used via TUGBOT_TEST_DATABASE_URL), stop the PG
+# NOTE: this target invalidates the migration tracker on the shared compose DB
+# (the dbmigrate/features tests reset their state: `schema_migrations`, `servers`,
+# `features` rows; the derpies test drops/recreates `derpies_gimmicks` and deletes
+# its own tracker row). Before the next `make migrate` / `make setup`: reset the
+# DB with `docker compose down -v` (a plain container recreate does NOT reset it —
+# the named volume survives), or DROP the test-left objects (`derpies_gimmicks`,
+# `schema_migrations`, `features` — on a previously-migrated DB also the baseline
+# objects a re-run recreates, e.g. the `job_status` type) and re-run migrate.
 test-db: db-up
-	TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test ./internal/dbmigrate ./internal/features -count=1
+	TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 ./internal/dbmigrate ./internal/features ./internal/handlers/derpies -count=1
 	docker compose down
 
 # Build, then the CI selftest surface (the selftest connects to the

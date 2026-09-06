@@ -43,6 +43,7 @@ import (
 	"github.com/danielcherubini/tugbot/internal/handlers/aislop"
 	"github.com/danielcherubini/tugbot/internal/handlers/bsky"
 	"github.com/danielcherubini/tugbot/internal/handlers/cull"
+	"github.com/danielcherubini/tugbot/internal/handlers/derpies"
 	"github.com/danielcherubini/tugbot/internal/handlers/feat"
 	"github.com/danielcherubini/tugbot/internal/handlers/gokupoll"
 	"github.com/danielcherubini/tugbot/internal/handlers/gulag"
@@ -119,6 +120,7 @@ type handlers struct {
 	prefix    *prefixhandler.PrefixHandler
 	feat      *feat.Feat
 	cull      *cull.Cull
+	derpies   *derpies.Derpies
 
 	// Test seams (mirroring the per-handler seam convention; nil = the
 	// concrete Discord-session / gulag paths run unchanged in
@@ -142,7 +144,7 @@ type handlers struct {
 	applyShapeFu func(guildID, name string) error
 }
 
-// newHandlers constructs all eleven handlers (the selftest's "handler
+// newHandlers constructs all twelve handlers (the selftest's "handler
 // construction" step and main's wiring).
 func newHandlers(a *app.App) *handlers {
 	return &handlers{
@@ -158,6 +160,7 @@ func newHandlers(a *app.App) *handlers {
 		prefix:    prefixhandler.New(a),
 		feat:      feat.New(a),
 		cull:      cull.New(a),
+		derpies:   derpies.New(a),
 	}
 }
 
@@ -227,7 +230,7 @@ func (s serversStore) deleteServer(ctx context.Context, id int32) (int, error) {
 
 func main() {
 	selftest := flag.Bool("selftest", false,
-		"Verify the CI surface and exit WITHOUT opening the Discord gateway: load the config (falling back to dummies for missing DISCORD_TOKEN/APPLICATION_ID), connect the database pool at postgres://postgres:postgres@localhost:5432/tugbot — the compose-PG URL, start its container with `make db-up` (alias: docker compose up -d postgres; docker/compose pins the postgres:postgres credentials on database tugbot) — construct the discordgo session and all eleven handlers")
+		"Verify the CI surface and exit WITHOUT opening the Discord gateway: load the config (falling back to dummies for missing DISCORD_TOKEN/APPLICATION_ID), connect the database pool at postgres://postgres:postgres@localhost:5432/tugbot — the compose-PG URL, start its container with `make db-up` (alias: docker compose up -d postgres; docker/compose pins the postgres:postgres credentials on database tugbot) — construct the discordgo session and all twelve handlers")
 	flag.Parse()
 
 	if *selftest {
@@ -283,7 +286,7 @@ func runSelftest() int {
 
 	a := app.NewApp(cfg, pool, d)
 	_ = newHandlers(a)
-	slog.Info("selftest: Discord session and all eleven handlers constructed", "module", "main")
+	slog.Info("selftest: Discord session and all twelve handlers constructed", "module", "main")
 	return 0
 }
 
@@ -384,6 +387,7 @@ func run() {
 			h.bsky.MessageCreate(m)
 			h.instagram.MessageCreate(m)
 			h.mention.MessageCreate(m)
+			h.derpies.MessageCreate(m)
 		}()
 	})
 

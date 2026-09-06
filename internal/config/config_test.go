@@ -25,6 +25,7 @@ func validEnv() map[string]string {
 		"ADMIN_USER_ID":            "",
 		"COOLDOWN_EXEMPT_USER_IDS": "",
 		"SLOW_USER_IDS":            "",
+		"TUGBOT_DERPIES_USER_IDS":  "",
 		"TUGBOT_SKILLS_DIR":        "",
 		"RUST_LOG":                 "",
 	}
@@ -250,6 +251,53 @@ func TestLoadConfigSlowUserIDs(t *testing.T) {
 	if len(cfg.SlowUserIDs) != 2 {
 		t.Errorf("SlowUserIDs = %v, want 2 entries", cfg.SlowUserIDs)
 	}
+}
+
+func TestLoadConfigDerpiesUserIDs(t *testing.T) {
+	t.Run("comma list parses", func(t *testing.T) {
+		vars := validEnv()
+		vars["TUGBOT_DERPIES_USER_IDS"] = "163055057254875136,999"
+		setEnv(t, vars)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v, want nil", err)
+		}
+		if _, ok := cfg.DerpiesUserIDs[163055057254875136]; !ok {
+			t.Error("DerpiesUserIDs missing 163055057254875136")
+		}
+		if _, ok := cfg.DerpiesUserIDs[999]; !ok {
+			t.Error("DerpiesUserIDs missing 999")
+		}
+		if len(cfg.DerpiesUserIDs) != 2 {
+			t.Errorf("DerpiesUserIDs len = %d, want 2", len(cfg.DerpiesUserIDs))
+		}
+	})
+
+	t.Run("malformed parts skipped, default empty", func(t *testing.T) {
+		vars := validEnv()
+		vars["TUGBOT_DERPIES_USER_IDS"] = "163055057254875136,abc,"
+		setEnv(t, vars)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v, want nil", err)
+		}
+		if _, ok := cfg.DerpiesUserIDs[163055057254875136]; !ok {
+			t.Error("DerpiesUserIDs missing the valid entry")
+		}
+		if len(cfg.DerpiesUserIDs) != 1 {
+			t.Errorf("DerpiesUserIDs len = %d, want 1 (malformed parts must be skipped)", len(cfg.DerpiesUserIDs))
+		}
+
+		vars2 := validEnv()
+		setEnv(t, vars2)
+		cfg2, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v, want nil", err)
+		}
+		if len(cfg2.DerpiesUserIDs) != 0 {
+			t.Errorf("unset var: DerpiesUserIDs len = %d, want 0", len(cfg2.DerpiesUserIDs))
+		}
+	})
 }
 
 func TestLoadConfigLogLevel(t *testing.T) {
