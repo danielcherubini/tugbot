@@ -13,7 +13,7 @@ The Go rewrite ports the 11 **live** handler modules/packages of the Rust bot (i
 _Avoid_: 1:1 port, literal port, full rewrite
 
 **Gimmick word**
-An obfuscated token (e.g. `sw1ft`) that Derpie uses to evade the derpies filter's word matching. Persisted in the `derpies_gimmicks` table with `source` distinguishing `seed` (migration-seeded) from `llm` (learnt at runtime via the pi RPC verdict). Matched by lowercase, punctuation-trimmed exact token match — never substring.
+An obfuscated token (e.g. `sw1ft`) that Derpie uses to evade the derpies filter's word matching. Persisted in the `derpies_gimmicks` table with `source` distinguishing `seed` (migration-seeded), `llm` (learnt at runtime via the pi RPC verdict), and `manual` (curated at runtime via the `/gimmick` slash command). Matched by lowercase, punctuation-trimmed exact token match — never substring.
 _Avoid_: blocklist entry, banned word, filter entry
 
 **Derpies filter**

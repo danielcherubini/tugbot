@@ -101,8 +101,8 @@ func TestReadyThreeWayKeepsNegativeIDRows(t *testing.T) {
 
 // TestRegisterCommandsUsesReadySliceRustOrder locks the single-load reuse
 // (M3: registerCommands takes the readyThreeWay slice, no second read) and
-// the Rust mod.rs:285-302 vector order on the five non-gulag shapes
-// (M11: AI Slop, horny, phony, feature, cull).
+// the Rust mod.rs:285-302 vector order on the six non-gulag shapes
+// (M11: AI Slop, horny, phony, feature, cull, gimmick).
 func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	pool := setupTestDB(t)
 	if pool == nil {
@@ -140,38 +140,45 @@ func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	}
 	want := []string{
 		"999/AI Slop", "999/horny", "999/phony", "999/feature", "999/cull",
+		"999/gimmick",
 	}
 	if len(shapes) != len(want) {
 		t.Fatalf("shape registrations: got %v, want %v", shapes, want)
 	}
 	for i := range want {
 		if shapes[i] != want[i] {
-			t.Errorf("shape %d: got %q, want %q (Rust mod.rs vector order: AI Slop, horny, phony, feature, cull)", i, shapes[i], want[i])
+			t.Errorf("shape %d: got %q, want %q (Rust mod.rs vector order: AI Slop, horny, phony, feature, cull, gimmick)", i, shapes[i], want[i])
 		}
 	}
 }
 
 // TestDeliverInteractionACKRace pins the in-flight ACK-deadline race
 // (see deliverInteraction in main.go): fast work is delivered as the
-// plain reply (the bad-token session's 401 is logged, not asserted);
-// a fast defer response (cull's contract) ACKs on its own without
-// touching the watchdog seams; slow work (work outlives
+// plain reply (the bad-token session's 401 is logged, not asserted in
+// the stub arm); a fast defer response (cull's contract) ACKs on its
+// own without touching the watchdog seams; a fast-path respond FAILURE
+// falls back to the slow path (single defer-ACK, then the whole
+// delivery set as follow-ups); slow work (work outlives
 // interactionAckBudget) first ACKs via the watchdog's defer, then
-// delivers the result via the follow-up stub, with the ephemeral
-// flag passed through.
+// delivers the delivery set (chunks, else content) as follow-ups, with
+// the ephemeral flag passed through. Counters are reset per arm: the
+// per-arm expectations hold only with fresh counters.
 func TestDeliverInteractionACKRace(t *testing.T) {
 	s, err := discordgo.New("123456789012345678")
 	if err != nil {
 		t.Fatalf("discordgo.New: %v", err)
 	}
 	h := &handlers{app: app.NewApp(nil, nil, s)}
-	var ackCalls, followups []bool
+	var ackCalls int
+	var followupContents [][]string
+	var followupEphemeral []bool
 	h.deferAckFu = func() error {
-		ackCalls = append(ackCalls, true)
+		ackCalls++
 		return nil
 	}
-	h.followupFu = func(content string, ephemeral bool) error {
-		followups = append(followups, ephemeral)
+	h.followupFu = func(chunks []string, ephemeral bool) error {
+		followupContents = append(followupContents, chunks)
+		followupEphemeral = append(followupEphemeral, ephemeral)
 		return nil
 	}
 	i := &discordgo.Interaction{ID: "1", Type: discordgo.InteractionApplicationCommand}
@@ -182,26 +189,101 @@ func TestDeliverInteractionACKRace(t *testing.T) {
 	interactionAckBudget = 30 * time.Millisecond
 	defer func() { interactionAckBudget = old }()
 
-	// Fast: plain reply, watchdog untouched.
+	reset := func() {
+		ackCalls = 0
+		followupContents = nil
+		followupEphemeral = nil
+	}
+	wantFollowUps := func(name string, want [][]string, wantFlags ...bool) {
+		if len(followupContents) != len(want) {
+			t.Fatalf("%s: followups=%v, want %v", name, followupContents, want)
+		}
+		for n, got := range followupContents {
+			if len(got) != len(want[n]) {
+				t.Fatalf("%s: followup[%d]=%v, want %v", name, n, got, want[n])
+			}
+			for k, c := range got {
+				if c != want[n][k] {
+					t.Fatalf("%s: followup[%d]=%v, want %v", name, n, got, want[n])
+				}
+			}
+		}
+		if len(wantFlags) > 0 && (len(followupEphemeral) != len(wantFlags) || followupEphemeral[0] != wantFlags[0]) {
+			t.Fatalf("%s: flags=%v, want %v", name, followupEphemeral, wantFlags)
+		}
+	}
+
+	// Fast plain, single message: stub respond, watchdog untouched.
+	reset()
+	h.respondFu = func(reply) error { return nil }
 	h.deliverInteraction(i, func() reply { return reply{content: "fresh"} })
-	if len(ackCalls) != 0 || len(followups) != 0 {
-		t.Fatalf("fast: ack=%v followup=%v, want none", ackCalls, followups)
+	if ackCalls != 0 || len(followupContents) != 0 {
+		t.Fatalf("fast: ack=%d followup=%v, want none", ackCalls, followupContents)
 	}
-	// Fast defer response: its own ACK, watchdog untouched.
+	// Fast defer response (cull's contract): its own ACK, watchdog
+	// untouched.
+	reset()
+	h.respondFu = func(reply) error { return nil }
 	h.deliverInteraction(i, func() reply { return reply{content: "cull", deferResp: true, ephemeral: true} })
-	if len(ackCalls) != 0 || len(followups) != 0 {
-		t.Fatalf("fast deferResp: ack=%v followup=%v, want none", ackCalls, followups)
+	if ackCalls != 0 || len(followupContents) != 0 {
+		t.Fatalf("fast deferResp: ack=%d followup=%v, want none", ackCalls, followupContents)
 	}
-	// Slow: watchdog ACK, then follow-up (non-ephemeral content).
-	h.deliverInteraction(i, func() reply { time.Sleep(150 * time.Millisecond); return reply{content: "slow"} })
-	if len(ackCalls) != 1 || len(followups) != 1 || followups[0] != false {
-		t.Fatalf("slow: ack=%v followup=%v, want [true], [false]", ackCalls, followups)
+	// Fast plain, respond FAILURE: the real session's 401 exercises the
+	// fallback — single defer-ACK, then the delivery set as follow-ups.
+	reset()
+	h.respondFu = nil
+	h.deliverInteraction(i, func() reply { return reply{content: "fresh"} })
+	if ackCalls != 1 {
+		t.Fatalf("fast failure: ack=%d, want 1", ackCalls)
 	}
-	// Slow ephemeral: the follow-up carries the flag through.
-	h.deliverInteraction(i, func() reply { time.Sleep(150 * time.Millisecond); return reply{content: "slow e", ephemeral: true} })
-	if len(followups) != 2 || followups[1] != true {
-		t.Fatalf("slow ephemeral: followup=%v, want [false true]", followups)
+	wantFollowUps("fast failure", [][]string{{"fresh"}}, false)
+	// Fast plain, multi-chunk (success arm of the fan-out): chunk 0
+	// rides the interaction; the remainder follow up.
+	reset()
+	h.respondFu = func(reply) error { return nil }
+	h.deliverInteraction(i, func() reply { return reply{content: "c0", chunks: []string{"c0", "c1", "c2"}, ephemeral: true} })
+	if ackCalls != 0 {
+		t.Fatalf("fast multi: ack=%d, want 0", ackCalls)
 	}
+	wantFollowUps("fast multi", [][]string{{"c1", "c2"}}, true)
+	// Fast plain multi-chunk, respond failure: full-set fallback (no
+	// mix: nothing was delivered initially).
+	reset()
+	h.respondFu = nil
+	h.deliverInteraction(i, func() reply { return reply{content: "c0", chunks: []string{"c0", "c1"}} })
+	if ackCalls != 1 {
+		t.Fatalf("fast multi failure: ack=%d, want 1", ackCalls)
+	}
+	wantFollowUps("fast multi failure", [][]string{{"c0", "c1"}}, false)
+	// Slow single message: watchdog ACK, then the delivery set as a
+	// follow-up (non-ephemeral content).
+	reset()
+	h.deliverInteraction(i, func() reply { time.Sleep(150 * time.Millisecond); return reply{content: "solo"} })
+	if ackCalls != 1 {
+		t.Fatalf("slow: ack=%d, want 1", ackCalls)
+	}
+	wantFollowUps("slow", [][]string{{"solo"}}, false)
+	// Slow multi-chunk: the whole delivery set follows up.
+	reset()
+	h.deliverInteraction(i, func() reply {
+		time.Sleep(150 * time.Millisecond)
+		return reply{content: "s0", chunks: []string{"s0", "s1", "s2"}}
+	})
+	if ackCalls != 1 {
+		t.Fatalf("slow multi: ack=%d, want 1", ackCalls)
+	}
+	wantFollowUps("slow multi", [][]string{{"s0", "s1", "s2"}}, false)
+	// Slow multi-chunk ephemeral: the follow-up carries the flag
+	// through.
+	reset()
+	h.deliverInteraction(i, func() reply {
+		time.Sleep(150 * time.Millisecond)
+		return reply{content: "s0", chunks: []string{"s0", "s1"}, ephemeral: true}
+	})
+	if ackCalls != 1 {
+		t.Fatalf("slow multi ephemeral: ack=%d, want 1", ackCalls)
+	}
+	wantFollowUps("slow multi ephemeral", [][]string{{"s0", "s1"}}, true)
 }
 
 // TestDiscordgoToken pins the Rust->discordgo token-contract

@@ -414,7 +414,7 @@ func TestSelectGulagUsersReleasableBoundary(t *testing.T) {
 	pool := setupGulagTestDB(t)
 	g := newGulag(&discordgo.Session{}, pool)
 	ctx := context.Background()
-	now := time.Now()
+	now := time.Now().UTC()
 	for _, c := range []struct {
 		userID int64
 		offset time.Duration

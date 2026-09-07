@@ -35,9 +35,9 @@ func TestConstants(t *testing.T) {
 // TestWhitelistRoles pins the role allowlist in Rust order
 // (cull.rs:24-26).
 func TestWhitelistRoles(t *testing.T) {
-	roles := whitelistRoles()
+	roles := WhitelistRoles()
 	if len(roles) != 2 || roles[0] != "Highly Regarded" || roles[1] != "admin" {
-		t.Errorf("whitelistRoles() = %v, want [Highly Regarded admin]", roles)
+		t.Errorf("WhitelistRoles() = %v, want [Highly Regarded admin]", roles)
 	}
 }
 

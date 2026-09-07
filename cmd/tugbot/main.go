@@ -45,6 +45,7 @@ import (
 	"github.com/danielcherubini/tugbot/internal/handlers/cull"
 	"github.com/danielcherubini/tugbot/internal/handlers/derpies"
 	"github.com/danielcherubini/tugbot/internal/handlers/feat"
+	"github.com/danielcherubini/tugbot/internal/handlers/gimmick"
 	"github.com/danielcherubini/tugbot/internal/handlers/gokupoll"
 	"github.com/danielcherubini/tugbot/internal/handlers/gulag"
 	"github.com/danielcherubini/tugbot/internal/handlers/instagram"
@@ -120,6 +121,7 @@ type handlers struct {
 	prefix    *prefixhandler.PrefixHandler
 	feat      *feat.Feat
 	cull      *cull.Cull
+	gimmick   *gimmick.Gimmick
 	derpies   *derpies.Derpies
 
 	// Test seams (mirroring the per-handler seam convention; nil = the
@@ -134,17 +136,20 @@ type handlers struct {
 	// deferAckFu substitutes for the watchdog's defer-ACK call (see
 	// deliverInteraction).
 	deferAckFu func() error
-	// followupFu substitutes for the post-ACK follow-up message.
-	followupFu func(content string, ephemeral bool) error
+	// followupFu substitutes for the post-ACK follow-up message(s).
+	followupFu func(chunks []string, ephemeral bool) error
+	// respondFu substitutes for the fast-path respond (see
+	// deliverInteraction).
+	respondFu func(reply) error
 	// guildSetupFu substitutes for the four-shape
 	// Gulag.SetupCommand(d) registration.
 	guildSetupFu func() []error
-	// applyShapeFu substitutes for the five non-gulag shape
+	// applyShapeFu substitutes for the six non-gulag shape
 	// ApplicationCommandCreate calls.
 	applyShapeFu func(guildID, name string) error
 }
 
-// newHandlers constructs all twelve handlers (the selftest's "handler
+// newHandlers constructs all thirteen handlers (the selftest's "handler
 // construction" step and main's wiring).
 func newHandlers(a *app.App) *handlers {
 	return &handlers{
@@ -160,6 +165,7 @@ func newHandlers(a *app.App) *handlers {
 		prefix:    prefixhandler.New(a),
 		feat:      feat.New(a),
 		cull:      cull.New(a),
+		gimmick:   gimmick.New(a),
 		derpies:   derpies.New(a),
 	}
 }
@@ -230,7 +236,7 @@ func (s serversStore) deleteServer(ctx context.Context, id int32) (int, error) {
 
 func main() {
 	selftest := flag.Bool("selftest", false,
-		"Verify the CI surface and exit WITHOUT opening the Discord gateway: load the config (falling back to dummies for missing DISCORD_TOKEN/APPLICATION_ID), connect the database pool at postgres://postgres:postgres@localhost:5432/tugbot — the compose-PG URL, start its container with `make db-up` (alias: docker compose up -d postgres; docker/compose pins the postgres:postgres credentials on database tugbot) — construct the discordgo session and all twelve handlers")
+		"Verify the CI surface and exit WITHOUT opening the Discord gateway: load the config (falling back to dummies for missing DISCORD_TOKEN/APPLICATION_ID), connect the database pool at postgres://postgres:postgres@localhost:5432/tugbot — the compose-PG URL, start its container with `make db-up` (alias: docker compose up -d postgres; docker/compose pins the postgres:postgres credentials on database tugbot) — construct the discordgo session and all thirteen handlers")
 	flag.Parse()
 
 	if *selftest {
@@ -286,7 +292,7 @@ func runSelftest() int {
 
 	a := app.NewApp(cfg, pool, d)
 	_ = newHandlers(a)
-	slog.Info("selftest: Discord session and all twelve handlers constructed", "module", "main")
+	slog.Info("selftest: Discord session and all thirteen handlers constructed", "module", "main")
 	return 0
 }
 
@@ -438,7 +444,7 @@ func run() {
 	})
 
 	// OnReady — Rust ready(): the servers three-way + the per-guild
-	// command registration (9 shapes). The pi RPC spawn is main's
+	// command registration (10 shapes). The pi RPC spawn is main's
 	// instead (startup step 3); the ready-arm parity is the rest. The
 	// ready three-way's row slice is REUSED for the registration (Rust
 	// ready() iterates the same get_servers() result — one load, not
@@ -511,6 +517,11 @@ func run() {
 //     response, whose content rides the follow-up.
 //   - Fatal work (the ACK itself answers 10062): the interaction is
 //     unrecoverable; the error is logged and the follow-up is skipped.
+//
+// Multi-chunk replies: fast path responds with chunk 0 and follow-ups
+// the remainder; fast-path failure falls back to the slow path
+// (defer-ACK + the full delivery set as follow-ups); slow path
+// delivers the delivery set (chunks, else content) as follow-ups.
 func (h *handlers) deliverInteraction(i *discordgo.Interaction, work func() reply) {
 	claimed := &atomic.Bool{}
 	done := make(chan reply, 1)
@@ -518,44 +529,99 @@ func (h *handlers) deliverInteraction(i *discordgo.Interaction, work func() repl
 	select {
 	case r := <-done:
 		if r.deferResp {
-			h.respond(i, r)
+			if err := h.callRespond(i, r); err != nil {
+				return
+			}
 			return
 		}
 		if claimed.CompareAndSwap(false, true) {
-			h.respond(i, r)
+			if err := h.callRespond(i, r); err != nil {
+				// Fast-path failure → fallback (never mix a sent
+				// initial response with follow-ups for the same
+				// reply): single defer-ACK, then deliver the whole
+				// delivery set as follow-ups; skip the follow-ups if
+				// the ACK itself fails (Fatal-work semantics, same as
+				// the slow branch).
+				if ackErr := h.watchdogACK(i); ackErr != nil {
+					return
+				}
+				// deliverFollowUps logs its own failures (the ACK already
+				// landed; Fatal-work semantics of the slow branch).
+				_ = h.deliverFollowUps(i, r.deliverySet(), r.ephemeral) //nolint:errcheck // logged internally
+				return
+			}
+			if len(r.chunks) > 1 {
+				_ = h.deliverFollowUps(i, r.chunks[1:], r.ephemeral) //nolint:errcheck // logged internally
+			}
 		}
 	case <-time.After(interactionAckBudget):
 		claimed.Store(true)
 		slog.Warn("slash command outlived its ACK budget — deferring IN-FLIGHT, then follow-up", "module", "main")
-		var ackErr error
-		if h.deferAckFu != nil {
-			ackErr = h.deferAckFu()
-		} else {
-			ack := &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{},
-			}
-			ackErr = h.app.D.InteractionRespond(i, ack)
-		}
-		if ackErr != nil {
-			slog.Error("Cannot defer slash command (ACK)", "module", "main", "error", ackErr)
+		if ackErr := h.watchdogACK(i); ackErr != nil {
 			return
 		}
-		r := <-done // the interaction is already ack'd; wait the work out
-		fm := &discordgo.WebhookParams{Content: r.content}
-		if r.ephemeral {
+		r := <-done                                             // the interaction is already ack'd; wait the work out
+		_ = h.deliverFollowUps(i, r.deliverySet(), r.ephemeral) //nolint:errcheck // logged internally
+	}
+}
+
+// callRespond is the fast-path seam-or-real selector: the respondFu
+// stub when set (see the test seams on handlers), the real respond
+// otherwise.
+func (h *handlers) callRespond(i *discordgo.Interaction, r reply) error {
+	if h.respondFu != nil {
+		return h.respondFu(r)
+	}
+	return h.respond(i, r)
+}
+
+// watchdogACK is the slow branch's defer-ACK block (stub-or-real); on
+// failure it logs "Cannot defer slash command (ACK)" (Fatal-work
+// semantics) and returns the error so the caller can skip the
+// follow-ups.
+func (h *handlers) watchdogACK(i *discordgo.Interaction) error {
+	var ackErr error
+	if h.deferAckFu != nil {
+		ackErr = h.deferAckFu()
+	} else {
+		ack := &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{},
+		}
+		ackErr = h.app.D.InteractionRespond(i, ack)
+	}
+	if ackErr != nil {
+		slog.Error("Cannot defer slash command (ACK)", "module", "main", "error", ackErr)
+	}
+	return ackErr
+}
+
+// deliverFollowUps delivers a delivery set (the chunks, or the single
+// content message) as post-ACK follow-ups: the followupFu stub when
+// set, else one FollowupMessageCreate per chunk with
+// MessageFlagsEphemeral when ephemeral. A per-chunk failure is logged
+// per chunk (not once per batch); the error is returned when ANY
+// follow-up failed (the caller absorbs it per the existing style).
+func (h *handlers) deliverFollowUps(i *discordgo.Interaction, set []string, ephemeral bool) error {
+	var anyErr error
+	if h.followupFu != nil {
+		if err := h.followupFu(set, ephemeral); err != nil {
+			slog.Error("Cannot follow up slash command", "module", "main", "error", err)
+			return err
+		}
+		return nil
+	}
+	for _, c := range set {
+		fm := &discordgo.WebhookParams{Content: c}
+		if ephemeral {
 			fm.Flags = discordgo.MessageFlagsEphemeral
 		}
-		var fuErr error
-		if h.followupFu != nil {
-			fuErr = h.followupFu(r.content, r.ephemeral)
-		} else {
-			_, fuErr = h.app.D.FollowupMessageCreate(i, false, fm)
-		}
-		if fuErr != nil {
-			slog.Error("Cannot follow up slash command", "module", "main", "error", fuErr)
+		if _, err := h.app.D.FollowupMessageCreate(i, false, fm); err != nil {
+			slog.Error("Cannot follow up slash command", "module", "main", "error", err)
+			anyErr = err
 		}
 	}
+	return anyErr
 }
 
 // isContextErr folds the loop-drain arms: a ctx-canceled loop is a
@@ -566,19 +632,32 @@ func isContextErr(err error) bool {
 
 // reply is this binary's share of Rust's HandlerResponse shape
 // (Content + Ephemeral + DeferResponse — cull is the one handler whose
-// responses defer; none of the nine commands carry components, so the
-// shape has no components field).
+// responses defer; none of the ten commands carry components, so the
+// shape has no components field). chunks carries a multi-message
+// delivery (the /gimmick list overflow): when non-empty, chunks IS
+// the delivery set (content mirrors chunk 0 for the fast path); when
+// empty, the delivery set is the single content message.
 type reply struct {
 	content   string
 	ephemeral bool
 	deferResp bool
+	chunks    []string
+}
+
+// deliverySet is the message set a follow-up branch must deliver:
+// the chunks when present, else the single content message.
+func (r reply) deliverySet() []string {
+	if len(r.chunks) > 0 {
+		return r.chunks
+	}
+	return []string{r.content}
 }
 
 // dispatchCommand mirrors Rust's interaction_create (mod.rs:214-253) in
 // the pinned name order: gulag, gulag-release, gulag-list, Add Gulag
 // Vote (message-kind, target_id = message id → outific author), AI Slop
 // (message-kind, first resolved message), phony, horny (both via
-// prefixhandler), feature (Feat), cull. Fallthrough: ephemeral "Not
+// prefixhandler), feature (Feat), cull, gimmick. Fallthrough: ephemeral "Not
 // Implemented" WITHOUT a defer (Rust defer_response: None).
 func (h *handlers) dispatchCommand(i *discordgo.Interaction) reply {
 	name := ""
@@ -616,6 +695,9 @@ func (h *handlers) dispatchCommand(i *discordgo.Interaction) reply {
 	case "cull":
 		r := h.cull.HandleInteraction(i)
 		return reply{content: r.Content, ephemeral: r.Ephemeral, deferResp: r.DeferResponse}
+	case "gimmick":
+		r := h.gimmick.HandleInteraction(i)
+		return reply{content: r.Content, ephemeral: r.Ephemeral, chunks: r.Chunks}
 	default:
 		return reply{content: "Not Implemented", ephemeral: true}
 	}
@@ -706,12 +788,13 @@ func (h *handlers) readyThreeWay(ctx context.Context) []serverRow {
 	return verified
 }
 
-// registerCommands pins the per-guild registration: EXACTLY the nine
-// command shapes (7 slash + 2 message-kind; there is no "goku"). The
+// registerCommands pins the per-guild registration: EXACTLY the ten
+// command shapes (8 slash + 2 message-kind; there is no "goku"). The
 // four gulag shapes (gulag, gulag-release, gulag-list, Add Gulag Vote)
 // go through the canonical gulag.SetupCommand — registered onto every
-// configured guild at once — then the remaining five shapes (AI Slop,
-// phony, horny, feature, cull) in the Rust ready() vector order, per
+// configured guild at once — then the remaining six shapes (AI Slop,
+// phony, horny, feature, cull, gimmick) in the Rust ready() vector
+// order, per
 // guild. The per-guild iteration consumes the ready three-way's row
 // slice (the caller's readyThreeWay result, passed in) — ONE load,
 // Rust parity (ready() iterates the single get_servers() result; no
@@ -724,13 +807,14 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 	for _, s := range servers {
 		gid := strconv.FormatInt(s.GuildID, 10)
 		// Rust ready() vector order (after the four gulag shapes):
-		// AI Slop, horny, phony, feature, cull.
+		// AI Slop, horny, phony, feature, cull, gimmick.
 		shapes := []*discordgo.ApplicationCommand{
 			h.aiSlop.SetupCommand(),
 			h.prefix.SetupCommand("horny", "Mark yourself as horny/lfg"),
 			h.prefix.SetupCommand("phony", "Mark yourself as phony/watching"),
 			h.feat.SetupCommand(),
 			h.cull.SetupCommand(),
+			h.gimmick.SetupCommand(),
 		}
 		for _, cmd := range shapes {
 			if err := h.applyShape(gid, cmd); err != nil {
@@ -740,7 +824,7 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 	}
 
 	slog.Info("I now have the following guild slash commands:", "module", "main")
-	for _, n := range []string{"gulag", "gulag-release", "gulag-list", "Add Gulag Vote", "AI Slop", "horny", "phony", "feature", "cull"} {
+	for _, n := range []string{"gulag", "gulag-release", "gulag-list", "Add Gulag Vote", "AI Slop", "horny", "phony", "feature", "cull", "gimmick"} {
 		slog.Info(n, "module", "main")
 	}
 }
@@ -748,9 +832,11 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 // respond mirrors Rust's interaction_create reply logic (mod.rs:236-253)
 // + the error logging: defer arm (defer_response == Some(true) → Defer
 // with the ephemeral flag — cull's path); otherwise the message arm
-// (honoring the ephemeral flag; none of the nine commands carry
-// components). Send failures log "Cannot respond to slash command".
-func (h *handlers) respond(i *discordgo.Interaction, r reply) {
+// (honoring the ephemeral flag; none of the ten commands carry
+// components). Send failures log "Cannot respond to slash command" AND
+// return the error (the fast path in deliverInteraction falls back on
+// it).
+func (h *handlers) respond(i *discordgo.Interaction, r reply) error {
 	d := h.app.D
 	var resp *discordgo.InteractionResponse
 	if r.deferResp {
@@ -774,5 +860,7 @@ func (h *handlers) respond(i *discordgo.Interaction, r reply) {
 	}
 	if err := d.InteractionRespond(i, resp); err != nil {
 		slog.Error("Cannot respond to slash command", "module", "main", "error", err)
+		return err
 	}
+	return nil
 }

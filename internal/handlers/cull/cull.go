@@ -43,9 +43,10 @@ const (
 	DefaultDays = 30
 )
 
-// whitelistRoles — users with these roles are never culled
-// (cull.rs:24-26, in Rust order).
-func whitelistRoles() []string { return []string{"Highly Regarded", "admin"} }
+// WhitelistRoles — the role names that whitelist a user from cull
+// (cull.rs:24-26, in Rust order). Exported: consumed by the /gimmick
+// gate so the two gates can never drift.
+func WhitelistRoles() []string { return []string{"Highly Regarded", "admin"} }
 
 // scanDaysSeconds is the 180-day scan cutoff (the Rust constant
 // `180 * 86400` seconds).
@@ -322,7 +323,7 @@ func (h *Cull) HandleInteraction(i *discordgo.Interaction) Response {
 	if err != nil {
 		return gateResponse("Error: Could not verify your permissions")
 	}
-	if !h.g.MemberHasAnyRole(ctx, guildID, member, whitelistRoles()...) {
+	if !h.g.MemberHasAnyRole(ctx, guildID, member, WhitelistRoles()...) {
 		return gateResponse("Error: You need Highly Regarded or admin role to use this command")
 	}
 
@@ -400,7 +401,7 @@ func (h *Cull) HandleInteraction(i *discordgo.Interaction) Response {
 	}
 	whitelistRoleIDs := map[string]bool{}
 	for _, role := range roles {
-		for _, name := range whitelistRoles() {
+		for _, name := range WhitelistRoles() {
 			if role.Name == name {
 				whitelistRoleIDs[role.ID] = true
 			}

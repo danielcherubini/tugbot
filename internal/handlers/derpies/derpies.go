@@ -18,19 +18,17 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/text/unicode/norm"
 
 	"github.com/danielcherubini/tugbot/internal/app"
 	"github.com/danielcherubini/tugbot/internal/features"
 	core "github.com/danielcherubini/tugbot/internal/handlers/gulag"
+	"github.com/danielcherubini/tugbot/internal/wordmatch"
 )
 
 const (
@@ -154,22 +152,6 @@ const punctB = "`{|}~"
 
 var punctTrim = punctA + punctB
 
-// foldToASCII lowers and reduces a token to ASCII: NFD decompose, drop
-// combining marks (Mn). "świft" -> "swift", "žwift" -> "zwift". Letters
-// that don't decompose to a base (e.g. Cyrillic lookalikes) stay — they
-// remain wordValid-ineligible and are only catchable via the LLM naming an
-// ASCII form.
-func foldToASCII(s string) string {
-	var b strings.Builder
-	for _, r := range norm.NFD.String(s) {
-		if unicode.Is(unicode.Mn, r) {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return strings.ToLower(b.String())
-}
-
 // tokensForMatch: fold each fielded token (foldToASCII — which includes the
 // lowercasing), trim leading and trailing punctuation off each FOLDED
 // token; keys of the result map are the folded tokens.
@@ -179,17 +161,9 @@ func tokensForMatch(content string) map[string]bool {
 	tokens := strings.Fields(content)
 	out := make(map[string]bool, len(tokens))
 	for _, tok := range tokens {
-		out[strings.Trim(foldToASCII(tok), punctTrim)] = true
+		out[strings.Trim(wordmatch.FoldToASCII(tok), punctTrim)] = true
 	}
 	return out
-}
-
-// wordValid: ^[a-z0-9]{2,32}$ — token charset only (no punctuation, no
-// unicode), 2..32 chars. Precompiled regexp.
-var wordRe = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
-
-func wordValid(w string) bool {
-	return wordRe.MatchString(w)
 }
 
 // parseVerdict: scan the lines of the pi response, take the FIRST non-empty
@@ -625,8 +599,8 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	//    from image text (the message is being filtered — a wrong word can
 	//    only delete the gated user's own future message containing that
 	//    word). A hallucinated word can never enter the list.
-	fw := foldToASCII(word)
-	if !wordValid(fw) {
+	fw := wordmatch.FoldToASCII(word)
+	if !wordmatch.WordValid(fw) {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
