@@ -27,3 +27,15 @@ _Avoid_: schema snapshot import, diesel history
 **Cutover**:
 The production switchover: stop the Rust systemd unit, point the unit at the Go binary, start. The Rust binary and old unit file are kept ~2 weeks for one-click rollback. There is no shadow/gray period — the token allows a single gateway connection.
 _Avoid_: migration, gray rollout, shadow bot, blue-green
+
+**MCP layer**:
+The in-process `internal/mcp` package: an always-on, zero-config Streamable-HTTP MCP server embedded in the tugbot process that shares the bot's single `*discordgo.Session` (the embedded-provider pattern — no second session, since the token allows one gateway connection). Agents (pi, Claude, …) connect to `:8642/mcp` and act as the bot.
+_Avoid_: MCP sidecar, MCP daemon, MCP plugin
+
+**Bridge tools**:
+The five v1 raw-Discord MCP tools: `list_guilds`, `list_channels`, `read_messages`, `post_message`, `react` — thin wrappers over session methods, no Postgres, no Pi.
+_Avoid_: MCP tools (unqualified), Discord API tools
+
+**Feature tools**:
+Follow-on MCP tools wrapping the bot's feature handlers (feature toggles, gimmick, gulag, ask-pi) — distinct from bridge tools; each needs a small `Invoke`-style public surface on the event-callback-shaped handlers.
+_Avoid_: feature MCP, command tools
