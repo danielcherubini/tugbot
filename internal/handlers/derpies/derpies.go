@@ -9,6 +9,11 @@
 // Degradation discipline (mirroring the mention feature): every failure
 // arm logs and stops — the flow never acts on a half-loaded list, and a
 // delete failure after a successful learn keeps the word learned.
+//
+// It also watches GUILD_MEMBER_UPDATE for the same gated users: a
+// nickname judged a gimmick is cleared (reset to default) via the same
+// fast path + pi RPC verdict, per member coalesced to one clear attempt
+// per 60-second window (nicknames.go).
 package derpies
 
 import (
@@ -20,6 +25,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -40,19 +46,38 @@ const (
 )
 
 // Derpies handles the derpies flow (feature gate → guild guard →
-// author-ID gate → fast-path token match → pi RPC verdict).
+// author-ID gate → fast-path token match → pi RPC verdict). It also
+// watches GUILD_MEMBER_UPDATE events for the same gated users and clears
+// their nicks when the flow judges them gimmicks (nicknames.go).
 type Derpies struct {
 	app *app.App
 	// New() wires the production store/ops. Tests (same package) assign
 	// the fakes directly, mirroring mention_test.go.
 	store store
 	ops   discordOps
+	// clock is the injectable clock (tests pin it; markEdit snapshots
+	// clock() at event time for the 60s window math).
+	clock func() time.Time
+	// lastNick is the per-member last-known nickname; "" means "no
+	// nickname" (display is the global name). Events whose Nick equals
+	// the cache were not nick changes (incl. our own clear's echo, the
+	// cache being written BEFORE it arrives) and are skipped.
+	lastNick map[string]string // key: guildID + "|" + memberID
+	lastEdit map[string]time.Time
+	busy     map[string]bool
+	nickMu   sync.Mutex // guards the three maps (lastNick, lastEdit, busy)
 }
 
 // New builds the handler from the shared *app.App (mirrors the mention
-// package's constructor).
+// package's constructor). Initializes ALL nickname-flow state: the maps
+// are keyed by guild+member and the first live event assigns into them,
+// so a nil map here would panic on the first live event (the selftest
+// constructs the handler but never dispatches events, so no gate would
+// catch it).
 func New(a *app.App) *Derpies {
-	return &Derpies{app: a, store: &poolStore{pool: a.Pool}, ops: &realOps{d: a.D}}
+	return &Derpies{app: a, store: &poolStore{pool: a.Pool}, ops: &realOps{d: a.D},
+		clock: time.Now, lastNick: map[string]string{},
+		lastEdit: map[string]time.Time{}, busy: map[string]bool{}}
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +113,8 @@ type discordOps interface {
 	// handled by the CALLER as "no reference" — log and continue, never
 	// abort the flow.
 	channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error)
+	// clearNickname — "reset to default" for the nickname flow.
+	clearNickname(guildID, memberID string) error
 }
 
 // poolStore is the production store (raw SQL over the shared pool).
@@ -138,6 +165,16 @@ func (o *realOps) deleteMessage(channelID, messageID string) error {
 
 func (o *realOps) channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error) {
 	return o.d.ChannelMessage(channelID, messageID)
+}
+
+// clearNickname — "reset to default": Discord's member PATCH accepts
+// "nick": null, which clears the per-server nickname (display falls back
+// to the global display name; verified live 2026-09-07). GuildMemberEdit
+// cannot do this — GuildMemberParams.Nick is an omitempty string, so an
+// empty value is omitted from the JSON and Discord never sees it.
+func (o *realOps) clearNickname(guildID, memberID string) error {
+	_, err := o.d.Request("PATCH", "/guilds/"+guildID+"/members/"+memberID, map[string]any{"nick": nil})
+	return err
 }
 
 // ---------------------------------------------------------------------------

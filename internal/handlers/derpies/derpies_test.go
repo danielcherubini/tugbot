@@ -58,6 +58,13 @@ type fakeOps struct {
 	ref      *discordgo.Message
 	refErr   error
 	refCalls int
+
+	// clearNickname records EVERY attempt (including a failed one) then
+	// returns clearErr — the nickname flow's window discipline is asserted
+	// on attempt counts, not successes.
+	clearErr  error
+	clears    int
+	clearArgs []string
 }
 
 func (o *fakeOps) deleteMessage(channelID, messageID string) error {
@@ -71,6 +78,15 @@ func (o *fakeOps) deleteMessage(channelID, messageID string) error {
 func (o *fakeOps) channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error) {
 	o.refCalls++
 	return o.ref, o.refErr
+}
+
+func (o *fakeOps) clearNickname(guildID, memberID string) error {
+	// Unconditionally record the attempt (clears increments, the args
+	// append) BEFORE returning the error — a failed attempt is still an
+	// attempt (the 429 window discipline asserts on this).
+	o.clears++
+	o.clearArgs = append(o.clearArgs, guildID+"|"+memberID)
+	return o.clearErr
 }
 
 // fakePi implements ALL THREE app.PiBackend methods (a fake with only

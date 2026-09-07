@@ -20,6 +20,10 @@ _Avoid_: blocklist entry, banned word, filter entry
 The Go bot's own original feature: silently deletes messages from author IDs in `TUGBOT_DERPIES_USER_IDS` via a fast-path token match against `derpies_gimmicks`, falling back on a fast-path miss to a pi RPC `GIMMICK:<word>` / `CLEAN` verdict that persists valid words back into the table. The slow-path prompt carries the FULL known gimmick list (already in memory from the fast-path fetch) so the LLM pattern-matches respellings against the known family — the list lives in the DB, not in a static skills/ file. The only action is `DeleteMessage` — no bot response, no reaction, no gulag involvement on any path.
 _Avoid_: mod action, anti-spam handler, derpies handler
 
+**Nickname reset**
+The derivative of the Derpies filter on `GuildMemberUpdate`: when a gated derpies user changes their per-server nickname, the new nickname is judged the same way as a message (fast-path token match against `derpies_gimmicks`, then the slow pi-RPC verdict); a GIMMICK verdict clears the nickname (`PATCH .../members/{member} {"nick":null}` — display falls back to the global display name). Resets are per-member coalesced: at most one clear attempt per 60-second window (success or failure marks the window), and the bot's own writes are never re-judged because a successful clear records the cache BEFORE the gateway echo arrives. The `derpies` feature flag gates both the message flow and this one.
+_Avoid_: nickname ban, display name reset, member rename
+
 **Baseline migration**:
 The single migration file representing the entire pre-cutover schema (diesel history treated as settled fact). Go-owned migration history begins with it; the Go runner stamps it applied on first run over a live DB without executing the DDL.
 _Avoid_: schema snapshot import, diesel history

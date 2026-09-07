@@ -411,6 +411,16 @@ func run() {
 		h.gulag.JoinRejoin(evt.Member)
 	})
 
+	// OnGuildMemberUpdate → the derpies nickname reset (feature-gated
+	// inside the handler; the derpies package now watches two events).
+	// NON-BLOCKING: the flow runs in its own goroutine.
+	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberUpdate) {
+		if evt == nil || evt.Member == nil || evt.Member.User == nil {
+			return
+		}
+		h.derpies.MemberUpdate(evt)
+	})
+
 	// OnReactionAdd / OnReactionRemove → the gulag reaction handler ONLY.
 	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.MessageReactionAdd) {
 		h.gulag.ReactionAdd(evt.MessageReaction)
