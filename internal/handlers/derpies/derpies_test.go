@@ -507,6 +507,71 @@ func TestFlowUnicodeFastHit(t *testing.T) {
 	assertNothingLearned(t, store)
 }
 
+// The prod leak (2026-09-07 20:36): a message whose only roster trace is
+// a NON-DECOMPOSABLE respelling — before the confusable fold, no valid
+// verdict existed for it (the base word "zwift" is not a folded token of
+// "zwіft", and the variant itself is not wordValid), so the LLM's best
+// available answer was CLEAN and the message leaked. Now the token folds
+// to the anchor, so the fast path catches it directly.
+func TestFlowConfusableNonDecomposableFastHit(t *testing.T) {
+	// и = U+0438 (Cyrillic small i, short i) — NFD does not decompose it.
+	pi := &fakePi{}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"zwift": true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"))
+
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 0 {
+		t.Errorf("pi.asks = %d, want 0 (the fast path must not reach pi)", pi.asks)
+	}
+	assertNothingLearned(t, store)
+}
+
+func TestFlowZeroWidthSpacedFastHit(t *testing.T) {
+	// Zero-width space (Cf, U+200B) wedged inside the token: stripped by
+	// the fold, the message token folds to the learned word.
+	pi := &fakePi{}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"zwift": true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("fish me a Zwi\u200Bft please."))
+
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 0 {
+		t.Errorf("pi.asks = %d, want 0", pi.asks)
+	}
+	assertNothingLearned(t, store)
+}
+
+// Verdict coherence on the same shape: with an EMPTY word list the
+// fast path cannot hit, the slow path judging "GIMMICK:zwift" must now
+// PASS the two-arm gate (the folded verdict word IS a folded token
+// thanks to the confusable fold) — learning "zwift" and deleting.
+// Pre-fold this exact verdict was rejected ("verdict word not in the
+// message") and the message leaked.
+func TestFlowConfusableVerdictCoherence(t *testing.T) {
+	pi := &fakePi{resp: "GIMMICK:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"))
+
+	if len(store.added) != 1 || store.added[0] != "zwift|llm" {
+		t.Errorf("added = %v, want [zwift|llm] (the folded word is stored)", store.added)
+	}
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 1 {
+		t.Errorf("pi.asks = %d, want 1", pi.asks)
+	}
+}
+
 func TestFlowUnicodeVerdictLearnsFolds(t *testing.T) {
 	// "GIMMICK:žwift" evaluates as the folded word "zwift": the gate
 	// passes and the FOLDED word is stored.
