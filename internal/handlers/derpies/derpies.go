@@ -18,7 +18,9 @@ package derpies
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -65,8 +67,18 @@ type Derpies struct {
 	lastNick map[string]string // key: guildID + "|" + memberID
 	lastEdit map[string]time.Time
 	busy     map[string]bool
-	nickMu   sync.Mutex // guards the three maps (lastNick, lastEdit, busy)
+	nickMu   sync.Mutex // guards the four maps (lastNick, lastEdit, busy, seenImages)
+	// seenImages keys sha256(image content) → last-judged time; the
+	// repeat-image fast path (flow 4.6) — a message whose posted content
+	// is image-only and whose images were all already LLM-judged is a
+	// re-post: the repetition is the gimmick, delete without an ask.
+	seenImages map[string]time.Time
 }
+
+const (
+	repeatImageTTL = 24 * time.Hour
+	repeatImageMax = 2048 // bounded cache: evict the oldest on overflow
+)
 
 // New builds the handler from the shared *app.App (mirrors the mention
 // package's constructor). Initializes ALL nickname-flow state: the maps
@@ -488,6 +500,62 @@ func gimmickPrompt(tmpl string, content string, known []string, nImages int, ref
 // The flow
 // ---------------------------------------------------------------------------
 
+// imageHash — the sha256 of the base64 payload (the same comparison
+// basis as pirpc's per-ask dedupe, so a repeat of an image whose ask
+// payload was deduped still matches the content the model saw).
+func imageHash(im app.PiImage) string {
+	sum := sha256.Sum256([]byte(im.Data))
+	return hex.EncodeToString(sum[:])
+}
+
+// seenImage reports whether this content hash was already LLM-judged
+// within the TTL window (the cache is LLM-judged content, not merely
+// seen content: an ask failure marks nothing, so a re-post of an
+// UNjudged image is judged — never fast-deleted blind).
+func (h *Derpies) seenImage(hash string) bool {
+	h.nickMu.Lock()
+	defer h.nickMu.Unlock()
+	t, ok := h.seenImages[hash]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > repeatImageTTL {
+		delete(h.seenImages, hash)
+		return false
+	}
+	return true
+}
+
+// markImagesSeen records content hashes as LLM-judged (flow 4.6, called
+// exactly once after a completed ask, on every verdict leg).
+func (h *Derpies) markImagesSeen(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	now := time.Now()
+	if h.clock != nil {
+		now = h.clock()
+	}
+	h.nickMu.Lock()
+	defer h.nickMu.Unlock()
+	if h.seenImages == nil {
+		h.seenImages = make(map[string]time.Time)
+	}
+	for _, hs := range hashes {
+		h.seenImages[hs] = now
+	}
+	if len(h.seenImages) > repeatImageMax {
+		var oldest string
+		var oldestT time.Time
+		for k, t := range h.seenImages {
+			if oldest == "" || t.Before(oldestT) {
+				oldest, oldestT = k, t
+			}
+		}
+		delete(h.seenImages, oldest)
+	}
+}
+
 // MessageCreate spawns the goroutine (the flow can block up to the pi
 // RPC's 300s ask deadline; the event thread is never held).
 // Burst amplification: there is no per-author coalescing or cooldown — N novel
@@ -576,6 +644,48 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	}
 	images := h.downloadPlan(ctx, uniqPlan, &http.Client{Timeout: 10 * time.Second})
 
+	// 4.6 Repeat-image fast path: an image whose CONTENT was already LLM-
+	//     judged is a re-post — the repetition itself is the gimmick.
+	//     Seen images are dropped from the ask (they are never re-judged);
+	//     a message whose content is image-only AND whose images are all
+	//     seen is the pure repeat: delete without an ask. A message with
+	//     new text still gets its (image-free) text judged — the seen
+	//     images just drop out of the payload. The word-fast path (step 4)
+	//     already handled text hits before this point.
+	var freshImages []app.PiImage
+	seenImgCount := 0
+	for _, im := range images {
+		if h.seenImage(imageHash(im)) {
+			seenImgCount++
+			continue
+		}
+		freshImages = append(freshImages, im)
+	}
+	if seenImgCount > 0 {
+		if len(freshImages) == 0 {
+			postedTextTokens := false
+			for range tokensForMatch(m.Content) {
+				postedTextTokens = true
+				break
+			}
+			if !postedTextTokens {
+				// The pure repeat (image-only, all content previously
+				// LLM-judged): the repetition is the gimmick — delete
+				// without an ask.
+				if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
+					slog.Error("derpies delete (repeat image) failed", "module", module, "channel", m.ChannelID, "message", m.ID, "seen", seenImgCount, "error", err)
+				} else {
+					slog.Info("derpies delete (repeat image)", "module", module, "channel", m.ChannelID, "message", m.ID, "seen", seenImgCount)
+				}
+				return
+			}
+			// New text with all-images-seen: the text is still judged,
+			// now image-free (the seen images dropped out).
+		}
+		slog.Info("derpies skipping seen image(s) from the ask", "module", module, "message", m.ID, "seen", seenImgCount)
+		images = freshImages
+	}
+
 	// 5. Slow path: pi unavailable -> silent return (the mention feature's
 	//    degradation path, same shape).
 	if h.app.Pi == nil {
@@ -614,6 +724,13 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	if askErr != nil {
 		slog.Error("derpies pi ask failed", "module", module, "error", askErr)
 		return
+	}
+	// Judged (a completed ask, every verdict leg — a failed ask marked
+	// nothing): record the FRESH image contents as seen (flow 4.6's
+	// repeat detection). Seen images were dropped earlier and need no
+	// re-mark.
+	for _, im := range images {
+		h.markImagesSeen([]string{imageHash(im)})
 	}
 
 	// 8. Parse the verdict.

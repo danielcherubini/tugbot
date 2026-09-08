@@ -6,6 +6,11 @@
 - An agent_end that completes with an empty assistant response now logs ERROR (req_id) in pi rpc so the agent failure no longer masquerades as an unrecognized verdict; the "" return (mention's existing empty-skip path) is unchanged.
 - Code: internal/pirpc/images.go (new), images_test.go (6 tests), pirpc.go (pipeline hook + empty-response log). go.mod: golang.org/x/image (already-cached version; x/sync, x/text bumped).
 
+### derpies: repeat-image fast delete (the re-post IS the gimmick)
+- Image CONTENT (sha256, same basis as the pirpc dedupe) is memorized after any completed LLM ask — an ask FAILURE marks nothing, so an un-judged image is always judged and never fast-deleted blind. A message whose content is image-only and whose images are all previously judged is the repeat of a judged post: deleted with ZERO asks (log `derpies delete (repeat image)`). Seen images drop out of mixed asks: fresh images and new text are still judged, seen ones just leave the payload (text-only ask when all images are seen and new text is present). In-memory map (guarded by the handler's existing mutex), 24h TTL, bounded at 2048 entries with oldest-eviction; survives nothing across restarts (a fresh start judges the first sighting again — safe by construction), no table, no migration.
+- Code: internal/handlers/derpies/derpies.go (flow 4.6 + cache), derpies_repeat_image_test.go (new, 4 tests). Docs: docs/features/derpies.md burst-amplification note updated.
+- Note: the in-memory cache is per-process — a bot restart clears it, and the first re-post after a restart is judged once (one ask) before becoming a fast delete again.
+
 ## 2026-09-06
 
 ### derpies: images + referenced messages (squash 1c34f08)
