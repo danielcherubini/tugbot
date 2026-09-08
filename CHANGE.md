@@ -1,3 +1,11 @@
+## 2026-09-08
+
+### pi rpc: per-ask image guard — dedupe, shrink, budget (fix for the 46MB image-ask dead end)
+- Observed: a filtered user's single message with 10 re-uploaded ~4.6MB attachments became one ~46MB base64 pi ask; the one-at-a-time pi agent dead-ended (empty agent_end → "unrecognized verdict"), and every ask queued behind it for those seconds was rejected ("Agent is already processing"), including the shared mention channel.
+- `askWithImages` now runs the image pipeline (pirpc.images): byte-identical attachments are deduped (sha256 on the base64), oversized images (>1MB or >2048 on a side) are resized to 2048 and re-encoded JPEG q80, a never-make-it-worse guard keeps the original when the JPEG would be larger, and the total is capped at 12MB raw per ask (excess dropped in order, logged). Any decode/encode failure keeps the original. One choke point: mention and derpies are both bounded.
+- An agent_end that completes with an empty assistant response now logs ERROR (req_id) in pi rpc so the agent failure no longer masquerades as an unrecognized verdict; the "" return (mention's existing empty-skip path) is unchanged.
+- Code: internal/pirpc/images.go (new), images_test.go (6 tests), pirpc.go (pipeline hook + empty-response log). go.mod: golang.org/x/image (already-cached version; x/sync, x/text bumped).
+
 ## 2026-09-06
 
 ### derpies: images + referenced messages (squash 1c34f08)

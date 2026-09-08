@@ -203,6 +203,12 @@ func (p *PiRpc) AskWithImages(ctx context.Context, prompt string, images []app.P
 }
 
 func (p *PiRpc) askWithImages(ctx context.Context, prompt string, images []Image) (string, error) {
+	if len(images) > 0 {
+		// Per-ask image pipeline: dedupe identical attachments, shrink
+		// oversized ones, cap the total — a single ask can never exceed the
+		// budget (see images.go).
+		images = p.shrinkImages(images)
+	}
 	timeout := p.askTimeout
 	ctx2, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -590,6 +596,13 @@ func (s *subprocess) handleRequest(req askRequest, log *slog.Logger) askResult {
 				return askResult{err: err}
 			}
 			log.Info(fmt.Sprintf("← response: %s", truncateForLog(text)), "module", Module)
+			if strings.TrimSpace(text) == "" {
+				// An agent_end that completes without any assistant text is
+				// an agent failure, not a model judgment — log it loudly so it
+				// no longer masquerades as a verdict.
+				log.Error("pi RPC agent_end returned an empty assistant response",
+					"module", Module, "req_id", req.reqID)
+			}
 			return askResult{text: text}
 		}
 	}
