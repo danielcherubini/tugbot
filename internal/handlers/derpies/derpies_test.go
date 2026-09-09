@@ -59,12 +59,12 @@ type fakeOps struct {
 	refErr   error
 	refCalls int
 
-	// clearNickname records EVERY attempt (including a failed one) then
-	// returns clearErr — the nickname flow's window discipline is asserted
+	// setNickname records EVERY attempt (including a failed one) then
+	// returns setErr — the nickname flow's window discipline is asserted
 	// on attempt counts, not successes.
-	clearErr  error
-	clears    int
-	clearArgs []string
+	setErr  error
+	sets    int
+	setArgs []string // "guildID|memberID|nick"
 }
 
 func (o *fakeOps) deleteMessage(channelID, messageID string) error {
@@ -80,13 +80,14 @@ func (o *fakeOps) channelMessageRetrieve(channelID, messageID string) (*discordg
 	return o.ref, o.refErr
 }
 
-func (o *fakeOps) clearNickname(guildID, memberID string) error {
-	// Unconditionally record the attempt (clears increments, the args
-	// append) BEFORE returning the error — a failed attempt is still an
-	// attempt (the 429 window discipline asserts on this).
-	o.clears++
-	o.clearArgs = append(o.clearArgs, guildID+"|"+memberID)
-	return o.clearErr
+func (o *fakeOps) setNickname(guildID, memberID, nick string) error {
+	// Unconditionally record the attempt (sets increments, the args
+	// append with the "guildID|memberID|nick" triple) BEFORE returning
+	// the error — a failed attempt is still an attempt (the 429 window
+	// discipline asserts on this).
+	o.sets++
+	o.setArgs = append(o.setArgs, guildID+"|"+memberID+"|"+nick)
+	return o.setErr
 }
 
 // fakePi implements ALL THREE app.PiBackend methods (a fake with only
@@ -426,7 +427,7 @@ func TestFlowFeatureFlagGate(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: false}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("who's giving me a sw1ft."))
+	h.flow(derpMsg("who's giving me a sw1ft."), false)
 
 	assertNoDeletes(t, ops)
 	if pi.asks != 0 {
@@ -444,7 +445,7 @@ func TestFlowNoGuild(t *testing.T) {
 	h := newTestDerpies(store, ops, pi)
 	m := derpMsg("who's giving me a sw1ft.")
 	m.GuildID = ""
-	h.flow(m)
+	h.flow(m, false)
 
 	assertNoDeletes(t, ops)
 	if store.listCalls != 0 {
@@ -460,7 +461,7 @@ func TestFlowAuthorNotFiltered(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(otherMsg("who's giving me a sw1ft."))
+	h.flow(otherMsg("who's giving me a sw1ft."), false)
 
 	assertNoDeletes(t, ops)
 	if store.listCalls != 0 {
@@ -512,7 +513,7 @@ func TestFlowUnicodeFastHit(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"swift": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("A świft cog wrapped in some vintage Gianna mags"))
+	h.flow(derpMsg("A świft cog wrapped in some vintage Gianna mags"), false)
 
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
@@ -535,7 +536,7 @@ func TestFlowConfusableNonDecomposableFastHit(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"zwift": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"))
+	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"), false)
 
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
@@ -553,7 +554,7 @@ func TestFlowZeroWidthSpacedFastHit(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"zwift": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("fish me a Zwi\u200Bft please."))
+	h.flow(derpMsg("fish me a Zwi\u200Bft please."), false)
 
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
@@ -575,7 +576,7 @@ func TestFlowConfusableVerdictCoherence(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"))
+	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"), false)
 
 	if len(store.added) != 1 || store.added[0] != "zwift|llm" {
 		t.Errorf("added = %v, want [zwift|llm] (the folded word is stored)", store.added)
@@ -595,7 +596,7 @@ func TestFlowUnicodeVerdictLearnsFolds(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("You should save the money and get me a žwift instead"))
+	h.flow(derpMsg("You should save the money and get me a žwift instead"), false)
 
 	if len(store.added) != 1 || store.added[0] != "zwift|llm" {
 		t.Errorf("added = %v, want [zwift|llm] (the folded word is stored)", store.added)
@@ -616,7 +617,7 @@ func TestFlowVerdictBaseFormStillRejected(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("Can it fish me a zwift ?"))
+	h.flow(derpMsg("Can it fish me a zwift ?"), false)
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
@@ -630,7 +631,7 @@ func TestFlowFastPathDeletesWithoutPi(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"sw1ft": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("who's giving me a sw1ft."))
+	h.flow(derpMsg("who's giving me a sw1ft."), false)
 
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 		t.Errorf("deleted = %v, want [[c1 msg1]]", ops.deleted)
@@ -646,7 +647,7 @@ func TestFastPathExactTokenBothWords(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"swift": true, "bike": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("I'll sell you a bike that is swift."))
+	h.flow(derpMsg("I'll sell you a bike that is swift."), false)
 
 	if len(ops.deleted) != 1 {
 		t.Errorf("deleted = %v, want exactly one fast delete", ops.deleted)
@@ -664,7 +665,7 @@ func TestFastPathNearTokenFallsThrough(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"swift": true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("swiftly"))
+	h.flow(derpMsg("swiftly"), false)
 
 	if len(ops.deleted) != 0 {
 		t.Errorf("deleted = %v, want empty (no fast hit, CLEAN verdict)", ops.deleted)
@@ -680,7 +681,7 @@ func TestFlowFastPathListErrorSkips(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, listErr: errors.New("db down")}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("who's giving me a sw1ft."))
+	h.flow(derpMsg("who's giving me a sw1ft."), false)
 
 	assertNoDeletes(t, ops)
 	if pi.asks != 0 {
@@ -694,7 +695,7 @@ func TestFlowNilPiSilentReturn(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, nil)
-	h.flow(derpMsg("completely clean text"))
+	h.flow(derpMsg("completely clean text"), false)
 
 	assertNoDeletes(t, ops)
 	assertNothingLearned(t, store)
@@ -705,7 +706,7 @@ func TestFlowPiAskError(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("completely clean text"))
+	h.flow(derpMsg("completely clean text"), false)
 
 	assertNoDeletes(t, ops)
 	assertNothingLearned(t, store)
@@ -716,7 +717,7 @@ func TestFlowVerdictClean(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("completely clean text"))
+	h.flow(derpMsg("completely clean text"), false)
 
 	assertNoDeletes(t, ops)
 	assertNothingLearned(t, store)
@@ -727,7 +728,7 @@ func TestFlowVerdictUnknownGibberish(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("completely clean text"))
+	h.flow(derpMsg("completely clean text"), false)
 
 	assertNoDeletes(t, ops)
 	assertNothingLearned(t, store)
@@ -740,7 +741,7 @@ func TestFlowVerdictHallucinatedWordAbsentFromMessage(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("completely clean text"))
+	h.flow(derpMsg("completely clean text"), false)
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
@@ -752,7 +753,7 @@ func TestFlowVerdictInvalidWord(t *testing.T) {
 		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 		ops := &fakeOps{}
 		h := newTestDerpies(store, ops, pi)
-		h.flow(derpMsg("s-w1ft here"))
+		h.flow(derpMsg("s-w1ft here"), false)
 
 		assertNothingLearned(t, store)
 		assertNoDeletes(t, ops)
@@ -764,7 +765,7 @@ func TestFlowVerdictInvalidWord(t *testing.T) {
 		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 		ops := &fakeOps{}
 		h := newTestDerpies(store, ops, pi)
-		h.flow(derpMsg("sw-1ft here"))
+		h.flow(derpMsg("sw-1ft here"), false)
 
 		assertNothingLearned(t, store)
 		assertNoDeletes(t, ops)
@@ -777,7 +778,7 @@ func TestFlowVerdictLearnsAndDeletes(t *testing.T) {
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	content := "holler at zswiftf now"
-	h.flow(derpMsg(content))
+	h.flow(derpMsg(content), false)
 
 	if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
 		t.Errorf("added = %v, want [zswiftf|llm]", store.added)
@@ -801,7 +802,7 @@ func TestFlowPromptFallbackOnStoreError(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, promptErr: errors.New("db down")}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg(content))
+	h.flow(derpMsg(content), false)
 
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
@@ -821,7 +822,7 @@ func TestFlowPromptFallbackOnInvalidTemplate(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, prompt: "no markers here"}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg(content))
+	h.flow(derpMsg(content), false)
 
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
@@ -841,7 +842,7 @@ func TestFlowDeleteFailsAfterSuccessfulAdd(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{delErr: errors.New("discord 500")}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(derpMsg("holler at zswiftf now"))
+	h.flow(derpMsg("holler at zswiftf now"), false)
 
 	if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
 		t.Errorf("added = %v, want [zswiftf|llm] (a delete failure must not un-learn the word)", store.added)

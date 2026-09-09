@@ -1,3 +1,10 @@
+## 2026-09-09
+
+### derpies: edit re-judgment + the name reset is "Derpies" (not a clear)
+- A gated author's `GUILD_MESSAGE_UPDATE` now re-runs the full create flow on the updated content — fast path / images / repeat-image / one-hop ref / one slow ask / learn / delete carry over (at most one list SELECT + one pi ask per edit). Bare payloads — no text, no attachments, and no embeds — fetch via the `channelMessageRetrieve` seam, the same fetch pattern as the gokupoll port of mod.rs:126-136, with the strict trigger deviation stated: gokupoll fetches on empty content ALONE; here an attachments- or embeds-present payload is judged in place (fewer REST calls, identical image leg). Fetch failure degrades (log + skip), never aborts. The bot never edits, so there is no echo recursion.
+- The nickname reset now SETS the guild nick to the fixed neutral name `Derpies` (const `derpiesNickReset`) instead of clearing to null — a null clear exposes the member's global display name, which the bot cannot modify; the fixed value masks it. The name reset action runs on ANY parseable GIMMICK verdict (the "as-appears word not learnable" dead end no longer lets a recognizable gimmick name survive); the learning gate (wordValid + folded-token-in-nick) is UNCHANGED and now gates learning only. Message flow is untouched (an unlearnable word there still deletes nothing).
+- Code: `internal/handlers/derpies/edits.go` (new), `nicknames.go` (rework), `derpies.go` (seam `clearNickname` → `setNickname`), `derpies_edits_test.go` (new), `nicknames_test.go`/`derpies_test.go` (fake shape), `cmd/tugbot/main.go` (one-line wiring).
+
 ## 2026-09-08
 
 ### pi rpc: per-ask image guard — dedupe, shrink, budget (fix for the 46MB image-ask dead end)

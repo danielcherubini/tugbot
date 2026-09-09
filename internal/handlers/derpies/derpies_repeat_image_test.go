@@ -55,7 +55,7 @@ func TestRepeatImageFastDelete(t *testing.T) {
 	h, _, ops, pi := newRepeatTest(t)
 	pi.resp = "GIMMICK:sw1ft"
 
-	h.flow(imgMsg("m1", srv.URL+"/a.png"))
+	h.flow(imgMsg("m1", srv.URL+"/a.png"), false)
 	if pi.imageAsks != 1 {
 		t.Fatalf("first sighting: imageAsks = %d, want 1", pi.imageAsks)
 	}
@@ -63,7 +63,7 @@ func TestRepeatImageFastDelete(t *testing.T) {
 		t.Fatalf("first sighting: deletes = %v, want 1", ops.deleted)
 	}
 
-	h.flow(imgMsg("m2", srv.URL+"/a.png-reupload")) // same content, new attachment id
+	h.flow(imgMsg("m2", srv.URL+"/a.png-reupload"), false) // same content, new attachment id
 	if pi.imageAsks != 1 {
 		t.Fatalf("repeat: imageAsks = %d, want 1 (NO ask)", pi.imageAsks)
 	}
@@ -80,7 +80,7 @@ func TestRepeatImageWithNewTextGetsTextOnlyAsk(t *testing.T) {
 	h, _, _, pi := newRepeatTest(t)
 	pi.resp = "CLEAN"
 
-	h.flow(imgMsg("m1", srv.URL+"/a.png"))
+	h.flow(imgMsg("m1", srv.URL+"/a.png"), false)
 	if pi.imageAsks != 1 || pi.asks != 0 {
 		t.Fatalf("first sighting: imageAsks=%d asks=%d, want 1/0", pi.imageAsks, pi.asks)
 	}
@@ -88,7 +88,7 @@ func TestRepeatImageWithNewTextGetsTextOnlyAsk(t *testing.T) {
 	m2 := derpMsg("hello entirely fresh text")
 	m2.ID = "m2"
 	m2.Attachments = []*discordgo.MessageAttachment{{URL: srv.URL + "/a.png-again", ContentType: "image/png"}}
-	h.flow(m2)
+	h.flow(m2, false)
 
 	if pi.imageAsks != 1 {
 		t.Fatalf("text+seen-image: imageAsks = %d, want 1 (the seen image must not be re-asked)", pi.imageAsks)
@@ -105,11 +105,11 @@ func TestUnjudgedImageRepostIsJudged(t *testing.T) {
 	h, _, _, pi := newRepeatTest(t)
 	pi.askErr = errors.New(" boom")
 
-	h.flow(imgMsg("m1", srv.URL+"/a.png"))
+	h.flow(imgMsg("m1", srv.URL+"/a.png"), false)
 	pi.askErr = nil
 	pi.resp = "CLEAN"
 
-	h.flow(imgMsg("m2", srv.URL+"/a.png-again"))
+	h.flow(imgMsg("m2", srv.URL+"/a.png-again"), false)
 	if pi.imageAsks != 2 {
 		t.Fatalf("unjudged re-post: imageAsks = %d, want 2 (the failed ask marks nothing)", pi.imageAsks)
 	}
@@ -135,13 +135,13 @@ func TestMixedSeenAndFreshImages(t *testing.T) {
 		return m
 	}
 
-	h.flow(imgMsg("m1", a.URL)) // judges A
+	h.flow(imgMsg("m1", a.URL), false) // judges A
 	if pi.imageAsks != 1 {
 		t.Fatalf("setup: imageAsks = %d, want 1", pi.imageAsks)
 	}
 	seenDeletes := len(ops.deleted)
 
-	h.flow(msgAB("m2")) // A seen (dropped out), B fresh
+	h.flow(msgAB("m2"), false) // A seen (dropped out), B fresh
 	if pi.imageAsks != 2 {
 		t.Fatalf("m2: imageAsks = %d, want 2 (the fresh image is asked)", pi.imageAsks)
 	}
@@ -149,7 +149,7 @@ func TestMixedSeenAndFreshImages(t *testing.T) {
 		t.Fatalf("m2: ask image count = %d, want 1 (the seen image dropped out of the payload)", len(pi.images[1]))
 	}
 
-	h.flow(msgAB("m3")) // both contents seen now — pure repeat, fast delete
+	h.flow(msgAB("m3"), false) // both contents seen now — pure repeat, fast delete
 	if pi.imageAsks != 2 {
 		t.Fatalf("m3: imageAsks = %d, want 2 (no ask)", pi.imageAsks)
 	}

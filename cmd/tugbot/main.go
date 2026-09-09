@@ -397,10 +397,15 @@ func run() {
 		}()
 	})
 
-	// OnMessageUpdate → gokupoll (the mod.rs:126-136 empty-payload
-	// fetch lives inside the handler). NON-BLOCKING.
+	// OnMessageUpdate → gokupoll + derpies re-judgment (the
+	// mod.rs:126-136 empty-payload fetch lives inside gokupoll; derpies
+	// re-runs its full create flow on any edit by a gated author — see
+	// edits.go). NON-BLOCKING: both handlers spawn their own goroutines
+	// (derpies.MessageUpdate starts the flow with `go`, exactly like
+	// MessageCreate is wired).
 	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.MessageUpdate) {
 		go h.gokupoll.MessageUpdate(evt)
+		h.derpies.MessageUpdate(evt)
 	})
 
 	// OnGuildMemberAdd → the gulag join/rejoin arm.
@@ -412,7 +417,8 @@ func run() {
 	})
 
 	// OnGuildMemberUpdate → the derpies nickname reset (feature-gated
-	// inside the handler; the derpies package now watches two events).
+	// inside the handler; the derpies package now watches three events —
+	// MessageCreate, MessageUpdate, and GuildMemberUpdate).
 	// NON-BLOCKING: the flow runs in its own goroutine.
 	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberUpdate) {
 		if evt == nil || evt.Member == nil || evt.Member.User == nil {

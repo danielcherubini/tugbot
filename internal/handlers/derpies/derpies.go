@@ -11,8 +11,10 @@
 // delete failure after a successful learn keeps the word learned.
 //
 // It also watches GUILD_MEMBER_UPDATE for the same gated users: a
-// nickname judged a gimmick is cleared (reset to default) via the same
-// fast path + pi RPC verdict, per member coalesced to one clear attempt
+// nickname judged a gimmick is reset to the fixed neutral name (a SET
+// of a constant, not a null clear — nil is a dead end: the display
+// would fall back to a global name the bot cannot touch) via the same
+// fast path + pi RPC verdict, per member coalesced to one reset attempt
 // per 60-second window (nicknames.go).
 package derpies
 
@@ -49,8 +51,9 @@ const (
 
 // Derpies handles the derpies flow (feature gate → guild guard →
 // author-ID gate → fast-path token match → pi RPC verdict). It also
-// watches GUILD_MEMBER_UPDATE events for the same gated users and clears
-// their nicks when the flow judges them gimmicks (nicknames.go).
+// watches GUILD_MEMBER_UPDATE events for the same gated users and resets
+// their nicks to a fixed neutral name when the flow judges them
+// gimmicks (nicknames.go).
 type Derpies struct {
 	app *app.App
 	// New() wires the production store/ops. Tests (same package) assign
@@ -60,10 +63,13 @@ type Derpies struct {
 	// clock is the injectable clock (tests pin it; markEdit snapshots
 	// clock() at event time for the 60s window math).
 	clock func() time.Time
-	// lastNick is the per-member last-known nickname; "" means "no
-	// nickname" (display is the global name). Events whose Nick equals
-	// the cache were not nick changes (incl. our own clear's echo, the
-	// cache being written BEFORE it arrives) and are skipped.
+	// lastNick is the per-member last-known nickname: after a successful
+	// reset the cache holds derpiesNickReset (the echo of our own set is
+	// skipped via the cur == evt.Nick check — the echo arrives with
+	// Nick == derpiesNickReset, non-empty); "" still means "no nick
+	// known / cleared state" (failure arms and the empty-nick arm write
+	// ""). Events whose Nick equals the cache were not nick changes and
+	// are skipped.
 	lastNick map[string]string // key: guildID + "|" + memberID
 	lastEdit map[string]time.Time
 	busy     map[string]bool
@@ -116,8 +122,9 @@ type store interface {
 }
 
 type discordOps interface {
-	// deleteMessage — the flow's ONLY outgoing REST call that takes an
-	// action (the referenced fetch is a data GET, not a bot action).
+	// deleteMessage — the MESSAGE flow's only outgoing REST call that
+	// takes an action (the referenced fetch is a data GET, not a bot
+	// action; the nickname flow's action arm is setNickname, a PATCH).
 	deleteMessage(channelID, messageID string) error
 	// channelMessageRetrieve — the one-hop referenced-message fetch
 	// (mention parity): a REST GET of the earlier message behind a
@@ -125,8 +132,9 @@ type discordOps interface {
 	// handled by the CALLER as "no reference" — log and continue, never
 	// abort the flow.
 	channelMessageRetrieve(channelID, messageID string) (*discordgo.Message, error)
-	// clearNickname — "reset to default" for the nickname flow.
-	clearNickname(guildID, memberID string) error
+	// setNickname — set the guild nickname (the reset is a fixed neutral
+	// value, not a clear).
+	setNickname(guildID, memberID, nick string) error
 }
 
 // poolStore is the production store (raw SQL over the shared pool).
@@ -179,13 +187,10 @@ func (o *realOps) channelMessageRetrieve(channelID, messageID string) (*discordg
 	return o.d.ChannelMessage(channelID, messageID)
 }
 
-// clearNickname — "reset to default": Discord's member PATCH accepts
-// "nick": null, which clears the per-server nickname (display falls back
-// to the global display name; verified live 2026-09-07). GuildMemberEdit
-// cannot do this — GuildMemberParams.Nick is an omitempty string, so an
-// empty value is omitted from the JSON and Discord never sees it.
-func (o *realOps) clearNickname(guildID, memberID string) error {
-	_, err := o.d.Request("PATCH", "/guilds/"+guildID+"/members/"+memberID, map[string]any{"nick": nil})
+// setNickname — set the guild nickname (the reset value; Discord's
+// member PATCH accepts a nick string — no null trick needed now).
+func (o *realOps) setNickname(guildID, memberID, nick string) error {
+	_, err := o.d.Request("PATCH", "/guilds/"+guildID+"/members/"+memberID, map[string]any{"nick": nick})
 	return err
 }
 
@@ -560,9 +565,19 @@ func (h *Derpies) markImagesSeen(hashes []string) {
 // RPC's 300s ask deadline; the event thread is never held).
 // Burst amplification: there is no per-author coalescing or cooldown — N novel
 // posts from a filtered user yield N serialized pi asks (the pi RPC queue is shared with the mention handler); rate limiting is out of scope per the spec.
-func (h *Derpies) MessageCreate(m *discordgo.Message) { go h.flow(m) }
+func (h *Derpies) MessageCreate(m *discordgo.Message) { go h.flow(m, false) }
 
-func (h *Derpies) flow(m *discordgo.Message) {
+// flow — the full message flow (gates → fast path → images/repeat →
+// slow path → learn/delete). `isEdit` distinguishes the origin: the
+// create path passes false, the edit path (edits.go) passes true. The
+// ONLY behavioral difference is flow 4.6's pure-repeat delete arm, which
+// an EDIT must never trigger: on an edit, an all-seen image-only state
+// is a content-REMOVING change of a previously-judged message (the LLM
+// already cleared those images), so it returns without deleting or
+// asking instead of treating the repetition as the gimmick. Everything
+// else is origin-agnostic — an edit costs at most one list SELECT + one
+// pi ask, same as a create.
+func (h *Derpies) flow(m *discordgo.Message, isEdit bool) {
 	ctx := context.Background()
 
 	// 1. Feature gate (silent flavor).
@@ -669,6 +684,17 @@ func (h *Derpies) flow(m *discordgo.Message) {
 				break
 			}
 			if !postedTextTokens {
+				if isEdit {
+					// EDIT path: the all-seen image-only state must never
+					// reach the pure-repeat delete. An edit to that state
+					// REMOVED content (e.g. the caption dropped from a
+					// previously-judged message) — the seen images were
+					// already LLM-judged, so there is nothing fresh to
+					// judge: return without deleting and without asking (a
+					// clean no-op; the message stays).
+					slog.Info("derpies edit all-seen image-only — no-op", "module", module, "channel", m.ChannelID, "message", m.ID, "seen", seenImgCount)
+					return
+				}
 				// The pure repeat (image-only, all content previously
 				// LLM-judged): the repetition is the gimmick — delete
 				// without an ask.
