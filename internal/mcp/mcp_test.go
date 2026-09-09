@@ -183,8 +183,11 @@ func structuredMap(t *testing.T, res *mcpSDK.CallToolResult) map[string]string {
 	return m
 }
 
-// structuredSlice normalizes the result's structured payload to []map[string]any.
-func structuredSlice(t *testing.T, res *mcpSDK.CallToolResult) []map[string]any {
+// structuredRows enforces the SPEC contract on read_messages' payload (a
+// top-level JSON array is NOT a valid MCP structuredContent — strict
+// clients reject the whole call — so it must be a record) and returns the
+// "messages" array.
+func structuredRows(t *testing.T, res *mcpSDK.CallToolResult) []map[string]any {
 	t.Helper()
 	if res.StructuredContent == nil {
 		t.Fatalf("no structured content in result %+v", res)
@@ -193,11 +196,24 @@ func structuredSlice(t *testing.T, res *mcpSDK.CallToolResult) []map[string]any 
 	if err != nil {
 		t.Fatalf("marshal structured content: %v", err)
 	}
-	var out []map[string]any
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatalf("unmarshal structured content %s: %v", b, err)
+	var rec map[string]any
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatalf("structured content %s is not a record (an array?) — MCP structuredContent requires a JSON object: %v", b, err)
 	}
-	return out
+	var rows []map[string]any
+	if err := json.Unmarshal(mustMarshal(t, rec["messages"]), &rows); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+	return rows
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal %v: %v", v, err)
+	}
+	return b
 }
 
 // freePort grabs a currently-free TCP port (best effort — the listener is
@@ -739,7 +755,7 @@ func TestReadMessagesHappyPath(t *testing.T) {
 	if !strings.Contains(text, "3 messages") || !strings.Contains(text, ts1) || !strings.Contains(text, ts3) {
 		t.Errorf("text = %q, want \"3 messages\" + first/last timestamps %s / %s", text, ts1, ts3)
 	}
-	rows := structuredSlice(t, res)
+	rows := structuredRows(t, res)
 	if len(rows) != 3 {
 		t.Fatalf("payload length = %d, want 3", len(rows))
 	}
@@ -833,7 +849,7 @@ func TestReadMessagesAuthorIDFilter(t *testing.T) {
 	if !strings.Contains(r, "2 messages") {
 		t.Errorf("text = %q, want 2 of 3 matching author_id u1", r)
 	}
-	rows := structuredSlice(t, res)
+	rows := structuredRows(t, res)
 	if len(rows) != 2 || rows[0]["id"] != "m1" || rows[1]["id"] != "m2" {
 		t.Errorf("filtered rows = %v, want exactly m1 and m2", rows)
 	}
@@ -886,7 +902,7 @@ func TestReadMessagesNilAuthor(t *testing.T) {
 	if text := textOf(t, res); !strings.Contains(text, "2 messages") {
 		t.Errorf("text = %q, want \"2 messages\" (the nil-author row counts)", text)
 	}
-	rows := structuredSlice(t, res)
+	rows := structuredRows(t, res)
 	if len(rows) != 2 {
 		t.Fatalf("payload rows = %d, want 2", len(rows))
 	}
@@ -1050,8 +1066,8 @@ func TestReadMessagesEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal structured content: %v", err)
 	}
-	if string(b) != "[]" {
-		t.Errorf("structured payload = %s, want \"[]\" (not nil)", b)
+	if string(b) != `{"messages":[]}` {
+		t.Errorf("structured payload = %s, want %s (not nil, not an error result)", b, `{"messages":[]}`)
 	}
 }
 
@@ -1643,7 +1659,7 @@ func TestWireEndToEnd(t *testing.T) {
 	if text := textOf(t, res); !strings.Contains(text, "2 messages") {
 		t.Errorf("read_messages text = %q, want \"2 messages\"", text)
 	}
-	if rows := structuredSlice(t, res); len(rows) != 2 || rows[0]["id"] != "77" || rows[1]["id"] != "78" {
+	if rows := structuredRows(t, res); len(rows) != 2 || rows[0]["id"] != "77" || rows[1]["id"] != "78" {
 		t.Errorf("read_messages rows = %v, want 77 and 78", rows)
 	}
 

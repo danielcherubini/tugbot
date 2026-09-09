@@ -40,8 +40,9 @@ func registerReadTools(srv *mcpSDK.Server, d DiscordAPI) {
 }
 
 // handleReadMessages runs one ChannelMessages page (v1 — no paging loop),
-// applies the author filter, and renders the summary +
-// []map[string]any payload.
+// applies the author filter, and renders the summary + a record payload
+// ("messages": …) — top-level arrays are not a valid MCP structuredContent
+// (a client rejects the whole call), so the rows travel under a key.
 func handleReadMessages(d DiscordAPI, args readMessagesArgs) (*mcpSDK.CallToolResult, any, error) {
 	// Snowflake validation FIRST, before any REST.
 	if args.BeforeID != "" && !isSnowflake(args.BeforeID) {
@@ -122,5 +123,5 @@ func handleReadMessages(d DiscordAPI, args readMessagesArgs) (*mcpSDK.CallToolRe
 	if note != "" {
 		text += note
 	}
-	return textResult(text), out, nil
+	return textResult(text), map[string]any{"messages": out}, nil
 }
