@@ -7,6 +7,9 @@
 # Local environment (real tokens / credentials)
 .env
 
+# Per-developer MCP client registration (points at the local bot instance)
+.mcp.json
+
 # Test artifacts
 /test-artifacts/
 *.test
