@@ -43,6 +43,12 @@ type Config struct {
 	// map like the other lists. Default: empty.
 	DerpiesUserIDs map[int64]struct{}
 
+	// MCPPort is the MCP bridge's Streamable-HTTP listen port, read from
+	// TUGBOT_MCP_PORT. Always-on (no enabled flag). Default: 8642. Unlike
+	// the ID-list vars (whose malformed parts are skipped), a mistyped port
+	// fails LOUD: a set-but-non-numeric value is a LoadError.
+	MCPPort int
+
 	// SkillsDir is the resolved skills directory (see parseSkillsDir). The
 	// TUGBOT_SKILLS_DIR var may point at the repo root or at the skills dir
 	// itself. Default: the directory of os.Executable(); if that directory
@@ -88,6 +94,14 @@ func LoadConfig() (*Config, error) {
 		return nil, &LoadError{problems: []string{"APPLICATION_ID is not a valid id: " + appIDStr}}
 	}
 
+	// TUGBOT_MCP_PORT — the always-on MCP bridge listen port. Unset/empty
+	// → 8642; set-but-non-numeric → LoadError (a mistyped port fails LOUD,
+	// unlike the ID-list vars, where malformed parts are skipped).
+	mcpPort, perr := parseMCPPort(os.Getenv("TUGBOT_MCP_PORT"))
+	if perr != nil {
+		return nil, perr
+	}
+
 	// ADMIN_USER_ID — bypasses mention cooldowns. Default: 0 (disabled).
 	// Rust: .ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 	adminUserID := parseID(os.Getenv("ADMIN_USER_ID"))
@@ -119,6 +133,7 @@ func LoadConfig() (*Config, error) {
 		CooldownExemptUserIDs: exempt,
 		SlowUserIDs:           slow,
 		DerpiesUserIDs:        derpies,
+		MCPPort:               mcpPort,
 		SkillsDir:             parseSkillsDir(os.Getenv("TUGBOT_SKILLS_DIR")),
 		LogLevel:              parseLogLevel(os.Getenv("RUST_LOG")),
 	}, nil
@@ -128,6 +143,21 @@ func LoadConfig() (*Config, error) {
 type LoadError struct{ problems []string }
 
 func (e *LoadError) Error() string { return strings.Join(e.problems, "; ") }
+
+// parseMCPPort parses TUGBOT_MCP_PORT: unset/empty → the 8642 default;
+// set-but-non-numeric → a LoadError (the same errs/LoadError path the
+// required envs use — a mistyped port must fail loud, unlike the skipped
+// malformed parts of the ID-list vars).
+func parseMCPPort(v string) (int, error) {
+	if v == "" {
+		return 8642, nil
+	}
+	p, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, &LoadError{problems: []string{"TUGBOT_MCP_PORT is not a valid port: " + v}}
+	}
+	return p, nil
+}
 
 // parseID mirrors Rust's `.ok().and_then(|s| s.parse().ok()).unwrap_or(0)`:
 // an unset or malformed value is treated as 0.

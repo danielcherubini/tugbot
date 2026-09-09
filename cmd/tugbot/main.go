@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -53,6 +54,7 @@ import (
 	"github.com/danielcherubini/tugbot/internal/handlers/prefixhandler"
 	"github.com/danielcherubini/tugbot/internal/handlers/teh"
 	"github.com/danielcherubini/tugbot/internal/handlers/twitter"
+	"github.com/danielcherubini/tugbot/internal/mcp"
 	"github.com/danielcherubini/tugbot/internal/pirpc"
 )
 
@@ -292,7 +294,17 @@ func runSelftest() int {
 
 	a := app.NewApp(cfg, pool, d)
 	_ = newHandlers(a)
-	slog.Info("selftest: Discord session and all thirteen handlers constructed", "module", "main")
+	// The MCP server is CONSTRUCTED (its tools' construction step);
+	// Start is NOT called here — production wiring is the MCP bridge
+	// wiring task. NewRealDiscord wraps the real session in the
+	// DiscordAPI seam (pointer form; production = always on, port from
+	// config).
+	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), cfg.MCPPort)
+	if mcpSrv == nil {
+		slog.Error("Failed to construct MCP server", "module", "main")
+		return 1
+	}
+	slog.Info("selftest: Discord session and all thirteen handlers and the MCP server constructed", "module", "main")
 	return 0
 }
 
@@ -375,6 +387,14 @@ func run() {
 	a := app.NewApp(cfg, pool, d)
 	a.Pi = piVal
 	h := newHandlers(a)
+
+	// The MCP Discord bridge (always on; the single SESSION constraint it
+	// obeys is this construction — the tools share the gateway's one
+	// session, never a second gateway connection). Constructed here
+	// after the handler wiring and before the background loops +
+	// d.Open().
+	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), cfg.MCPPort)
+	slog.Info(fmt.Sprintf("MCP server constructed (tools: list_guilds, list_channels, read_messages, post_message, react; http://0.0.0.0:%d/mcp)", cfg.MCPPort), "module", "main")
 
 	// OnMessageCreate → teh, twitter, bsky, instagram, mention in that
 	// order (Rust mod.rs dispatch order — the commented-out TikTok arm
@@ -490,6 +510,21 @@ func run() {
 	eg.Go(func() error {
 		if err := h.gulag.RunVoteCheck(egCtx); err != nil && !isContextErr(err) {
 			slog.Error("vote check loop terminated", "module", "main", "error", err)
+		}
+		return nil
+	})
+	// MCP bridge: Start blocks until the shared ctx cancels and returns
+	// nil on a clean cancel (pinned by TestStartNilOnCancel), so eg.Wait()
+	// stays clean on SIGTERM. Anything else is the startup-failure class
+	// (port-in-use and friends) — that must be FATAL (slog.Error +
+	// os.Exit(1)), NOT degenerate into the SIGTERM slog.Warn path
+	// (which would swallow the bind failure and continue).
+	eg.Go(func() error {
+		if err := mcpSrv.Start(ctx); err != nil {
+			// Start returns nil on clean ctx-cancel; anything else is a
+			// startup-failure class (port-in-use, etc.)
+			slog.Error("MCP server failed to start and bind port", "module", "main", "error", err)
+			os.Exit(1)
 		}
 		return nil
 	})

@@ -28,6 +28,7 @@ func validEnv() map[string]string {
 		"TUGBOT_DERPIES_USER_IDS":  "",
 		"TUGBOT_SKILLS_DIR":        "",
 		"RUST_LOG":                 "",
+		"TUGBOT_MCP_PORT":          "",
 	}
 }
 
@@ -298,6 +299,43 @@ func TestLoadConfigDerpiesUserIDs(t *testing.T) {
 			t.Errorf("unset var: DerpiesUserIDs len = %d, want 0", len(cfg2.DerpiesUserIDs))
 		}
 	})
+}
+
+func TestLoadConfigMCPPort(t *testing.T) {
+	// Always-on MCP bridge: no enabled flag; unset/empty defaults to 8642.
+	vars := validEnv()
+	setEnv(t, vars)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if cfg.MCPPort != 8642 {
+		t.Errorf("MCPPort = %d, want 8642 (unset default)", cfg.MCPPort)
+	}
+}
+
+func TestLoadConfigMCPPortSet(t *testing.T) {
+	vars := validEnv()
+	vars["TUGBOT_MCP_PORT"] = "1234"
+	setEnv(t, vars)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if cfg.MCPPort != 1234 {
+		t.Errorf("MCPPort = %d, want 1234", cfg.MCPPort)
+	}
+}
+
+func TestLoadConfigMalformedMCPPort(t *testing.T) {
+	// A mistyped port fails LOUD (unlike the ID-list vars, whose malformed
+	// parts are skipped): LoadError.
+	vars := validEnv()
+	vars["TUGBOT_MCP_PORT"] = "abc"
+	setEnv(t, vars)
+	if _, err := LoadConfig(); err == nil {
+		t.Error("LoadConfig() with TUGBOT_MCP_PORT=abc: error = nil, want LoadError")
+	}
 }
 
 func TestLoadConfigLogLevel(t *testing.T) {
