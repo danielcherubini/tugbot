@@ -1,3 +1,12 @@
+## 2026-09-10
+
+### derpies: repeat-image fast delete (4.6) removed — re-posts are re-judged, never blind-deleted
+- Operator decision (driven by the 2026-09-10 journal incident): a filtered user's same-bytes PNG re-posts — the original had been LLM-judged clean — were deleted in under a second with zero asks (the 4.6 fast delete, shipped 2026-09-08, commit `bae6467`). The decision: images must NEVER be blindly deleted on previously judged content — a re-posted image is re-judged in a fresh pi ask like any other content.
+- Removed: the `seenImages` in-process cache (24h TTL, bounded at 2048 entries, oldest-evicted), the seen-skip logic (seen images leaving mixed asks), the pure-repeat delete arm and the edit no-op arm, the `isEdit` origin flag (edits are now origin-agnostic), and the 4.6 tests (the derpies package went from 91 tests to 85).
+- Kept: the 4.5 image leg (attachment + embed download, isSafeURL-guarded, URL-deduped, joining the ask via `AskWithImages`), the pirpc per-ask image guard (byte-identical dedupe, >1MB / >2048px resize to 2048/JPEG q80, 12MB raw cap — shared with the mention handler), the nickname flow.
+- Accepted cost trade: re-post burst amplification — N re-posts of a previously judged image = N bounded asks in the shared pi queue (plus N list SELECTs, the same profile as N novel images); there is NO zero-ask deletion on any image state. The word fast path (pre-image-handling token hits against `derpies_gimmicks`) is unchanged.
+- Code: `internal/handlers/derpies/` (`derpies.go`, `edits.go` + the 4.6 test removals). Docs: `docs/features/derpies.md`, `docs/decisions/0006-derpies-repeat-image-fast-delete-removed.md`, `CONTEXT.md`.
+
 ## 2026-09-09
 
 ### mcp: embedded MCP Discord bridge — five bridge tools over the bot's shared session

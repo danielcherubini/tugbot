@@ -265,7 +265,7 @@ func TestFlowImagesUseAskWithImages(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithImage("totally safe words", srv.URL+"/a.png"), false)
+	h.flow(msgWithImage("totally safe words", srv.URL+"/a.png"))
 
 	if pi.imageAsks != 1 {
 		t.Errorf("pi.imageAsks = %d, want 1 (a downloaded image must use AskWithImages)", pi.imageAsks)
@@ -294,7 +294,7 @@ func TestFlowImageOnlyLearnsAndDeletes(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithImage("", srv.URL+"/a.png"), false)
+	h.flow(msgWithImage("", srv.URL+"/a.png"))
 
 	if pi.imageAsks != 1 {
 		t.Errorf("pi.imageAsks = %d, want 1", pi.imageAsks)
@@ -317,7 +317,7 @@ func TestFlowImageOnlyVerdictInvalidWordRejected(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithImage("", srv.URL+"/a.png"), false)
+	h.flow(msgWithImage("", srv.URL+"/a.png"))
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
@@ -332,7 +332,7 @@ func TestFlowTextAndImageVerdictWordNotInTextRejected(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithImage("hi there", srv.URL+"/a.png"), false)
+	h.flow(msgWithImage("hi there", srv.URL+"/a.png"))
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
@@ -348,7 +348,7 @@ func TestFlowImageDownloadFailureDegradesToTextAsk(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithImage(content, closed.URL+"/a.png"), false)
+	h.flow(msgWithImage(content, closed.URL+"/a.png"))
 
 	if pi.imageAsks != 0 {
 		t.Errorf("pi.imageAsks = %d, want 0 (nothing downloaded)", pi.imageAsks)
@@ -378,7 +378,7 @@ func TestFlowReferencedFetchFailureDegrades(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{refErr: errors.New("gone")}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithRef("totally safe words"), false)
+	h.flow(msgWithRef("totally safe words"))
 
 	if ops.refCalls != 1 {
 		t.Errorf("refCalls = %d, want 1", ops.refCalls)
@@ -400,7 +400,7 @@ func TestFlowReferencedFastHitDeletes(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"sw1ft": true}}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "who's giving me a sw1ft."}}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithRef("↑↑↑"), false)
+	h.flow(msgWithRef("↑↑↑"))
 
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 		t.Errorf("deleted = %v, want one fast delete [[c1 msg1]]", ops.deleted)
@@ -421,7 +421,7 @@ func TestFlowReferencedPromptCarriesRefContent(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "holler at zswiftf now"}}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithRef("holler"), false)
+	h.flow(msgWithRef("holler"))
 
 	if pi.asks != 1 {
 		t.Errorf("pi.asks = %d, want 1", pi.asks)
@@ -448,7 +448,7 @@ func TestFlowReferencedVerdictWordOnlyInRefLearns(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "holler at zswiftf now"}}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithRef("???"), false)
+	h.flow(msgWithRef("???"))
 
 	if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
 		t.Errorf("added = %v, want [zswiftf|llm]", store.added)
@@ -468,7 +468,7 @@ func TestFlowReferencedVerdictWordNowhereRejected(t *testing.T) {
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "bbb"}}
 	h := newTestDerpies(store, ops, pi)
-	h.flow(msgWithRef("aaa"), false)
+	h.flow(msgWithRef("aaa"))
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
@@ -496,7 +496,7 @@ func TestDownloadPlanDedupesReferenced(t *testing.T) {
 	h := newTestDerpies(store, ops, pi)
 	m := msgWithImage("", urlX)
 	m.MessageReference = &discordgo.MessageReference{MessageID: "ref1"}
-	h.flow(m, false)
+	h.flow(m)
 
 	if pi.imageAsks != 1 {
 		t.Errorf("pi.imageAsks = %d, want 1", pi.imageAsks)

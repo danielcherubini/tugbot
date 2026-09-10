@@ -8,6 +8,8 @@ package derpies
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -219,6 +221,19 @@ func TestEditFlowFetchedMessageNoAuthor(t *testing.T) {
 	assertNoDeletes(t, ops)
 }
 
+// bodyServer — a server answering 200 with the given body; the body is
+// the image CONTENT (two server bodies = two image contents).
+type requestAlias = http.Request
+
+func bodyServer(t *testing.T, body []byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *requestAlias) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestEditFlowEmptyTextWithAttachmentsJudgedInPlace(t *testing.T) {
 	// The STRICT trigger deviation, pinned: Content == "" WITH an
 	// attachment present is judged in place — ZERO fetches (gokupoll
@@ -289,87 +304,4 @@ func TestEditFlowFetchedSlowPathLearnsDeletes(t *testing.T) {
 	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "m1" {
 		t.Errorf("deleted = %v, want [[c1 m1]] (the FETCHED message's ID deleted)", ops.deleted)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Repeat-image on the EDIT path — an all-seen image-only edit must NEVER
-// trigger the pure-repeat delete (flow 4.6 with isEdit). The seen cache
-// is primed through the CREATE path (flow(m, false)), then the edit is
-// judged in place (attachment-bearing payload) and must be a clean no-op.
-// ---------------------------------------------------------------------------
-
-func TestEditFlowSeenImageRepeatDoesNotDelete(t *testing.T) {
-	srv := bodyServer(t, []byte{0x89, 0x50, 0x4e, 0x50, 0x0c})
-	h, _, ops, pi := newRepeatTest(t)
-	pi.resp = "CLEAN"
-
-	// Create path: the image is judged and marked seen.
-	h.flow(imgMsg("m1", srv.URL+"/a.png"), false)
-	if pi.imageAsks != 1 {
-		t.Fatalf("create judge: imageAsks = %d, want 1", pi.imageAsks)
-	}
-
-	// An EDIT to the image-only state (same seen content, no text): the
-	// pure-repeat arm must NOT delete — and must NOT ask (nothing fresh
-	// to judge): a clean no-op.
-	evt := &discordgo.MessageUpdate{Message: &discordgo.Message{
-		ID: "m1", ChannelID: "c1", GuildID: "g1",
-		Author:      &discordgo.User{ID: editUser},
-		Content:     "",
-		Attachments: []*discordgo.MessageAttachment{{URL: srv.URL + "/a.png-edit", ContentType: "image/png"}},
-	}}
-	h.editFlow(evt)
-
-	if len(ops.deleted) != 0 {
-		t.Errorf("deleted = %v, want none (an all-seen image-only EDIT must not delete)", ops.deleted)
-	}
-	if pi.imageAsks != 1 || pi.asks != 0 {
-		t.Errorf("after the edit: imageAsks=%d asks=%d, want 1/0 (the edit asked nothing)", pi.imageAsks, pi.asks)
-	}
-}
-
-func TestEditFlowFreshTextWithSeenImageGetsTextOnlyAsk(t *testing.T) {
-	// The edit-path mirror of the create-path
-	// TestRepeatImageWithNewTextGetsTextOnlyAsk: a seen image PLUS fresh
-	// text on an EDIT is not swallowed by the isEdit arm — that arm only
-	// no-ops the all-seen IMAGE-ONLY state. The seen image drops out of
-	// the ask payload, the fresh text is judged once as a PLAIN
-	// (image-free) ask, and a CLEAN verdict deletes nothing. This pins
-	// that the isEdit arm never skips judging fresh text.
-	srv := bodyServer(t, []byte{0x89, 0x50, 0x4e, 0x50, 0x0d})
-	h, store, ops, pi := newRepeatTest(t)
-	pi.resp = "CLEAN"
-
-	// Prime the seen cache through the CREATE path (the same mechanism as
-	// TestEditFlowSeenImageRepeatDoesNotDelete): the image is judged and
-	// marked seen.
-	h.flow(imgMsg("m1", srv.URL+"/a.png"), false)
-	if pi.imageAsks != 1 {
-		t.Fatalf("create judge: imageAsks = %d, want 1", pi.imageAsks)
-	}
-
-	// The EDIT carries the SAME seen image plus FRESH text: the text must
-	// be judged in place (the edit payload holds content — no fetch).
-	evt := &discordgo.MessageUpdate{Message: &discordgo.Message{
-		ID: "m1", ChannelID: "c1", GuildID: "g1",
-		Author:      &discordgo.User{ID: editUser},
-		Content:     "hello entirely fresh text",
-		Attachments: []*discordgo.MessageAttachment{{URL: srv.URL + "/a.png-edit", ContentType: "image/png"}},
-	}}
-	h.editFlow(evt)
-
-	if ops.refCalls != 0 {
-		t.Errorf("refCalls = %d, want 0 (the edit payload had content — judged in place, no fetch)", ops.refCalls)
-	}
-	if pi.asks != 1 {
-		t.Errorf("pi.asks = %d, want 1 (the fresh text was judged as a plain ask)", pi.asks)
-	}
-	if pi.imageAsks != 1 {
-		t.Errorf("pi.imageAsks = %d, want 1 (the seen image must not be re-asked)", pi.imageAsks)
-	}
-	if len(pi.prompts) != 1 || !strings.Contains(pi.prompts[0], "hello entirely fresh text") {
-		t.Errorf("prompts = %v, want exactly one prompt carrying the fresh text (the text ask judged the edit's content, image-free)", pi.prompts)
-	}
-	assertNoDeletes(t, ops)
-	assertNothingLearned(t, store)
 }

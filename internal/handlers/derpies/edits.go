@@ -4,13 +4,10 @@
 // the LLM judged the ORIGINAL text, and the author can now rewrite that
 // same message to carry a gimmick with no create-time check re-running
 // (only gokupoll watches the update event today). Every update by a
-// gated author re-runs the existing create flow on the updated content
-// with the isEdit origin flag — fast path, images/repeat-image, one-hop
-// reference, one slow-path ask, learning, and deletion all carry over
-// unchanged (an edit costs at most one list SELECT + one pi ask, same as
-// a create). The single origin difference: flow 4.6's pure-repeat
-// delete arm is disabled for edits (an all-seen image-only EDIT never
-// deletes — see flow's isEdit docs).
+// gated author re-runs the existing create flow on the updated content —
+// fast path, images, one-hop reference, one slow-path ask, learning, and
+// deletion all carry over unchanged (an edit is origin-agnostic: at most
+// one list SELECT + one pi ask, same as a create).
 // BARE update payloads (the mod.rs:126-136 quirk — a payload with no
 // usable content) are fetched by channel+id through the
 // channelMessageRetrieve seam; a fetch failure degrades (log + skip),
@@ -29,7 +26,7 @@ import (
 )
 
 // MessageUpdate re-judges an edit by a gated author: the full create
-// flow (fast path, images/repeat-image, one-hop reference, one slow
+// flow (fast path, images, one-hop reference, one slow
 // ask, learn, delete) runs on the UPDATED content. The event thread is
 // never held (same shape as MessageCreate).
 func (h *Derpies) MessageUpdate(evt *discordgo.MessageUpdate) { go h.editFlow(evt) }
@@ -89,10 +86,8 @@ func (h *Derpies) editFlow(evt *discordgo.MessageUpdate) {
 		}
 		m = fetched
 	}
-	// 5. The full create flow, with the isEdit origin flag (the only
-	//    difference: flow 4.6's pure-repeat delete arm is disabled — an
-	//    all-seen image-only EDIT never deletes). The flow's own gates
-	//    re-run on m — idempotent and cheap; m already passed the
-	//    event-level gates.
-	h.flow(m, true)
+	// 5. The full create flow (origin-agnostic; an edit costs at most one
+	//    list SELECT + one pi ask). The flow's own gates re-run on m —
+	//    idempotent and cheap; m already passed the event-level gates.
+	h.flow(m)
 }
