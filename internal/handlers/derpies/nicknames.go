@@ -57,7 +57,7 @@ func (h *Derpies) nickFlow(evt *discordgo.GuildMemberUpdate) {
 
 	// 2. Payload guard (the main.go closure already nil-guards the
 	//    payload; this makes the flow call-safe in its own right).
-	if evt == nil || evt.Member == nil || evt.Member.User == nil {
+	if evt == nil || evt.Member == nil || evt.User == nil {
 		return
 	}
 

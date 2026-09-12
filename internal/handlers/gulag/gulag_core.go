@@ -378,18 +378,18 @@ func (g *Gulag) IsUserInGulag(ctx context.Context, userID int64) *db.GulagUser {
 }
 
 // AddToGulag mirrors add_to_gulag (mod.rs:110-183): fetch the member
-// (context "Failed to get guild member"), add the gulag role (context
-// "Failed to add gulag role"), the checked u32 -> int32 of the length
+// (context "failed to get guild member"), add the gulag role (context
+// "failed to add gulag role"), the checked u32 -> int32 of the length
 // (ERRORS on overflow), then the existing-row add-time branch (checked
-// addition, context "Failed to add time to gulag") or the fresh
+// addition, context "failed to add time to gulag") or the fresh
 // send_to_gulag branch (checked ID conversions, context "Failed to send
 // user to gulag").
 func (g *Gulag) AddToGulag(ctx context.Context, p GulagParams) (db.GulagUser, error) {
 	if _, err := g.discord().GuildMember(p.GuildID, p.UserID); err != nil {
-		return db.GulagUser{}, fmt.Errorf("Failed to get guild member: %w", err)
+		return db.GulagUser{}, fmt.Errorf("failed to get guild member: %w", err)
 	}
 	if err := g.discord().GuildMemberRoleAdd(p.GuildID, p.UserID, p.GulagRoleID); err != nil {
-		return db.GulagUser{}, fmt.Errorf("Failed to add gulag role: %w", err)
+		return db.GulagUser{}, fmt.Errorf("failed to add gulag role: %w", err)
 	}
 	length, err := CheckedGulagLengthToSeconds(p.GulagLength)
 	if err != nil {
@@ -406,7 +406,7 @@ func (g *Gulag) AddToGulag(ctx context.Context, p GulagParams) (db.GulagUser, er
 			return db.GulagUser{}, err
 		}
 		if err := g.updateGulagUserTime(ctx, gulagUser.ID, newLength, newRelease); err != nil {
-			return db.GulagUser{}, fmt.Errorf("Failed to add time to gulag: %w", err)
+			return db.GulagUser{}, fmt.Errorf("failed to add time to gulag: %w", err)
 		}
 		gulagUser.GulagLength = newLength
 		gulagUser.ReleaseAt = pgtype.Timestamp{Time: newRelease, Valid: true}
@@ -419,7 +419,7 @@ func (g *Gulag) AddToGulag(ctx context.Context, p GulagParams) (db.GulagUser, er
 // branch of add_to_gulag, mod.rs:166-182): the checked ID conversions
 // (Rust "User ID {} exceeds i64::MAX" et al.), the non-negative length
 // check, release_at = now + length * 1s, then the insert (context
-// "Failed to send user to gulag").
+// "failed to send user to gulag").
 func (g *Gulag) sendToGulag(ctx context.Context, p GulagParams, length int32, userID int64) (db.GulagUser, error) {
 	if length < 0 {
 		return db.GulagUser{}, errors.New("gulag_length must be non-negative")
@@ -455,7 +455,7 @@ func (g *Gulag) sendToGulag(ctx context.Context, p GulagParams, length int32, us
 	}
 	id, err := g.insertGulagUser(ctx, row)
 	if err != nil {
-		return db.GulagUser{}, fmt.Errorf("Failed to send user to gulag: %w", err)
+		return db.GulagUser{}, fmt.Errorf("failed to send user to gulag: %w", err)
 	}
 	row.ID = id
 	return row, nil

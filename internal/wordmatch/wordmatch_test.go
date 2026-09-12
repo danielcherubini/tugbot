@@ -30,9 +30,9 @@ func TestFoldToASCII(t *testing.T) {
 		{"zwиft", "zwift"},                          // and (U+0438, small i)
 		{"ZWИFТ", "zwift"},                          // капитализация: И (И) + Т (Т)
 		{"sоt", "sot"},                              // о (small O)
-		{"z​wi​ft", "zwift"},                        // zero-width space (Cf) stripped
-		{"z⁠wi⁠ft", "zwift"},                        // word joiner (Cf) stripped
-		{"z‍wi‍ft", "zwift"},                        // ZWNJ (Cf) stripped
+		{"z\u200bwi\u200bft", "zwift"},              // zero-width space (Cf) stripped
+		{"z\u2060wi\u2060ft", "zwift"},              // word joiner (Cf) stripped
+		{"z\u200dwi\u200dft", "zwift"},              // ZWNJ (Cf) stripped
 		{"\uFF5A\uFF57\uFF49\uFF46\uFF54", "zwift"}, // fullwidth lowercase
 		{"\uFF3A\uFF37\uFF29\uFF26\uFF34", "zwift"}, // fullwidth uppercase
 		{"sw٣ft", "sw3ft"},                          // Arabic-Indic ٣

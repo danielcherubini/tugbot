@@ -96,7 +96,7 @@ func Update(ctx context.Context, pool *pgxpool.Pool, key string, enabled bool) e
 	tag, err := pool.Exec(ctx, `UPDATE features SET enabled = $1 WHERE name = $2`, enabled, key)
 	if err != nil {
 		// Rust mod.rs:52-56: pool connection failure bails with a fixed text.
-		return errors.New("Failed to get database connection from pool")
+		return errors.New("failed to get database connection from pool")
 	}
 	if tag.RowsAffected() == 0 {
 		// Rust mod.rs:63-64: bail!("Feature '{}' not found in database", name)

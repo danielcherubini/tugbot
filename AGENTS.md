@@ -11,7 +11,7 @@ Gate order (mirrors CI's `vet, lint, test, build` job):
 go build ./...
 go vet ./...
 gofmt -l .            # must print nothing (CI's linter set does NOT include gofmt)
-make lint             # golangci-lint (version pinned in CI: v1.64.8) + go vet
+make lint             # golangci-lint (version pinned in CI: v2.13.2) + go vet
 go test ./...         # without PG: DB-touching tests self-skip cleanly
 ```
 

@@ -151,10 +151,10 @@ func TestDownloadImages(t *testing.T) {
 	bodyB := []byte{0xff, 0xd8, 0xff, 0xe0}
 	bodyC := []byte{0x47, 0x49, 0x46, 0x38}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/a.png":
+		switch r.URL.Path {
+		case "/a.png":
 			_, _ = w.Write(bodyA)
-		case r.URL.Path == "/b.png":
+		case "/b.png":
 			_, _ = w.Write(bodyB)
 		default:
 			w.WriteHeader(500)

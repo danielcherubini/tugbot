@@ -43,7 +43,7 @@ func TestEditFlowNotGatedAuthor(t *testing.T) {
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	evt := editEvent("who's giving me a sw1ft.")
-	evt.Message.Author = &discordgo.User{ID: "222"}
+	evt.Author = &discordgo.User{ID: "222"}
 	h.editFlow(evt)
 
 	assertNoDeletes(t, ops)
@@ -64,7 +64,7 @@ func TestEditFlowNoGuild(t *testing.T) {
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	evt := editEvent("who's giving me a sw1ft.")
-	evt.Message.GuildID = ""
+	evt.GuildID = ""
 	h.editFlow(evt)
 
 	assertNoDeletes(t, ops)

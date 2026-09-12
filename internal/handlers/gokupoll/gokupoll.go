@@ -50,7 +50,7 @@ func (h *GokuPoll) MessageUpdate(u *discordgo.MessageUpdate) {
 			slog.Error("failed to fetch message for update event: no message in payload", "module", "gokupoll")
 			return
 		}
-		fetched, err := h.app.D.ChannelMessage(u.Message.ChannelID, u.Message.ID)
+		fetched, err := h.app.D.ChannelMessage(u.ChannelID, u.ID)
 		if err != nil {
 			slog.Error("failed to fetch message for update event", "module", "gokupoll", "error", err)
 			return

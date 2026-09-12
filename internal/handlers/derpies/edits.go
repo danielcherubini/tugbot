@@ -34,7 +34,7 @@ func (h *Derpies) MessageUpdate(evt *discordgo.MessageUpdate) { go h.editFlow(ev
 func (h *Derpies) editFlow(evt *discordgo.MessageUpdate) {
 	// 0. Payload guard (the event carries *Message — nil guards are the
 	//    house discipline; Author must exist for the gate below).
-	if evt == nil || evt.Message == nil || evt.Message.Author == nil {
+	if evt == nil || evt.Message == nil || evt.Author == nil {
 		return
 	}
 	ctx := context.Background()
@@ -43,18 +43,18 @@ func (h *Derpies) editFlow(evt *discordgo.MessageUpdate) {
 		return
 	}
 	// 2. Guild guard.
-	if evt.Message.GuildID == "" {
+	if evt.GuildID == "" {
 		return
 	}
 	// 3. Author-ID gate (checked conversion — the house discipline).
-	uid, err := core.DiscordID("user", evt.Message.Author.ID)
+	uid, err := core.DiscordID("user", evt.Author.ID)
 	if err != nil {
 		return
 	}
 	if _, ok := h.app.Cfg.DerpiesUserIDs[uid]; !ok {
 		return
 	}
-	slog.Info("derpies edit from filtered user", "module", module, "user", evt.Message.Author.ID, "message", evt.Message.ID)
+	slog.Info("derpies edit from filtered user", "module", module, "user", evt.Author.ID, "message", evt.ID)
 	// 4. Bare-payload guard — the mod.rs:126-136 fetch branch (the
 	//    gokupoll port, with a STRICT trigger deviation — gokupoll
 	//    fetches on empty content ALONE; here also require NO
