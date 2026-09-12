@@ -73,10 +73,11 @@ var (
 var eBMLHeader = []byte{0x1A, 0x45, 0xDF, 0xA3}
 
 // videoDemuxer / videoCodec are the minimal method sets the mp4+webm demuxers
-// and the h264+vp8 codecs share, so the seek-sample + fallback + encode legs are
-// written ONCE and only the demuxer/codec construction branches per container.
-// Both *mp4.Demuxer and *webm.Demuxer satisfy videoDemuxer; both *h264.Codec
-// and *vp8.Codec satisfy videoCodec.
+// and the h264+vp8 codecs share, so the seek-sample + fallback + encode legs
+// (sampleVideoFrames and its walks) are written ONCE and only the
+// demuxer/codec construction branches per container. Both *mp4.Demuxer and
+// *webm.Demuxer satisfy videoDemuxer; both *h264.Codec and *vp8.Codec
+// satisfy videoCodec.
 type videoDemuxer interface {
 	Seek(t time.Duration) (time.Duration, error)
 	Duration() time.Duration
@@ -88,6 +89,27 @@ type videoDemuxer interface {
 type videoCodec interface {
 	Decode(pkt govid.Packet) (*govid.Frame, error)
 	Flush()
+}
+
+// videoWalkResult is what one bounded decode walk (a seek-window or the
+// sequential fallback) produced: the kept frame, and the first codec-decode
+// error hit — wrapped with the packet position (nil when the walk ran to
+// EOF without a decode error). A decode error (NOT the (nil, nil) buffering
+// shape) stops that walk; it is recorded, never returned — per-sample
+// degradation is log-skip (house discipline) and the caller carries the
+// recorded error in its degrade log.
+type videoWalkResult struct {
+	frame     *govid.Frame
+	decodeErr error
+}
+
+// videoSampleResult is what the per-sample loop produced: the frames yielded
+// (a 0-frame result is NOT an error — it degrades to what was got) and the
+// first recorded decode error (observable for the persistent-failure degrade
+// log + for tests; also never returned per the degrade discipline).
+type videoSampleResult struct {
+	frames    []app.PiImage
+	decodeErr error
 }
 
 // downloadVideoBytes does ONE GET of url (the exact http.NewRequestWithContext
@@ -157,20 +179,13 @@ func govidVideoFrames(data []byte) ([]app.PiImage, error) {
 }
 
 // decodeVideoFrames runs the one shared seek-sample pass for whichever demuxer +
-// codec the container selected. It is the single seek-sampled-frame algorithm:
-//
-//	k = min(videoOutputFrames, max(1, int(dur.Seconds()*fps)+1)), fps guarded.
-//
-// For each sample i in [0, k): target t = (i + 0.5)/k * dur; Seek(t); then
-// codec.Flush() IMMEDIATELY after the seek resolves (govid documents Flush as the
-// post-seek reset — it discards the H.264 reorder buffer and resets decoder
-// state; WITHOUT it the first frame after a seek is a STALE buffered frame from
-// the previous segment and SPS/ref state carries across); then walk up to
-// videoSeekDecodeWindow packets, decoding, and keep the first usable frame at >= t
-// (or the first usable frame when timestamps are zero). If the seek-window yields
-// nothing, a bounded sequential fallback (up to videoSequentialCap packets from the
-// previous stop position) takes the last usable frame before the cap. A sample
-// that still yields nothing is skipped (log, no error).
+// codec the container selected. It builds the container-specific demuxer + codec
+// (the only branch that differs per container); the k computation, the per-sample
+// seek + post-seek Flush + seek-window walk + sequential fallback + encode legs
+// all live in sampleVideoFrames (created by the extraction; behavior preserved,
+// see its doc). A demuxer-construction error is propagated to the caller
+// (which also warns + skips). A successfully sniffed container that yields
+// ZERO frames is NOT an error.
 func decodeVideoFrames(data []byte, container string) ([]app.PiImage, error) {
 	var d videoDemuxer
 	var c videoCodec
@@ -191,7 +206,58 @@ func decodeVideoFrames(data []byte, container string) ([]app.PiImage, error) {
 		return nil, errUnsupported
 	}
 	defer func() { _ = d.Close() }()
+	res := sampleVideoFrames(d, c)
+	// Per the degrade discipline the function contract is UNCHANGED: the
+	// returned error is only the container-level failure (the demuxer
+	// construction above); a per-sample decode error is recorded in the
+	// result (the persistent-failure degrade log in sampleVideoFrames +
+	// tests observe it) but is never returned — a 0-frame result is not an
+	// error.
+	return res.frames, nil
+}
 
+// sampleVideoFrames is the per-sample seek + fallback + encode leg, extracted
+// from decodeVideoFrames (behavior preserved) so it can be driven through the
+// fake videoDemuxer / videoCodec seams (the real decode leg stays locked by
+// TestVideoFramesGovidFixture).
+//
+//	k = min(videoOutputFrames, max(1, int(dur.Seconds()*fps)+1)), fps guarded.
+//
+// For each sample i in [0, k): target t = (i + 0.5)/k * dur; Seek(t); then
+// codec.Flush() IMMEDIATELY after the seek resolves (govid documents Flush as the
+// post-seek reset — it discards the H.264 reorder buffer and resets decoder
+// state; WITHOUT it the first frame after a seek is a STALE buffered frame from
+// the previous segment and SPS/ref state carries across); then walk up to
+// videoSeekDecodeWindow packets, decoding, and keep the first usable frame at >= t
+// (or the first usable frame when timestamps are zero). Codec.Decode returns
+// (nil, nil) while the H.264 reorder buffer fills and for parameter-set packets
+// and is NEVER an error (the silent-continue path is unchanged). A codec-decode
+// ERROR (not the buffering shape) stops the current walk at that point and is
+// recorded (wrapped with the packet position); a sample that then yields nothing
+// is skipped with a degrade warning carrying the RECORDED error (the actual
+// decode failure + the sample index via idx), not a bare "no frame" warning —
+// never an error return, never an abort of govidVideoFrames or the flow. If the
+// seek-window yielded nothing, the bounded sequential fallback (up to
+// videoSequentialCap packets from the previous stop position) takes the last
+// usable frame before the cap; on a decode error it too stops + records, and the
+// seek-walk error takes priority (the earlier failure is the more diagnostic
+// one). An error in a walk AFTER its frame was already captured (a good frame
+// with planes, then a later error) keeps the frame — the success path is
+// unchanged.
+//
+// Persistent-decoder-failure (documented judgment): the decoder's state is shared
+// by ALL samples (seek or not), so a decode error in one sample is likely to
+// poison the next. TWO CONSECUTIVE samples both degrading on a decode error are
+// treated as a persistent decoder failure: the walk stops for the REMAINING
+// samples and ONE final degrade warning is logged (instead of up to k-1
+// identical per-sample warnings repeating the same error). A good frame after an
+// errored sample resets the counter (a one-off error does not poison the rest);
+// the plain "no frame" path resets it too, exactly as before.
+//
+// The contract is unchanged: per-sample problems are WARN-only (log + skip); a
+// 0-frame result is not an error (it degrades to what was got).
+func sampleVideoFrames(d videoDemuxer, c videoCodec) videoSampleResult {
+	var res videoSampleResult
 	fps := d.VideoInfo().FrameRate
 	if fps <= 0 {
 		fps = 16.67
@@ -205,39 +271,78 @@ func decodeVideoFrames(data []byte, container string) ([]app.PiImage, error) {
 		k = videoOutputFrames
 	}
 
-	var out []app.PiImage
+	var consecutiveDecodeErrs int
 	for i := 0; i < k; i++ {
+		// Persistent decoder failure (two consecutive samples degraded on a
+		// decode error): the decoder is assumed stuck. Log ONCE (instead of
+		// repeating one warning per sample) and skip the remaining samples.
+		if consecutiveDecodeErrs >= 2 {
+			slog.Warn("derpies video decoder is failing — skipping remaining samples (degrade)", "module", module, "error", res.decodeErr)
+			break
+		}
 		frac := (float64(i) + 0.5) / float64(k)
 		t := time.Duration(frac * float64(dur))
 		if _, err := d.Seek(t); err != nil {
 			slog.Warn("derpies video seek failed — skipping sample (degrade)", "module", module, "idx", i, "error", err)
 			continue
 		}
-		// Post-seek reset: discard the reorder buffer + reset decoder state so
-		// the first decoded frame is the seek-target, not a stale buffer.
+		// Post-seek reset: discard the reorder buffer + reset decoder state
+		// so the first decoded frame is the seek-target, not a stale buffer.
 		c.Flush()
-		frame := pickSeekFrame(d, c, t)
-		if frame == nil {
-			frame = sequentialFallback(d, c)
-			if frame != nil {
+		seek := pickSeekFrame(d, c, t)
+		var frame *govid.Frame
+		var decodeErr error
+		if seek.frame != nil {
+			frame = seek.frame
+		} else {
+			fb := sequentialFallback(d, c)
+			if fb.frame != nil {
 				slog.Warn("derpies video sample fell back to sequential decode", "module", module, "idx", i)
+				frame = fb.frame
+			}
+			if seek.decodeErr != nil {
+				decodeErr = seek.decodeErr
+			} else {
+				decodeErr = fb.decodeErr
 			}
 		}
 		if frame == nil {
-			// A sample that yields nothing is skipped (log, no error) — a
-			// 0-frame result is NOT an error (degrade to what we got).
-			slog.Warn("derpies video sample yielded no frame — skipping (degrade)", "module", module, "idx", i)
+			if decodeErr != nil {
+				// A decode error (not the (nil, nil) buffering shape)
+				// stopped the walk — the degrade warning carries the
+				// RECORDED error (the codec failure + packet position,
+				// wrapped; the sample index via idx) instead of a bare
+				// "no frame" warning. Never an error return, never an
+				// abort.
+				consecutiveDecodeErrs++
+				if res.decodeErr == nil {
+					res.decodeErr = decodeErr
+				}
+				slog.Warn("derpies video sample decode failed — skipping sample (degrade)", "module", module, "idx", i, "error", decodeErr)
+			} else {
+				// A sample that yields nothing is skipped (log, no error)
+				// — a 0-frame result is NOT an error (degrade to what we
+				// got).
+				consecutiveDecodeErrs = 0
+				slog.Warn("derpies video sample yielded no frame — skipping (degrade)", "module", module, "idx", i)
+			}
 			continue
 		}
+		// A good frame means the decoder is alive — including in a sample
+		// where the walk later hit a decode error and kept the frame
+		// anyway. A one-off errored sample does not poison the rest of
+		// the run.
+		consecutiveDecodeErrs = 0
 		img, err := frameToPiImage(frame)
 		if err != nil {
-			// A doc'd partial/undecodable frame is logged + skipped (degrade).
+			// A doc'd partial/undecodable frame is logged + skipped
+			// (degrade).
 			slog.Warn("derpies video frame skipped — not encodable (degrade)", "module", module, "idx", i, "error", err)
 			continue
 		}
-		out = append(out, img)
+		res.frames = append(res.frames, img)
 	}
-	return out, nil
+	return res
 }
 
 // pickSeekFrame walks up to videoSeekDecodeWindow packets after the seek and
@@ -246,8 +351,18 @@ func decodeVideoFrames(data []byte, container string) ([]app.PiImage, error) {
 // the first usable frame instead. Codec.Decode returns (nil, nil) while the H.264
 // reorder buffer fills and for parameter-set packets — the returned *govid.Frame
 // nil-check is done here BEFORE any plane access (a frame.YCbCr deref on a nil
-// frame would panic the flow). A frame with nil/empty YCbCr planes is skipped.
-func pickSeekFrame(d videoDemuxer, c videoCodec, t time.Duration) *govid.Frame {
+// frame would panic the flow); the (nil, nil) shape is neutral for the
+// walker (silent continue — unchanged). A frame with nil/empty YCbCr planes is
+// skipped. A codec-decode ERROR (not the (nil, nil) buffering shape) is a
+// walk-stop: it is recorded (wrapped with the packet position) in the returned
+// videoWalkResult — it is never returned as an error (degrade discipline) and,
+// per the persistent-failure rule, two consecutive errored samples stop the
+// whole run. When an error stops the walk AFTER usable frames were already
+// collected, those frames are KEPT (an error after a good frame keeps the
+// frame — the success path is unchanged); only a walk that collected nothing
+// degrades.
+func pickSeekFrame(d videoDemuxer, c videoCodec, t time.Duration) videoWalkResult {
+	var res videoWalkResult
 	var good []*govid.Frame
 	anyZero := false
 	for i := 0; i < videoSeekDecodeWindow; i++ {
@@ -255,7 +370,14 @@ func pickSeekFrame(d videoDemuxer, c videoCodec, t time.Duration) *govid.Frame {
 		if err != nil { // io.EOF or any other walk-stop.
 			break
 		}
-		frame, _ := c.Decode(pkt)
+		frame, decErr := c.Decode(pkt)
+		if decErr != nil {
+			// A decode error (not the (nil, nil) buffering shape) means
+			// the walk cannot make progress from here: stop, and record
+			// the error (with the packet position) for the degrade log.
+			res.decodeErr = fmt.Errorf("decode packet %d (seek window): %w", i, decErr)
+			break
+		}
 		if !frameHasPlanes(frame) { // nil frame / nil YCbCr / empty planes all skipped.
 			continue
 		}
@@ -265,38 +387,51 @@ func pickSeekFrame(d videoDemuxer, c videoCodec, t time.Duration) *govid.Frame {
 		good = append(good, frame)
 	}
 	if len(good) == 0 {
-		return nil
+		return res // error (if recorded) still carried in res.decodeErr
 	}
 	if anyZero {
-		return good[0] // headers/timestamps are zero: the first usable frame IS the one.
+		res.frame = good[0] // headers/timestamps are zero: the first usable frame IS the one.
+		return res
 	}
 	for _, g := range good {
 		if g.Timestamp >= t {
-			return g
+			res.frame = g
+			return res
 		}
 	}
-	return nil
+	return res
 }
 
 // sequentialFallback is the per-sample bounded fallback: the seek-window yielded
 // nothing, so it continues (NO re-seek — the demuxer cursor already sits at the
 // previous stop position, the packet just past the seek-window end) walking up to
 // videoSequentialCap packets in stream order and takes the LAST usable frame
-// before the cap. It returns nil when none is usable.
-func sequentialFallback(d videoDemuxer, c videoCodec) *govid.Frame {
-	var last *govid.Frame
+// before the cap. It returns a videoWalkResult: a codec-decode
+// ERROR (not the (nil, nil) buffering shape) stops the walk + records
+// (wrapped with the packet position) — it is never returned as an error. On a
+// clean run it takes the LAST usable frame before the cap, or a nil frame
+// when none is usable.
+func sequentialFallback(d videoDemuxer, c videoCodec) videoWalkResult {
+	var res videoWalkResult
 	for i := 0; i < videoSequentialCap; i++ {
 		pkt, err := d.NextPacket()
 		if err != nil { // io.EOF or any other walk-stop.
 			break
 		}
-		frame, _ := c.Decode(pkt)
+		frame, decErr := c.Decode(pkt)
+		if decErr != nil {
+			// A decode error (not the (nil, nil) buffering shape) means
+			// the walk cannot make progress from here: stop, and record
+			// the error (with the packet position) for the degrade log.
+			res.decodeErr = fmt.Errorf("decode packet %d (sequential fallback): %w", i, decErr)
+			break
+		}
 		if !frameHasPlanes(frame) {
 			continue
 		}
-		last = frame
+		res.frame = frame
 	}
-	return last
+	return res
 }
 
 // frameHasPlanes is the single validity gate a decoded *govid.Frame must pass
