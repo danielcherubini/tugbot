@@ -256,12 +256,18 @@ func runSelftest() int {
 	// (or the test override, which the production value never uses);
 	// missing credential env falls back to dummies (the session is
 	// never opened, so the values are never used).
-	os.Setenv("DATABASE_URL", selftestURL())
+	if err := os.Setenv("DATABASE_URL", selftestURL()); err != nil {
+		slog.Warn("selftest: failed to set env", "module", "main", "var", "DATABASE_URL", "error", err)
+	}
 	if os.Getenv("DISCORD_TOKEN") == "" {
-		os.Setenv("DISCORD_TOKEN", "selftest-dummy-token")
+		if err := os.Setenv("DISCORD_TOKEN", "selftest-dummy-token"); err != nil {
+			slog.Warn("selftest: failed to set env", "module", "main", "var", "DISCORD_TOKEN", "error", err)
+		}
 	}
 	if os.Getenv("APPLICATION_ID") == "" {
-		os.Setenv("APPLICATION_ID", "1")
+		if err := os.Setenv("APPLICATION_ID", "1"); err != nil {
+			slog.Warn("selftest: failed to set env", "module", "main", "var", "APPLICATION_ID", "error", err)
+		}
 	}
 
 	cfg, err := config.LoadConfig()
@@ -430,7 +436,7 @@ func run() {
 
 	// OnGuildMemberAdd → the gulag join/rejoin arm.
 	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberAdd) {
-		if evt.Member == nil || evt.Member.User == nil {
+		if evt.Member == nil || evt.User == nil {
 			return
 		}
 		h.gulag.JoinRejoin(evt.Member)
@@ -441,7 +447,7 @@ func run() {
 	// MessageCreate, MessageUpdate, and GuildMemberUpdate).
 	// NON-BLOCKING: the flow runs in its own goroutine.
 	d.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberUpdate) {
-		if evt == nil || evt.Member == nil || evt.Member.User == nil {
+		if evt == nil || evt.Member == nil || evt.User == nil {
 			return
 		}
 		h.derpies.MemberUpdate(evt)
@@ -826,9 +832,10 @@ func (h *handlers) readyThreeWay(ctx context.Context) []serverRow {
 		gid := strconv.FormatInt(s.GuildID, 10)
 		if err := h.checkGuild(gid); err != nil {
 			slog.Error("Couldn't connect to server with guild_id "+gid, "module", "main", "error", err)
-			switch n, derr := st.deleteServer(ctx, s.ID); {
-			case derr == nil:
-				slog.Info("Deleted stale server "+strconv.FormatInt(int64(s.ID), 10)+" from database ("+strconv.Itoa(n)+" rows)", "module", "main")
+			deleted, derr := st.deleteServer(ctx, s.ID)
+			switch derr {
+			case nil:
+				slog.Info("Deleted stale server "+strconv.FormatInt(int64(s.ID), 10)+" from database ("+strconv.Itoa(deleted)+" rows)", "module", "main")
 			default:
 				slog.Error("Database error during delete", "module", "main", "error", derr)
 			}

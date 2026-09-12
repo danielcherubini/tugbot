@@ -89,8 +89,8 @@ func handlePostMessage(d DiscordAPI, args postMessageArgs) (*mcpSDK.CallToolResu
 	}
 
 	var msg *discordgo.Message
-	switch {
-	case args.ReplyToID == "":
+	switch args.ReplyToID {
+	case "":
 		msg, err = d.ChannelMessageSend(cid, text)
 	default:
 		// Reference is the v0.29.0 reply field (NOT MessageReference).

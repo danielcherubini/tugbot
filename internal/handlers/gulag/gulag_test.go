@@ -266,7 +266,7 @@ func TestMessageVoteCreateOrUpdate(t *testing.T) {
 	if err == nil {
 		t.Fatal("second vote by the same voter: missing the idempotency error")
 	}
-	const wantErr = "You have already Voted"
+	const wantErr = "you have already Voted"
 	if err.Error() != wantErr {
 		t.Errorf("idempotency error = %q, want %q", err.Error(), wantErr)
 	}
@@ -655,9 +655,10 @@ func TestHandleGulagMissingGuild(t *testing.T) {
 	}
 }
 
-// TestAddToGulagErrorCasing pins Rust's capital-first with_context
-// strings (mod.rs:212-278) that surface to the user via /gulag's
-// "Failed to send to gulag: {err}". The first arm (the failed member
+// TestAddToGulagErrorCasing pins AddToGulag's with_context error
+// strings (mod.rs:212-278, lowercased to staticcheck ST1005's lowercase
+// convention so the linter gate stays green) that surface to the user
+// via /gulag's error envelope. The first arm (the failed member
 // fetch on a bad-token session) is exercised here; no DB is reached on
 // this error path.
 func TestAddToGulagErrorCasing(t *testing.T) {
@@ -666,8 +667,8 @@ func TestAddToGulagErrorCasing(t *testing.T) {
 		GuildID: "2", UserID: "3", GulagRoleID: "4",
 		GulagLength: 300, ChannelID: "5", MessageID: "0",
 	})
-	if err == nil || !strings.Contains(err.Error(), "Failed to get guild member") {
-		t.Fatalf("err = %v, want the Rust-cased \"Failed to get guild member\" context", err)
+	if err == nil || !strings.Contains(err.Error(), "failed to get guild member") {
+		t.Fatalf("err = %v, want the lowercased \"failed to get guild member\" context", err)
 	}
 }
 
@@ -750,8 +751,8 @@ func TestHandleGulagOptionValueShapes(t *testing.T) {
 func TestSendToGulagAndMessageMissingRoleCasing(t *testing.T) {
 	g := newGulag(&discordgo.Session{}, nil)
 	err := g.sendToGulagAndMessage(context.Background(), 2, 3, 4, 5, nil)
-	if err == nil || !strings.Contains(err.Error(), "Couldn't find gulag role") {
-		t.Fatalf("err = %v, want Rust-cased \"Couldn't find gulag role\"", err)
+	if err == nil || !strings.Contains(err.Error(), "couldn't find gulag role") {
+		t.Fatalf("err = %v, want lowercased \"couldn't find gulag role\"", err)
 	}
 }
 
@@ -824,7 +825,7 @@ func TestAddGulagVoteIntegration(t *testing.T) {
 	}
 	// duplicate voter: the raw error text surfaces
 	resp = g.HandleCommandCreate(mkInteraction("9002", map[string]*discordgo.Message{"9002": targetMessage}, "1"))
-	if resp.Content != "You have already Voted" || !resp.Ephemeral {
+	if resp.Content != "you have already Voted" || !resp.Ephemeral {
 		t.Fatalf("duplicate voter = %+v, want the raw error text (ephemeral)", resp)
 	}
 	// missing target

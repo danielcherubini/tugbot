@@ -126,7 +126,7 @@ func (g *Gulag) syncFromDiscord(ctx context.Context, messageID, guildID, channel
 
 // messageVoteCreateOrUpdate ports message_vote_create_or_update
 // (message_vote.rs:91-143): the idempotent voter set (one vote per user
-// per message — "You have already Voted"), the tally increment, and the
+// per message — "you have already Voted"), the tally increment, and the
 // fresh insert. It preserves Rust's exact asymmetry: message_votes
 // .user_id (the VOTED person) is the message AUTHOR, while the INVOKER
 // lands in the voters array.
@@ -138,7 +138,7 @@ func (g *Gulag) messageVoteCreateOrUpdate(ctx context.Context, messageID, guildI
 	if existing != nil {
 		for _, v := range existing.Voters {
 			if v == voterID {
-				return voteHandlerResponse{}, errors.New("You have already Voted")
+				return voteHandlerResponse{}, errors.New("you have already Voted")
 			}
 		}
 		voters := append(append([]int64{}, existing.Voters...), voterID)
@@ -152,7 +152,7 @@ func (g *Gulag) messageVoteCreateOrUpdate(ctx context.Context, messageID, guildI
 	}
 	row, err := g.insertMessageVoteRow(ctx, messageID, channelID, guildID, userID, 1, []int64{voterID})
 	if err != nil {
-		return voteHandlerResponse{}, fmt.Errorf("Database Error Creating Vote: %w", err)
+		return voteHandlerResponse{}, fmt.Errorf("database error creating vote: %w", err)
 	}
 	return voteHandlerResponse{responseType: voteAdded, vote: &row}, nil
 }

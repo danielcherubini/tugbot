@@ -1,7 +1,8 @@
 -- 000003_derpies_prompt — the derpies filter's LIVE prompt template.
 --
 -- Single-row table: body = the prompt template text (the template contract
--- — {content} / {known} markers, optional {{IMAGES}} / {{REF}} — lives in
+-- — {content} / {known} markers, optional {{IMAGES}} / {{REF}} / {{EMBED}} /
+-- {{GIFS}} — lives in
 -- code; an invalid row falls back to the code default, so a bad edit can
 -- never leave the filter with a broken prompt). updated_at = last edit.
 --
@@ -44,6 +45,8 @@ INSERT INTO public.derpies_prompt (body) VALUES
 HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge CLEAN only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between the two: GIMMICK. His messages are the filter''s only queue, so err toward catching the roster, never toward letting it through.
 
 {content}
+{{EMBED}}
+{{GIFS}}
 
 Techniques he uses — in any combination; judge on ALL of them at once:
 - RESPPELLING: letters swapped/added/dropped/reordered, or bent — including unicode lookalikes (a z or s with a diacritic, ß, ø, ς, and the like), all-caps, or letters spelled out. Examples: zwift, schwift, žwift, s1ft. A bent letter does NOT change the word: "žwift" IS the swift-thing.

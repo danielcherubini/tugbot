@@ -129,7 +129,7 @@ func TestUpdateErrorTextsMatchRust(t *testing.T) {
 	if err == nil {
 		t.Fatal("Update on closed pool: error = nil, want the Rust pool-error text")
 	}
-	const wantPool = "Failed to get database connection from pool"
+	const wantPool = "failed to get database connection from pool"
 	if err.Error() != wantPool {
 		t.Errorf("Update pool-error text = %q, want %q (Rust mod.rs:52-56)", err.Error(), wantPool)
 	}

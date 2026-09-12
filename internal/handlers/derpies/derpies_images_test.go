@@ -151,10 +151,10 @@ func TestDownloadImages(t *testing.T) {
 	bodyB := []byte{0xff, 0xd8, 0xff, 0xe0}
 	bodyC := []byte{0x47, 0x49, 0x46, 0x38}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/a.png":
+		switch r.URL.Path {
+		case "/a.png":
 			_, _ = w.Write(bodyA)
-		case r.URL.Path == "/b.png":
+		case "/b.png":
 			_, _ = w.Write(bodyB)
 		default:
 			w.WriteHeader(500)
@@ -208,7 +208,7 @@ func TestDownloadImages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// gimmickPrompt — the 5-arg SHIPPED form (images line + referenced block).
+// gimmickPrompt — the 7-arg SHIPPED form (images line + gif-frames block + referenced block).
 // ---------------------------------------------------------------------------
 
 func TestGimmickPromptImages(t *testing.T) {
@@ -216,13 +216,13 @@ func TestGimmickPromptImages(t *testing.T) {
 	known := []string{"bike"}
 
 	// 2 images, no ref: the pinned images line with N = 2.
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 2, "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "")
 	if !strings.Contains(got, "The message also has 2 attached image(s)") {
 		t.Errorf("2-image form must contain the pinned images line with 2")
 	}
 
 	// 0 images, ref text: the pinned referenced block; no images line.
-	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, "ref text")
+	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "ref text")
 	for _, part := range []string{"<<<REFERENCED MESSAGE", "ref text", "REFERENCED MESSAGE>>>", "The message replies to a previous message (often the author's own)"} {
 		if !strings.Contains(gotRef, part) {
 			t.Errorf("ref form must contain %q", part)
@@ -233,7 +233,7 @@ func TestGimmickPromptImages(t *testing.T) {
 	}
 
 	// 2 images + ref text: BOTH elements.
-	gotBoth := gimmickPrompt(defaultPromptTemplate, content, known, 2, "ref text")
+	gotBoth := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "ref text")
 	if !strings.Contains(gotBoth, "The message also has 2 attached image(s)") || !strings.Contains(gotBoth, "<<<REFERENCED MESSAGE") {
 		t.Errorf("form with both must contain the images line AND the referenced block")
 	}
@@ -241,7 +241,7 @@ func TestGimmickPromptImages(t *testing.T) {
 	// 0 images / no ref: the shipped 0-image/no-ref prompt form — neither
 	// optional element, the rest intact (the shipped TestGimmickPromptDefault
 	// pins the full bytes; this restates it at the flow level).
-	gotZero := gimmickPrompt(defaultPromptTemplate, content, known, 0, "")
+	gotZero := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "")
 	if strings.Contains(gotZero, "The message also has") {
 		t.Errorf("0-image no-ref form must not contain the images line")
 	}
@@ -359,7 +359,7 @@ func TestFlowImageDownloadFailureDegradesToTextAsk(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the 0-image text prompt %q", pi.prompts[0], want)
 	}

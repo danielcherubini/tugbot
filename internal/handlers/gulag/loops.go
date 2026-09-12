@@ -404,7 +404,7 @@ func (g *Gulag) removeFromGulag(ctx context.Context, guildID, userID, roleID str
 func (g *Gulag) sendToGulagAndMessage(ctx context.Context, guildID, userID, channelID, messageID int64, voters []*discordgo.User) error {
 	gulenRole := g.FindGulagRole(ctx, strconv.FormatInt(guildID, 10))
 	if gulenRole == nil {
-		return fmt.Errorf("Couldn't find gulag role")
+		return fmt.Errorf("couldn't find gulag role")
 	}
 	const gulenLength = 300
 	channel, found, err := g.FindChannel(ctx, strconv.FormatInt(guildID, 10), GulagChannelName)

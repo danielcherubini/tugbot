@@ -78,7 +78,7 @@ func TestCheckedGulagLengthToSeconds(t *testing.T) {
 }
 
 // TestSendToGulagInsertFailureCasing pins the INSERT-failure context of
-// add_to_gulag (Rust mod.rs:277 with_context "Failed to send user to
+// add_to_gulag (Rust mod.rs:277 with_context "failed to send user to
 // gulag" — NO "the", matching the Rust casing exactly): the exact
 // Error() text when the insert fails. This is user-visible on the
 // ai_slop insert-failure path ("Error: Failed to send to gulag: {err}").
@@ -88,7 +88,7 @@ func TestSendToGulagInsertFailureCasing(t *testing.T) {
 		GuildID: "10", UserID: "11", GulagRoleID: "12",
 		GulagLength: 300, ChannelID: "13", MessageID: "14",
 	})
-	const want = `Failed to send user to gulag: boom`
+	const want = `failed to send user to gulag: boom`
 	if err == nil || err.Error() != want {
 		t.Fatalf("insert-failure err = %v, want exact text %q", err, want)
 	}
