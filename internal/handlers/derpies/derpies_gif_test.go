@@ -269,6 +269,64 @@ func lumaAt(t *testing.T, data []byte, x, y int) int {
 	return int((uint64(r)*299 + uint64(g)*587 + uint64(b)*114) / 257000)
 }
 
+// rgbFrameAt — a w×h solid Paletted frame at RGBA c whose bounds are
+// offset (x0, y0) (a real sub-rectangle — a delta frame; a
+// full-canvas RGB frame when the bounds cover the whole screen).
+func rgbFrameAt(x0, y0, w, h int, c color.RGBA) *image.Paletted {
+	f := image.NewPaletted(image.Rect(x0, y0, x0+w, y0+h), color.Palette{c})
+	for y := y0; y < y0+h; y++ {
+		for x := x0; x < x0+w; x++ {
+			f.SetColorIndex(x, y, 0)
+		}
+	}
+	return f
+}
+
+// transparentFrame — a w×h Paletted frame at (x0, y0) whose sole palette
+// entry is alpha-0 — a no-op delta under draw.Over (the canvas beneath
+// is preserved; the encoder must emit the transparent index, which the
+// assertions below implicitly re-assert through the composite result).
+func transparentFrame(x0, y0, w, h int) *image.Paletted {
+	f := image.NewPaletted(image.Rect(x0, y0, x0+w, y0+h), color.Palette{color.RGBA{0, 0, 0, 0}})
+	for y := y0; y < y0+h; y++ {
+		for x := x0; x < x0+w; x++ {
+			f.SetColorIndex(x, y, 0)
+		}
+	}
+	return f
+}
+
+// buildGIFWithDisposal — buildGIF plus per-frame disposal methods (the
+// gif.GIF.Disposal field; a nil disposal leaves the flag off, the
+// decoder pads the raw 0x00 read-back to DisposalNone-equivalent
+// "keep previous").
+func buildGIFWithDisposal(t *testing.T, frames []*image.Paletted, disposal []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	delays := make([]int, len(frames))
+	for i := range delays {
+		delays[i] = 10
+	}
+	g := &gif.GIF{Image: frames, Delay: delays, Disposal: disposal}
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		t.Fatalf("gif encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// colAt — a decoded image's pixel, 8-bit channels (solid colors
+// round-trip within a few levels through gif + jpeg q80 — 4:2:0
+// subsampling spreads soft edges ~1-2px, so probe well inside blocks).
+func colAt(t *testing.T, data []byte, x, y int) (uint32, uint32, uint32) {
+	t.Helper()
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("jpeg decode: %v", err)
+	}
+	r, g, b, _ := img.At(x, y).RGBA() // 16-bit — collapse to 8-bit for the checks
+	return r >> 8, g >> 8, b >> 8
+}
+
 func TestExpandGIFFramesDeltaComposited(t *testing.T) {
 	// Frame 1 = full-canvas 40×40 solid S1 (gray 230); frame 2 = a 20×20
 	// sub-rectangle at (10,10) solid S2 (gray 10). Decoded as-is, frame 2
@@ -319,6 +377,196 @@ func TestExpandGIFFramesDeltaComposited(t *testing.T) {
 	}
 	if l := lumaAt(t, data, 15, 15); l < 0 || l > 40 {
 		t.Errorf("frame[1] pixel (15,15) luma = %d, want ~10 (the S2 sub-rectangle composited at the offset)", l)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Full replay — unselected intermediate frames are drawn (and their
+// disposal applied) before a later selected frame composites onto the
+// canvas; per-frame GIF disposal methods are honored.
+// ---------------------------------------------------------------------------
+
+func TestExpandGIFFramesWalksUnselectedDeltaFrames(t *testing.T) {
+	// 9 frames, canvas 40x40. Frame 0 = full-canvas solid gray 128;
+	// frames 1-6 = transparent no-op deltas; frame 7 = a 12x12 blue
+	// sub-rectangle at (4,4) (UNSELECTED — the even-spacing selection
+	// over 9 frames with k=8 is [0,1,2,3,4,5,6,8]); frame 8 = a 12x12
+	// red sub-rectangle at (24,4) (SELECTED). The blue block must
+	// survive into the selected frame 8's snapshot: a replay that
+	// skips the intermediate unselected frame would hand the model a
+	// canvas that was never visible during playback (the red block
+	// would composite onto the pre-blue state).
+	var frames []*image.Paletted
+	frames = append(frames, solidFrameAt(0, 0, 40, 40, 128))
+	for i := 0; i < 6; i++ {
+		frames = append(frames, transparentFrame(0, 0, 1, 1))
+	}
+	frames = append(frames, rgbFrameAt(4, 4, 12, 12, color.RGBA{0, 0, 255, 255}))
+	frames = append(frames, rgbFrameAt(24, 4, 12, 12, color.RGBA{255, 0, 0, 255}))
+	body := buildGIF(t, frames)
+
+	got, skipped, err := expandGIFFrames(body)
+	if err != nil {
+		t.Fatalf("expandGIFFrames err = %v, want nil", err)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	// Frames 1-6 are no-op deltas — their snapshots equal the
+	// previously ADDED gray canvas (the consecutive-duplicate skip
+	// folds them all), so EXACTLY two frames: the gray prime and the
+	// final canvas (gray + blue@7 + red@8).
+	if len(got) != 2 {
+		t.Fatalf("frames = %d, want exactly 2 (gray, then the walked-and-composited final canvas)", len(got))
+	}
+	data, err := base64.StdEncoding.DecodeString(got[1].Data)
+	if err != nil {
+		t.Fatalf("frame[1] base64 decode: %v", err)
+	}
+	// The UNSELECTED frame 7's blue block, sampled well inside the
+	// 12x12 block (4:2:0 edge softness spans ~2px; 6px inside is safe).
+	if g2, _, b := colAt(t, data, 10, 10); g2 > 120 || b < 150 {
+		t.Errorf("frame[1] pixel (10,10) g=%d b=%d, want g < 120 and b > 150 (the unselected intermediate frame's blue block must have been walked before the selected frame 8 composited)", g2, b)
+	}
+	// The selected frame 8's red block, and the untouched gray region.
+	if r3, g3, b3 := colAt(t, data, 30, 10); r3 < 150 || b3 > 120 || g3 > 120 {
+		t.Errorf("frame[1] pixel (30,10) = (%d,%d,%d), want red-ish (the selected frame 8's block)", r3, g3, b3)
+	}
+	if r4, g4, b4 := colAt(t, data, 10, 30); r4 > 148 || r4 < 108 || g4 > 148 || g4 < 108 || b4 > 148 || b4 < 108 {
+		t.Errorf("frame[1] pixel (10,30) = (%d,%d,%d), want ~128 gray (untouched region)", r4, g4, b4)
+	}
+}
+
+func TestExpandGIFFramesDisposalBackgroundClearsCanvas(t *testing.T) {
+	// 3 frames (k=3, all selected), canvas 40x40. Frame 0 = full-canvas
+	// solid red, disposal Background; frame 1 = a 12x12 blue
+	// sub-rectangle at (4,4), disposal Background; frame 2 = a 12x12
+	// green sub-rectangle at (20,20), disposal None. Per the spec,
+	// after frame 1 the canvas is cleared to blank (a new empty
+	// canvas — the gif screen background is transparent), so frame 2
+	// composites ONLY the green block onto blank: the red and the
+	// blue are gone. An implementation that only tracks the default
+	// "keep previous" would retain both.
+	f0 := rgbFrameAt(0, 0, 40, 40, color.RGBA{255, 0, 0, 255})
+	f1 := rgbFrameAt(4, 4, 12, 12, color.RGBA{0, 0, 255, 255})
+	f2 := rgbFrameAt(20, 20, 12, 12, color.RGBA{0, 230, 0, 255})
+	body := buildGIFWithDisposal(t, []*image.Paletted{f0, f1, f2},
+		[]byte{gif.DisposalBackground, gif.DisposalBackground, gif.DisposalNone})
+
+	// Re-verify the on-disk disposal flags (if the toolchain dropped
+	// them the test wouldn't hold — the decoder pads a missing flag
+	// to keep-previous, silently disabling this case).
+	g, err := gif.DecodeAll(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("self-decode of the test gif: %v", err)
+	}
+	if len(g.Disposal) < 2 || g.Disposal[0] != gif.DisposalBackground || g.Disposal[1] != gif.DisposalBackground {
+		t.Fatalf("test gif lost its disposal flags (decoded %v) — the toolchain normalizes; the test does not hold", g.Disposal)
+	}
+
+	got, skipped, err := expandGIFFrames(body)
+	if err != nil {
+		t.Fatalf("expandGIFFrames err = %v, want nil", err)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	if len(got) != 3 {
+		t.Fatalf("frames = %d, want 3 (all three canvases distinct)", len(got))
+	}
+	// Snapshot 0: the red prime.
+	d0, err := base64.StdEncoding.DecodeString(got[0].Data)
+	if err != nil {
+		t.Fatalf("frame[0] base64 decode: %v", err)
+	}
+	if r, _, b := colAt(t, d0, 30, 30); r < 150 || b > 120 {
+		t.Errorf("frame[0] pixel (30,30) r=%d b=%d, want red-ish (the full red prime)", r, b)
+	}
+	// Snapshot 1: the blue block on BLANK — frame 0's Background
+	// disposal cleared the red prime before frame 1 was drawn (the
+	// spec applies the disposal between frames' displays; the red is
+	// visible during frame 0's display only).
+	d1, err := base64.StdEncoding.DecodeString(got[1].Data)
+	if err != nil {
+		t.Fatalf("frame[1] base64 decode: %v", err)
+	}
+	if _, _, b := colAt(t, d1, 10, 10); b < 150 {
+		t.Fatalf("frame[1] pixel (10,10) b = %d, want > 150 (the blue block)", b)
+	}
+	if r, _, _ := colAt(t, d1, 5, 5); r > 120 {
+		t.Errorf("frame[1] pixel (5,5) r = %d, want < 120 (the Background disposal after frame 0 cleared the red prime before frame 1 drew)", r)
+	}
+	// Snapshot 2: ONLY the green block on blank — the Background
+	// disposal after frame 1 cleared the red AND the blue.
+	d2, err := base64.StdEncoding.DecodeString(got[2].Data)
+	if err != nil {
+		t.Fatalf("frame[2] base64 decode: %v", err)
+	}
+	if _, g2, _ := colAt(t, d2, 26, 26); g2 < 150 {
+		t.Errorf("frame[2] pixel (26,26) g = %d, want > 150 (the green block)", g2)
+	}
+	if _, _, b2 := colAt(t, d2, 10, 10); b2 > 60 {
+		t.Errorf("frame[2] pixel (10,10) b = %d, want < 60 (cleared by the Background disposal — not the pre-clear blue)", b2)
+	}
+	if r, _, _ := colAt(t, d2, 5, 5); r > 120 {
+		t.Errorf("frame[2] pixel (5,5) r = %d, want < 120 (cleared by the Background disposal — not the pre-clear red)", r)
+	}
+}
+
+func TestExpandGIFFramesDisposalPreviousRestoresCanvas(t *testing.T) {
+	// 3 frames (k=3, all selected), canvas 40x40. Frame 0 = full-canvas
+	// solid gray 120 (disposal None); frame 1 = full-canvas solid red
+	// (disposal Previous); frame 2 = a 12x12 blue sub-rectangle at
+	// (4,4) (disposal None). Per the spec, after frame 1 the canvas is
+	// restored to its state BEFORE frame 1 was drawn — the gray 120
+	// prime — so frame 2 composites the blue block on GRAY, not red.
+	// (Bounded approximation: the one-step restore to the immediately
+	// prior snapshot, which here IS the chain-correct answer.) An
+	// implementation that only tracks the default "keep previous" would
+	// leave the red canvas under the blue block for snapshot 2.
+	f0 := solidFrameAt(0, 0, 40, 40, 120)
+	f1 := rgbFrameAt(0, 0, 40, 40, color.RGBA{255, 0, 0, 255})
+	f2 := rgbFrameAt(4, 4, 12, 12, color.RGBA{0, 0, 255, 255})
+	body := buildGIFWithDisposal(t, []*image.Paletted{f0, f1, f2},
+		[]byte{gif.DisposalNone, gif.DisposalPrevious, gif.DisposalNone})
+
+	// Re-verify the on-disk disposal flag (see the Background test).
+	g, err := gif.DecodeAll(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("self-decode of the test gif: %v", err)
+	}
+	if len(g.Disposal) < 2 || g.Disposal[1] != gif.DisposalPrevious {
+		t.Fatalf("test gif lost its disposal flag (decoded %v) — the toolchain normalizes; the test does not hold", g.Disposal)
+	}
+
+	got, skipped, err := expandGIFFrames(body)
+	if err != nil {
+		t.Fatalf("expandGIFFrames err = %v, want nil", err)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	if len(got) != 3 {
+		t.Fatalf("frames = %d, want 3 (all three canvases distinct)", len(got))
+	}
+	// Snapshot 1: the full red prime (before the Previous disposal applies).
+	d1, err := base64.StdEncoding.DecodeString(got[1].Data)
+	if err != nil {
+		t.Fatalf("frame[1] base64 decode: %v", err)
+	}
+	if r, _, _ := colAt(t, d1, 30, 30); r < 150 {
+		t.Errorf("frame[1] pixel (30,30) r = %d, want > 150 (the full-canvas red prime)", r)
+	}
+	// Snapshot 2: gray (restored by the Previous disposal) + blue block.
+	d2, err := base64.StdEncoding.DecodeString(got[2].Data)
+	if err != nil {
+		t.Fatalf("frame[2] base64 decode: %v", err)
+	}
+	if r, _, _ := colAt(t, d2, 30, 30); r > 145 {
+		t.Errorf("frame[2] pixel (30,30) r = %d, want < 145 (the Previous disposal must have restored the gray prime — expected ~120, not red ~255)", r)
+	}
+	if _, _, b := colAt(t, d2, 10, 10); b < 150 {
+		t.Errorf("frame[2] pixel (10,10) b = %d, want > 150 (the blue block on the restored canvas)", b)
 	}
 }
 

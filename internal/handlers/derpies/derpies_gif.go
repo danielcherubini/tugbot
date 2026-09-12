@@ -59,35 +59,66 @@ var (
 // arbitrary). Any stream error — first frame or mid-stream — lands in
 // errGIFUnreadable.
 //
-// Selection: k = min(gifOutputFrames, n) evenly-spaced indices over the
-// collected frames (i * (n-1) / (k-1) for k > 1 — the same
-// even-spacing math as the video task); at most gifDecodeCap frames
-// walk from the stream (the rest of a long gif is never touched).
+// Selection: k = min(gifOutputFrames, n) evenly-spaced indices over
+// the collected frames (i * (n-1) / (k-1) for k > 1 — the same
+// even-spacing math as the video task). These indices pick which
+// walked canvas states get snapshotted and encoded; every other
+// frame is still walked (with its disposal honored) so the selected
+// canvases composite onto the true animation state. At most
+// gifDecodeCap frames walk from the stream (the rest of a long gif
+// is never touched).
 //
-// Compositing (delta-frame correction — the point of this fix): a
-// gif encoded as full-canvas frames followed by SUB-RECTANGLE delta
+// Compositing (full replay with disposal — the point of this fix):
+// a gif encoded as full-canvas frames followed by SUB-RECTANGLE delta
 // frames (partial frame bounds with transparent-pixel animations)
 // decodes here as sub-rectangles RETAINING their in-canvas offset in
 // Bounds().Min (verified empirically and re-asserted by
 // TestExpandGIFFramesDeltaComposited). Encoding a delta frame AS-IS
 // would hand the model an incomplete sub-rectangle and hide the
-// burned-in gimmick text this feature exists to catch; instead each
-// selected frame is composited via draw.Draw (draw.Over, at the
-// frame's bounds origin) onto a persistent *image.NRGBA canvas —
-// GIF's default disposal is "keep previous", and draw.Over preserves
-// the canvas through transparent palette entries (alpha 0). Canvas
-// size = the union of all collected frames' bounds (the superset of
-// the decoded logical screen size for in-bounds frames). A
-// full-canvas cover frame re-primes the canvas (draw.Over, full
-// coverage); a delta frame overlays its partial rectangle.
-// The JPEG-encoded is the CANVAS, not the bare frame.
-//
-// Consecutive-duplicate skip: a selected canvas equal (32x32 grayscale,
-// strided sampling, tolerance 8) to the previously ADDED canvas is
-// dropped — a looping gif emitting fewer than k frames is correct.
-// Canvas comparison (vs. the pre-fix per-frame comparison) is more
-// correct for delta animation: two DIFFERENT delta frames that
-// produce the same full canvas state collapse to one.
+// burned-in gimmick text this feature exists to catch. The walk
+// therefore REPLAYS the animation with default gif semantics: ALL
+// collected frames (bounded: at most gifDecodeCap are walked) are
+// drawn IN INDEX ORDER onto the persistent *image.NRGBA canvas —
+// a full-canvas frame re-primes it (draw.Over, full coverage), a
+// sub-rectangle delta overlays its partial rectangle, transparent
+// palette entries (alpha 0) leave the canvas beneath untouched
+// (draw.Over, the "keep previous" default). Drawing EVERY frame —
+// not just the selected ones — matters for delta animation: an
+// UNSELECTED intermediate frame can modify the canvas, and a later
+// selected delta, being relative to that intermediate state, must
+// composite onto a canvas that HAS the intermediate change
+// (TestExpandGIFFramesWalksUnselectedDeltaFrames); skipping it would
+// hand the model a canvas that was never visible during playback. AFTER
+// each frame is drawn, its DISPOSAL (g.Disposal[i], one entry per
+// frame as this toolchain's DecodeAll returns it) is applied before
+// the next frame draws: gif.DisposalBackground (0x02) clears the
+// canvas to blank (a new empty canvas — the gif screen background
+// is transparent); gif.DisposalPrevious (0x03) restores the canvas
+// to the state BEFORE that frame was drawn; everything else
+// (gif.DisposalNone 0x01, the raw 0x00 read-back of an unset flag,
+// and reserved 0x04+ values) keeps the canvas (the gif default).
+// The restore is bounded on memory: the canvas is
+// snapshotted exactly ONCE before each frame's draw (one NRGBA
+// copy, at most one live at a time, freed each iteration), and
+// DisposalPrevious restores that immediately-prior snapshot. A full
+// disposal-chain walk (how the spec resolves a Previous chain —
+// walking back through earlier frames' dispositions to their
+// canonical state) would require the whole frame history (one
+// snapshot per frame, up to gifDecodeCap full-canvas copies); the
+// one-step restore is the bounded behavior here and is spec-correct
+// for the common single-Previous pair (a full-cover frame +
+// DisposalPrevious over a full prior canvas)
+// (TestExpandGIFFramesDisposalPreviousRestoresCanvas). A
+// selected frame's canvas is captured in the state the frame WAS
+// DISPLAYED IN (its disposal applies only to what the NEXT frame
+// draws onto), and the consecutive-duplicate skip (a selected
+// canvas equal (32x32 grayscale, strided sampling, tolerance 8) to
+// the previously ADDED canvas is dropped — a looping gif emitting
+// fewer than k frames is correct) collapses any loop-internal
+// repeats.
+// Canvas size = the union of all collected frames' bounds (a
+// superset of the decoded logical screen size for in-bounds
+// frames). The JPEG-encoded is the CANVAS, not the bare frame.
 //
 // Encode: each kept canvas is image/jpeg at gifJpegQuality. An encode
 // error for a frame skips that frame (counted in returned `skipped` so
@@ -138,15 +169,28 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 	if k > n {
 		k = n
 	}
-	var selected []*image.Paletted
-	for i := 0; i < k; i++ {
-		if k > 1 {
-			selected = append(selected, decoded[i*(n-1)/(k-1)])
-		} else {
-			selected = append(selected, decoded[0])
+	// Selection — which walked frames' canvas states get snapshotted
+	// (the even-spacing math, now a boolean mask over the walk rather
+	// than a pre-walk frame list).
+	selected := make([]bool, n)
+	if k > 1 {
+		for i := 0; i < k; i++ {
+			selected[i*(n-1)/(k-1)] = true
 		}
+	} else {
+		selected[0] = true
 	}
-	for _, frame := range selected {
+	for i := 0; i < n; i++ {
+		// Bounded (one canvas-sized snapshot, at most one live at a
+		// time — it goes out of scope each iteration): snapshot the
+		// canvas as it stands BEFORE frame i is drawn. This pre-draw
+		// state is exactly what frame i's DisposalPrevious restores
+		// to — the bounded one-step restore (NOT the spec's full
+		// disposal-chain walk, which would need the whole frame
+		// history; see the doc comment above).
+		prev := image.NewNRGBA(canvas.Bounds())
+		draw.Draw(prev, prev.Bounds(), canvas, canvas.Bounds().Min, draw.Src)
+
 		// This toolchain's DecodeAll returns frames in CANNOT canvas
 		// coordinates — a delta frame's Bounds().Min IS its in-canvas
 		// offset. draw.Draw(dst, r, src, sp, op) sticks the src onto the
@@ -155,27 +199,65 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 		// position; a full-canvas frame covers the whole canvas (draw.Over
 		// re-primes it), a sub-rectangle delta frame overlays its partial
 		// rectangle, and transparent palette entries (alpha 0) leave the
-		// canvas beneath untouched (draw.Over — the GIF "keep previous"
-		// default).
-		draw.Draw(canvas, canvas.Bounds(), frame, image.Point{}, draw.Over)
-		if lastCanvas != nil && sameFrame32(lastCanvas, canvas) {
+		// canvas beneath untouched (draw.Over — the "keep previous"
+		// default). EVERY frame is drawn, not just the selected ones —
+		// see the compositing paragraph above.
+		draw.Draw(canvas, canvas.Bounds(), decoded[i], image.Point{}, draw.Over)
+
+		// A selected frame's canvas is captured NOW — the canvas as
+		// DISPLAYED (the spec captures the frame state before its
+		// disposal applies; the disposal only changes what the NEXT
+		// frame draws onto). This is the pre-disposal capture point.
+		if selected[i] && lastCanvas != nil && sameFrame32(lastCanvas, canvas) {
 			// Consecutive duplicate (a loop-internal repeat) — drop
 			// the later one; no window shift, just skip it.
-			continue
+			// (No early `continue` here: frame i's disposal below
+			// must still apply before frame i+1 draws.)
+		} else if selected[i] {
+			buf := &bytes.Buffer{}
+			if err := jpeg.Encode(buf, canvas, &jpeg.Options{Quality: gifJpegQuality}); err != nil {
+				skipped++
+			} else {
+				frames = append(frames, app.PiImage{
+					MimeType: "image/jpeg",
+					Data:     base64.StdEncoding.EncodeToString(buf.Bytes()),
+				})
+				// Snapshot the canvas for the next frame's duplicate check.
+				snap := image.NewNRGBA(canvas.Bounds())
+				draw.Draw(snap, snap.Bounds(), canvas, canvas.Bounds().Min, draw.Src)
+				lastCanvas = snap
+			}
 		}
-		buf := &bytes.Buffer{}
-		if err := jpeg.Encode(buf, canvas, &jpeg.Options{Quality: gifJpegQuality}); err != nil {
-			skipped++
-			continue
+		// Apply frame i's disposal AFTER the frame's display was
+		// captured, BEFORE frame i+1 draws. Per go doc
+		// image/gif: DisposalNone (0x01) keeps; the raw 0x00 (an unset
+		// flag — this toolchain's encoder writes disposal 0 for an
+		// absent/zero entry, and the decoder reads it back as 0 rather
+		// than padding it to 1) and the reserved 0x04+ values are all
+		// "do nothing" per the gif spec, i.e. keep too. So: only 0x02
+		// and 0x03 act.
+		d := byte(0)
+		if i < len(g.Disposal) {
+			d = g.Disposal[i]
 		}
-		frames = append(frames, app.PiImage{
-			MimeType: "image/jpeg",
-			Data:     base64.StdEncoding.EncodeToString(buf.Bytes()),
-		})
-		// Snapshot the canvas for the next frame's duplicate check.
-		snap := image.NewNRGBA(canvas.Bounds())
-		draw.Draw(snap, snap.Bounds(), canvas, canvas.Bounds().Min, draw.Src)
-		lastCanvas = snap
+		switch d {
+		case gif.DisposalBackground: // 0x02 — clear to blank.
+			// A fresh empty canvas at the same bounds — the gif screen
+			// background is transparent (alpha 0), which the subsequent
+			// frames' draw.Over preserves.
+			canvas = image.NewNRGBA(canvas.Bounds())
+		case gif.DisposalPrevious: // 0x03 — restore.
+			// Restore to the canvas state before frame i was drawn —
+			// the immediately-prior snapshot, the bounded one-step
+			// behavior (NOT the spec's full disposal-chain walk, which
+			// would require the whole frame history; see the doc
+			// comment). Spec-correct for the common single-Previous
+			// pair (a full-cover frame + DisposalPrevious over a full
+			// prior canvas).
+			canvas = prev
+		default: // DisposalNone + raw 0x00 + reserved 0x04+ = keep.
+			// Nothing to do — the canvas stands as drawn.
+		}
 	}
 	return frames, skipped, nil
 }
