@@ -106,7 +106,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 	known := []string{"bike"}
 
 	t.Run("titles set: the block is substituted, the payload marker survives exactly once", func(t *testing.T) {
-		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, "some title", "")
+		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "some title", "")
 		if !strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("prompt with titles must contain the TITLES OF MEDIA EMBEDDED block header:\n%s", got)
 		}
@@ -122,7 +122,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 	})
 
 	t.Run("empty titles: the block is absent", func(t *testing.T) {
-		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, "", "")
+		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "", "")
 		if strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("no-title form must not contain the TITLES OF MEDIA EMBEDDED block:\n%s", got)
 		}
@@ -130,7 +130,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 
 	t.Run("a template without {{EMBED}} degrades by omission (titles set)", func(t *testing.T) {
 		noEmbed := strings.ReplaceAll(defaultPromptTemplate, "{{EMBED}}\n", "")
-		got := gimmickPrompt(noEmbed, "x", known, 0, "some title", "")
+		got := gimmickPrompt(noEmbed, "x", known, 0, 0, "some title", "")
 		if strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("a template without the {{EMBED}} marker must not contain the block (degradation by omission):\n%s", got)
 		}

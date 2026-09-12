@@ -353,9 +353,15 @@ func mimeForURL(url string) string {
 // that URL is skipped — the flow continues with the rest. Attachment
 // downloads log the url + mime; embed downloads log the url. 5xx/4xx
 // responses are NOT an error here (mention parity: the body is read whatever
-// the status carries) — mirror mention EXACTLY.
-func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, client *http.Client) []app.PiImage {
+// the status carries) — mirror mention EXACTLY. The ONE derpies-specific
+// branch: a gif mime expands in-process (expandGIFFrames) into ≤8 evenly-
+// spaced JPEG frames (the gifFrames return counts emitted frames); a
+// single-frame / undecodable gif degrades to the status-quo RAW send with
+// an slog.Warn degradation log, and per-frame
+// encode failures are logged. Returns (images, gifFrames).
+func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, client *http.Client) ([]app.PiImage, int) {
 	var images []app.PiImage
+	gifFrames := 0
 	for _, entry := range plan {
 		if entry.source == "attachment" {
 			slog.Info("Downloading image: "+entry.url+" ("+entry.mime+")", "module", module)
@@ -378,17 +384,40 @@ func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, clien
 			slog.Error("Failed to read image bytes", "module", module, "url", entry.url, "error", err)
 			continue
 		}
+		if entry.mime == "image/gif" {
+			// Animated-gif expansion: frames join the same single ask;
+			// a single-frame or undecodable gif degrades to the status-
+			// quo raw send (log, never abort the flow).
+			expanded, skipped, err := expandGIFFrames(body)
+			if err != nil {
+				slog.Warn("derpies gif expansion degraded to raw send", "module", module, "url", entry.url, "error", err)
+				images = append(images, app.PiImage{
+					MimeType: entry.mime,
+					Data:     base64.StdEncoding.EncodeToString(body),
+				})
+				continue
+			}
+			if skipped > 0 {
+				slog.Warn("derpies gif frame encode failures skipped", "module", module, "url", entry.url, "skipped", skipped)
+			}
+			gifFrames += len(expanded)
+			images = append(images, expanded...)
+			continue
+		}
 		images = append(images, app.PiImage{
 			MimeType: entry.mime,
 			Data:     base64.StdEncoding.EncodeToString(body),
 		})
 	}
-	return images
+	return images, gifFrames
 }
 
-// downloadImages mirrors mention's one-message shape: plan then download.
+// downloadImages mirrors mention's one-message shape: plan then download
+// (the gifFrame count is flow-only, so the wrapper discards it — the
+// flow calls downloadPlan against the merged plan directly).
 func (h *Derpies) downloadImages(ctx context.Context, m *discordgo.Message, client *http.Client) []app.PiImage {
-	return h.downloadPlan(ctx, imageURLPlan(m), client)
+	images, _ := h.downloadPlan(ctx, imageURLPlan(m), client)
+	return images
 }
 
 // defaultPromptTemplate — the code-pinned default (exact text of the plan's
@@ -402,6 +431,7 @@ HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he active
 
 {content}
 {{EMBED}}
+{{GIFS}}
 
 Techniques he uses — in any combination; judge on ALL of them at once:
 - RESPPELLING: letters swapped/added/dropped/reordered, or bent — including unicode lookalikes (a z or s with a diacritic, ß, ø, ς, and the like), all-caps, or letters spelled out. Examples: zwift, schwift, žwift, s1ft. A bent letter does NOT change the word: "žwift" IS the swift-thing.
@@ -440,20 +470,20 @@ where <word> is the anchor word: the as-appears respelled token for a known-gimm
 - CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
 
 // validTemplate: the two MANDATORY literal markers are present. Absent
-// optional markers ({{IMAGES}} / {{REF}} / {{EMBED}}) are fine — the element
+// optional markers ({{IMAGES}} / {{GIFS}} / {{REF}} / {{EMBED}}) are fine — the element
 // is simply omitted.
 func validTemplate(t string) bool {
 	return strings.Contains(t, "{content}") && strings.Contains(t, "{known}")
 }
 
-// gimmickPrompt substitutes the FIVE markers with a TWO-PHASE pass so a
+// gimmickPrompt substitutes the SIX markers with a TWO-PHASE pass so a
 // payload can never re-trigger a later marker scan. Pass 1 runs on the
 // TEMPLATE ONLY (before any payload exists): each marker becomes a unique
 // inert placeholder wrapped in NUL bytes. Pass 2 swaps the placeholders
 // for the real payloads. content / refText are NUL-free Discord message
 // text (Discord content cannot contain U+0000), and known words pass
 // wordValid's ^[a-z0-9]{2,32}$ charset — so a message that literally
-// contains "{known}" / "{{IMAGES}}" / "{{REF}}" survives verbatim instead of
+// contains "{known}" / "{{IMAGES}}" / "{{GIFS}}" / "{{EMBED}}" / "{{REF}}" survives verbatim instead of
 // pulling the known block inside the untrusted fence or having its
 // marker bytes silently deleted (the single-pass ReplaceAll ordering this
 // replaces re-scanned the already-inserted content). embedTitles is
@@ -462,18 +492,19 @@ func validTemplate(t string) bool {
 // because pass 1 runs on the template only, so a payload can never
 // re-trigger a marker scan — a title that literally contained
 // "\x00EMBEDTITLES\x00" would at worst swap inertly. The
-// fence and the images line / referenced block bytes are code-pinned — the
+// fence and the images line / gif-frames block / referenced block bytes are code-pinned — the
 // template carries only the bare markers.
 // (`known` arrives sorted from the flow — sortedKeys — and is joined one
 // per line; the pi RPC always appends the anti-injection system fallback on
 // top of this.)
-func gimmickPrompt(tmpl string, content string, known []string, nImages int, embedTitles string, refText string) string {
+func gimmickPrompt(tmpl string, content string, known []string, nImages, nGifFrames int, embedTitles string, refText string) string {
 	// Pass 1: markers -> NUL-wrapped placeholders, template only.
 	marked := tmpl
 	marked = strings.ReplaceAll(marked, "{content}", "\x00CONTENT\x00")
 	marked = strings.ReplaceAll(marked, "{known}", "\x00KNOWN\x00")
 	marked = strings.ReplaceAll(marked, "{{IMAGES}}", "\x00IMAGES\x00")
 	marked = strings.ReplaceAll(marked, "{{EMBED}}", "\x00EMBEDTITLES\x00")
+	marked = strings.ReplaceAll(marked, "{{GIFS}}", "\x00GIFFRAMES\x00")
 	marked = strings.ReplaceAll(marked, "{{REF}}", "\x00REF\x00")
 
 	// Pass 2: placeholders -> payloads. A payload can never re-trigger a
@@ -492,6 +523,11 @@ func gimmickPrompt(tmpl string, content string, known []string, nImages int, emb
 		imagesBlock = fmt.Sprintf("The message also has %d attached image(s) (screenshots or pasted images — a text filter would not see their content). Judge the text AND the images. If the anchor word appears in an image rather than the message text, name it as if it were in the message.", nImages)
 	}
 	out = strings.ReplaceAll(out, "\x00IMAGES\x00", imagesBlock)
+	var gifsBlock string
+	if nGifFrames > 0 {
+		gifsBlock = "The message also has animated gif frame(s). In addition to the summary images above, below are up to 8 SAMPLED frames from each animated gif — gifs loop and change over time, so a gimmick's word can appear in ANY frame; judge all of the frames too."
+	}
+	out = strings.ReplaceAll(out, "\x00GIFFRAMES\x00", gifsBlock)
 	var embedBlock string
 	if embedTitles != "" {
 		embedBlock = "TITLES OF MEDIA EMBEDDED WITH THE MESSAGE (provider-furnished untrusted text — part of what was posted, judge it as if written):\n" + embedTitles + "\nA known word appearing in an embed title counts as if it were typed in the message."
@@ -610,7 +646,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		seenURLs[e.url] = true
 		uniqPlan = append(uniqPlan, e)
 	}
-	images := h.downloadPlan(ctx, uniqPlan, &http.Client{Timeout: 10 * time.Second})
+	images, nGifFrames := h.downloadPlan(ctx, uniqPlan, &http.Client{Timeout: 10 * time.Second})
 
 	// 5. Slow path: pi unavailable -> silent return (the mention feature's
 	//    degradation path, same shape).
@@ -655,7 +691,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		}
 		embedTitles = strings.Join(lines, "\n")
 	}
-	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), embedTitles, refContent)
+	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), nGifFrames, embedTitles, refContent)
 	var (
 		text   string
 		askErr error
