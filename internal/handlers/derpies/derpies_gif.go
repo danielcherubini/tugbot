@@ -91,9 +91,13 @@ var (
 // hand the model a canvas that was never visible during playback. AFTER
 // each frame is drawn, its DISPOSAL (g.Disposal[i], one entry per
 // frame as this toolchain's DecodeAll returns it) is applied before
-// the next frame draws: gif.DisposalBackground (0x02) clears the
-// canvas to blank (a new empty canvas — the gif screen background
-// is transparent); gif.DisposalPrevious (0x03) restores the canvas
+// the next frame draws: gif.DisposalBackground (0x02, spec "restore
+// to background") clears ONLY the just-drawn frame's OWN rectangle
+// to blank (a transparent wipe over the frame's bounds — the gif
+// screen background is transparent on this NRGBA canvas, and a
+// full-canvas wipe would lose content a previous frame retained
+// OUTSIDE the frame's bounds;
+// TestExpandGIFFramesBackgroundDisposalKeepsOutsideContent); gif.DisposalPrevious (0x03) restores the canvas
 // to the state BEFORE that frame was drawn; everything else
 // (gif.DisposalNone 0x01, the raw 0x00 read-back of an unset flag,
 // and reserved 0x04+ values) keeps the canvas (the gif default).
@@ -190,6 +194,7 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 		// history; see the doc comment above).
 		prev := image.NewNRGBA(canvas.Bounds())
 		draw.Draw(prev, prev.Bounds(), canvas, canvas.Bounds().Min, draw.Src)
+		frame := decoded[i]
 
 		// This toolchain's DecodeAll returns frames in CANNOT canvas
 		// coordinates — a delta frame's Bounds().Min IS its in-canvas
@@ -202,7 +207,7 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 		// canvas beneath untouched (draw.Over — the "keep previous"
 		// default). EVERY frame is drawn, not just the selected ones —
 		// see the compositing paragraph above.
-		draw.Draw(canvas, canvas.Bounds(), decoded[i], image.Point{}, draw.Over)
+		draw.Draw(canvas, canvas.Bounds(), frame, image.Point{}, draw.Over)
 
 		// A selected frame's canvas is captured NOW — the canvas as
 		// DISPLAYED (the spec captures the frame state before its
@@ -241,11 +246,27 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 			d = g.Disposal[i]
 		}
 		switch d {
-		case gif.DisposalBackground: // 0x02 — clear to blank.
-			// A fresh empty canvas at the same bounds — the gif screen
-			// background is transparent (alpha 0), which the subsequent
-			// frames' draw.Over preserves.
-			canvas = image.NewNRGBA(canvas.Bounds())
+		case gif.DisposalBackground: // 0x02 — spec: restore to background = clear the frame's own area.
+			// Clear ONLY this frame's rectangle to blank (the previous
+			// full-canvas replacement lost content frames retained
+			// OUTSIDE the frame's bounds). This toolchain's
+			// draw.Draw does not erase with a transparent source
+			// pixel under either Src or Over (verified empirically —
+			// alpha-0 contributes nothing: Src even leaves the
+			// destination OPAQUE), so the rectangle is zeroed
+			// directly: transparent is this NRGBA canvas's "background
+			// color" (it has none of its own). The manual
+			// intersection guards frames extending past the canvas
+			// bounds (an empty rect needs no zeroing — defensive, no
+			// panic). canvas is a *image.NRGBA throughout (it starts
+			// as one; DisposalPrevious restores the NRGBA snapshot
+			// `prev`).
+			if cr := interRect(canvas.Bounds(), frame.Bounds()); !cr.Empty() {
+				clip := canvas.SubImage(cr).(*image.NRGBA)
+				for i := range clip.Pix {
+					clip.Pix[i] = 0
+				}
+			}
 		case gif.DisposalPrevious: // 0x03 — restore.
 			// Restore to the canvas state before frame i was drawn —
 			// the immediately-prior snapshot, the bounded one-step
@@ -290,6 +311,19 @@ func sameFrame32(a, b image.Image) bool {
 		}
 	}
 	return true
+}
+
+// interRect — the intersection of two rectangles (the empty rect when
+// they do not overlap; draw.Draw on an empty rect is a documented no-op,
+// so this is also the guard for frames extending past the canvas
+// bounds — defensive, no panic).
+func interRect(a, b image.Rectangle) image.Rectangle {
+	return image.Rect(
+		max(a.Min.X, b.Min.X),
+		max(a.Min.Y, b.Min.Y),
+		min(a.Max.X, b.Max.X),
+		min(a.Max.Y, b.Max.Y),
+	)
 }
 
 // luma8 — 8-bit luma (0..255) of 16-bit RGBA components (0..65535);

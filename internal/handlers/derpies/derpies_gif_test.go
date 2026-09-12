@@ -513,6 +513,67 @@ func TestExpandGIFFramesDisposalBackgroundClearsCanvas(t *testing.T) {
 	}
 }
 
+func TestExpandGIFFramesBackgroundDisposalKeepsOutsideContent(t *testing.T) {
+	// 3 frames (k=3, all selected), canvas 40x40. Frame 0 = full-canvas
+	// solid S1 red, disposal unset (keep); frame 1 = a 20x20 sub-rectangle
+	// S2 blue at (10,10), Disposal[1] = 0x02 (DisposalBackground); frame 2
+	// = a 20x8 sub-rectangle S3 green at (0,30), disposal unset (keep).
+	// Spec 0x02 "restore to background" clears ONLY the disposing frame's
+	// own rectangle — so in frame 2's canvas, S1 must SURVIVE OUTSIDE
+	// frame 1's bounds, frame 1's own rectangle must be blank (the area
+	// itself cleared), and S3 must be present. A full-canvas wipe (the
+	// old behavior) loses the retained S1 outside frame 1's bounds.
+	f0 := rgbFrameAt(0, 0, 40, 40, color.RGBA{255, 0, 0, 255})
+	f1 := rgbFrameAt(10, 10, 20, 20, color.RGBA{0, 0, 255, 255})
+	f2 := rgbFrameAt(0, 30, 20, 8, color.RGBA{0, 230, 0, 255})
+	body := buildGIFWithDisposal(t, []*image.Paletted{f0, f1, f2},
+		[]byte{0, gif.DisposalBackground, 0})
+
+	// Re-verify the on-disk disposal flag (if the toolchain dropped it
+	// the test wouldn't hold — the decoder reads a missing flag back as 0,
+	// the "keep" default, silently disabling this case).
+	g, err := gif.DecodeAll(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("self-decode of the test gif: %v", err)
+	}
+	if len(g.Disposal) < 2 || g.Disposal[1] != gif.DisposalBackground {
+		t.Fatalf("test gif lost its 0x02 disposal flag (decoded %v) — the toolchain normalizes; the test does not hold", g.Disposal)
+	}
+
+	got, skipped, err := expandGIFFrames(body)
+	if err != nil {
+		t.Fatalf("expandGIFFrames err = %v, want nil", err)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	if len(got) != 3 {
+		t.Fatalf("frames = %d, want 3 (all three canvases distinct)", len(got))
+	}
+	// The LAST canvas: S1 + S3 present, frame 1's rectangle cleared to blank.
+	d2, err := base64.StdEncoding.DecodeString(got[2].Data)
+	if err != nil {
+		t.Fatalf("frame[2] base64 decode: %v", err)
+	}
+	// (5,5): OUTSIDE frame 1's rectangle, inside frame 0's paint — still
+	// S1 red (luma ~76, well above blank ~<30). The old full-canvas
+	// Background disposal wipes this; spot-checking it is the RED signal.
+	if l := lumaAt(t, d2, 5, 5); l < 55 {
+		t.Errorf("frame[2] pixel (5,5) luma = %d, want ~>76 (S1 red survives OUTSIDE frame 1's 20x20 rectangle — 0x02 must clear only the frame's own bounds, not the whole canvas)", l)
+	}
+	// (22,22): inside frame 1's OWN rectangle, fully inside one 8x8
+	// JPEG block (no boundary bleed) — now blank (the area itself was
+	// cleared by the Background disposal).
+	if l := lumaAt(t, d2, 22, 22); l > 30 {
+		t.Errorf("frame[2] pixel (22,22) luma = %d, want BLANK <30 (frame 1's own rectangle cleared by its 0x02 disposal)", l)
+	}
+	// (5,35): well inside frame 2's 20x8 rectangle at (0,30) — S3 green
+	// (luma ~135).
+	if l := lumaAt(t, d2, 5, 35); l < 100 {
+		t.Errorf("frame[2] pixel (5,35) luma = %d, want ~>135 (S3 green in frame 2's own rectangle)", l)
+	}
+}
+
 func TestExpandGIFFramesDisposalPreviousRestoresCanvas(t *testing.T) {
 	// 3 frames (k=3, all selected), canvas 40x40. Frame 0 = full-canvas
 	// solid gray 120 (disposal None); frame 1 = full-canvas solid red
