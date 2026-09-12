@@ -21,6 +21,7 @@ package derpies
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -453,7 +454,14 @@ func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, clien
 			// quo raw send (log, never abort the flow).
 			expanded, skipped, err := expandGIFFrames(body)
 			if err != nil {
-				slog.Warn("derpies gif expansion degraded to raw send", "module", module, "url", entry.url, "error", err)
+				// Oversize is a DISTINCT arm: budget refusal (log the
+				// byte length) rather than a decode failure — same
+				// raw-send shape as the other degraded gif arms.
+				if errors.Is(err, errGIFTooLarge) {
+					slog.Warn("derpies gif over pre-decode input cap, raw send", "module", module, "url", entry.url, "bytes", len(body))
+				} else {
+					slog.Warn("derpies gif expansion degraded to raw send", "module", module, "url", entry.url, "error", err)
+				}
 				images = append(images, app.PiImage{
 					MimeType: entry.mime,
 					Data:     base64.StdEncoding.EncodeToString(body),

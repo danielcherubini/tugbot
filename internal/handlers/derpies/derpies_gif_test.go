@@ -9,6 +9,7 @@ package derpies
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"image"
 	"image/color"
 	"image/gif"
@@ -116,6 +117,26 @@ func TestExpandGIFFrames(t *testing.T) {
 		}
 	})
 
+	t.Run("garbage over the input cap degrades with the distinct cap sentinel", func(t *testing.T) {
+		// Garbage (a real giant gif is not needed) — the cap check runs
+		// BEFORE the decode, so undecodable-but-oversized input must be
+		// a budget refusal, not a decode failure.
+		_, _, err := expandGIFFrames(make([]byte, gifInputMaxBytes+1))
+		if !errors.Is(err, errGIFTooLarge) {
+			t.Errorf("err = %v, want errGIFTooLarge (the distinct cap sentinel)", err)
+		}
+		if errors.Is(err, errGIFUnreadable) {
+			t.Errorf("err must NOT be errGIFUnreadable — different log semantics (budget refusal, not decode failure)")
+		}
+	})
+
+	t.Run("below-cap garbage stays a decode failure", func(t *testing.T) {
+		_, _, err := expandGIFFrames(make([]byte, 1<<20))
+		if !errors.Is(err, errGIFUnreadable) {
+			t.Errorf("err = %v, want errGIFUnreadable (a below-cap refusal must not fire)", err)
+		}
+	})
+
 	t.Run("consecutive-duplicate skip is provably exercised", func(t *testing.T) {
 		// 20 frames in the running pattern A x5, B x10, A x5 (A/B distinct
 		// solid colors). The 8 even-spaced selection indices [0,2,5,8,10,
@@ -160,6 +181,145 @@ func TestExpandGIFFrames(t *testing.T) {
 			t.Errorf("frame[1] gray = %d, want ~%d (the B block)", g, 230)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The pre-decode input cap — errGIFTooLarge
+// ---------------------------------------------------------------------------
+
+func TestFlowOversizeGIFDegradesToRaw(t *testing.T) {
+	// Oversize attachment (well over the 16MB pre-decode cap): budget
+	// refusal before any decode — raw send, no frames (the degrade arm
+	// mirrors the single-frame / undecodable arms).
+	body := make([]byte, gifInputMaxBytes+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	pi := &fakePi{resp: "CLEAN"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(msgWithGif("totally safe words", srv.URL+"/huge.gif"))
+
+	if pi.imageAsks != 1 {
+		t.Fatalf("pi.imageAsks = %d, want 1 (the raw gif must still be judged)", pi.imageAsks)
+	}
+	if len(pi.images) != 1 || len(pi.images[0]) != 1 {
+		t.Fatalf("ask images = %d, want exactly ONE (the raw gif — no frames)", len(pi.images[0]))
+	}
+	img := pi.images[0][0]
+	if img.MimeType != "image/gif" {
+		t.Errorf("mime = %q, want image/gif (oversize gif degrades to the raw send)", img.MimeType)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(img.Data)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	if !bytes.Equal(decoded, body) {
+		t.Errorf("decoded gif bytes must equal the raw served bytes (the status-quo raw send)")
+	}
+	if strings.Contains(pi.imagePrompts[0], "animated gif frame") {
+		t.Errorf("image prompt must NOT contain the gif-frames block for an oversize gif")
+	}
+	assertNoDeletes(t, ops)
+}
+
+// ---------------------------------------------------------------------------
+// Delta-rectangle compositing
+// ---------------------------------------------------------------------------
+
+// solidFrameAt — a w×h solid Paletted frame at gray v whose bounds are
+// offset (x0, y0) (a real sub-rectangle — frame 2 of a delta gif).
+func solidFrameAt(x0, y0, w, h int, v uint8) *image.Paletted {
+	f := image.NewPaletted(image.Rect(x0, y0, x0+w, y0+h), color.Palette{color.RGBA{R: v, G: v, B: v, A: 255}})
+	for y := y0; y < y0+h; y++ {
+		for x := x0; x < x0+w; x++ {
+			f.SetColorIndex(x, y, 0)
+		}
+	}
+	return f
+}
+
+// buildGIFDelta encodes a full-canvas frame followed by a sub-rectangle
+// delta frame into a real on-disk gif. This toolchain's gif.EncodeAll
+// preserves a frame's non-origin bounds on disk and gif.DecodeAll retains
+// them on read (verified empirically and re-asserted below by inspecting
+// the decoded Bounds) — a genuine delta-rectangle animation, the case
+// partial-frame gifs with transparent-pixel animations decode into.
+func buildGIFDelta(t *testing.T, full *image.Paletted, delta *image.Paletted) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, &gif.GIF{Image: []*image.Paletted{full, delta}, Delay: []int{10, 10}}); err != nil {
+		t.Fatalf("delta gif encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// lumaAt — 8-bit luma of a decoded image's pixel (solid colors round-trip
+// within a few levels through gif + jpeg q80).
+func lumaAt(t *testing.T, data []byte, x, y int) int {
+	t.Helper()
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("jpeg decode: %v", err)
+	}
+	r, g, b, _ := img.At(x, y).RGBA()
+	return int((uint64(r)*299 + uint64(g)*587 + uint64(b)*114) / 257000)
+}
+
+func TestExpandGIFFramesDeltaComposited(t *testing.T) {
+	// Frame 1 = full-canvas 40×40 solid S1 (gray 230); frame 2 = a 20×20
+	// sub-rectangle at (10,10) solid S2 (gray 10). Decoded as-is, frame 2
+	// is a 20×20 SUB-rectangle — compositing the expansion must be on the
+	// full 40×40 canvas: S1 background everywhere, S2 at the offset.
+	s1 := solidFrameAt(0, 0, 40, 40, 230)
+	delta := solidFrameAt(10, 10, 20, 20, 10)
+	body := buildGIFDelta(t, s1, delta)
+
+	// Re-verify the on-disk delta (the encoded bytes must retain the
+	// offset — the toolchain here preserves Bounds; if it normalized to
+	// (0,0) the compositing under test no longer holds and this fails).
+	g, err := gif.DecodeAll(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("self-decode of the test gif: %v", err)
+	}
+	if b := g.Image[1].Bounds(); b.Min.X != 10 || b.Min.Y != 10 {
+		t.Fatalf("test gif lost its delta offset (decoded frame 2 bounds %v) — the toolchain normalizes; the compositing under test does not hold", b)
+	}
+
+	got, skipped, err := expandGIFFrames(body)
+	if err != nil {
+		t.Fatalf("expandGIFFrames err = %v, want nil", err)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	if len(got) != 2 {
+		t.Fatalf("frames = %d, want 2 (40×40 solid + the composed delta — not a duplicate: the canvases differ)", len(got))
+	}
+	data, err := base64.StdEncoding.DecodeString(got[1].Data)
+	if err != nil {
+		t.Fatalf("frame[1] base64 decode: %v", err)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("frame[1] jpeg decode: %v", err)
+	}
+	// CANVAS-sized: the expanded delta frame must be the full 40×40
+	// logical screen, not the 20×20 sub-rectangle.
+	if b := img.Bounds(); b != image.Rect(0, 0, 40, 40) {
+		t.Fatalf("frame[1] bounds = %v, want (0,0)-(40,40) (full canvas, not the bare sub-rectangle)", b)
+	}
+	// Contains BOTH the S1 background (a pixel away from the sub-rectangle)
+	// AND the S2 sub-rectangle at the offset.
+	if l := lumaAt(t, data, 5, 5); l < 200 || l > 255 {
+		t.Errorf("frame[1] pixel (5,5) luma = %d, want ~230 (the S1 background survives under the delta)", l)
+	}
+	if l := lumaAt(t, data, 15, 15); l < 0 || l > 40 {
+		t.Errorf("frame[1] pixel (15,15) luma = %d, want ~10 (the S2 sub-rectangle composited at the offset)", l)
+	}
 }
 
 // ---------------------------------------------------------------------------

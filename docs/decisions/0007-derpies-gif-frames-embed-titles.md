@@ -48,9 +48,14 @@ Kendalltoole" — `peloton` sits in `derpies_gimmicks` as an LLM-learn row,
    `TestFlowFrameWordVerdictRejectedWhenTitleHasTokens`).
 2. **Animated media expand to ≤8 sampled frames, both gif paths, joining the
    ONE existing ask.** An uploaded `image/gif` attachment expands in-process
-   (stdlib `image/gif`, zero new dependencies; up to 60 frames walked from the
-   stream; consecutive-duplicate skip via 32×32 grayscale sampling, tolerance 8)
-   into ≤8 evenly-spaced JPEG q80 frames. A `gifv` embed's video URL (mp4
+   (stdlib `image/gif`, zero new dependencies; the input is capped at 16MB
+   BEFORE decode — an over-cap input is a budget refusal, never a decode
+   — and every selected frame is composited onto the full canvas, a
+   partial-rectangle delta frame never encoded as-is: keep-previous
+   disposal emulated with draw.Over on a persistent canvas); up to 60
+   frames walked from the stream; consecutive-duplicate skip via 32×32
+   grayscale sampling, tolerance 8) into ≤8 evenly-spaced JPEG q80
+   frames. A `gifv` embed's video URL (mp4
    H.264 / webm VP8) is downloaded (8MB cap, same `isSafeURL` guard, 10s
    client; non-2xx is an error and the body is never read) and decoded with
    `github.com/liqmix/govid` behind the `videoFrameDecoder` seam (the same
@@ -104,6 +109,7 @@ UNCHANGED.
 | Failure arm | Behavior |
 |---|---|
 | gif: single-frame or undecodable (`errSingleFrame` / `errGIFUnreadable`) | `slog.Warn` ("degraded to raw send") + the RAW gif bytes ride along (status quo) |
+| gif: over the 16MB pre-decode input cap (`errGIFTooLarge` — budget refusal, the decode work is never attempted) | `slog.Warn` (url + byte length) + the RAW gif bytes ride along (status quo) |
 | gif: per-frame JPEG encode failure | `slog.Warn` with the skip count; that frame is skipped (fewer than 8 frames is correct) |
 | gifv video: download failure (request error, non-2xx, over-cap Content-Length, over-cap body) | `slog.Warn` ("degrade to thumbnail-only") + skip — the thumbnail, if planned, still rides on its own entry (status quo) |
 | gifv video: decoder not wired, decoder error, or zero frames | `slog.Warn` + skip — thumbnail-only (status quo); a sniffed container that yields zero frames is NOT an error (degrade to what we got) |
