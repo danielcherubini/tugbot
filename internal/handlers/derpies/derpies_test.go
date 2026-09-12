@@ -259,7 +259,7 @@ func TestGimmickPromptDefault(t *testing.T) {
 	content := "holler at zswiftf now"
 
 	// 0-image / no-ref form.
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, "", "")
 	for _, part := range []string{
 		"<<<UNTRUSTED MESSAGE",
 		content,
@@ -291,18 +291,18 @@ func TestGimmickPromptDefault(t *testing.T) {
 		t.Errorf("no-ref form must not contain the referenced block")
 	}
 	// An empty known list: the block is empty, not a header without a body.
-	if gotEmpty := gimmickPrompt(defaultPromptTemplate, content, nil, 0, ""); strings.Contains(gotEmpty, "known gimmick words (sorted ascending)") {
+	if gotEmpty := gimmickPrompt(defaultPromptTemplate, content, nil, 0, "", ""); strings.Contains(gotEmpty, "known gimmick words (sorted ascending)") {
 		t.Errorf("empty known list must omit the block header")
 	}
 
 	// 2-image form: the pinned images line with N = 2.
-	gotImg := gimmickPrompt(defaultPromptTemplate, content, known, 2, "")
+	gotImg := gimmickPrompt(defaultPromptTemplate, content, known, 2, "", "")
 	if !strings.Contains(gotImg, "The message also has 2 attached image(s) (screenshots or pasted images \u2014 a text filter would not see their content). Judge the text AND the images. If the anchor word appears in an image rather than the message text, name it as if it were in the message.") {
 		t.Errorf("2-image form must contain the pinned images line with 2 in: %q", gotImg)
 	}
 	// Ref form: the pinned ref block around the ref text.
 	const refText = "the quoted earlier message"
-	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, refText)
+	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, "", refText)
 	wantRef := "<<<REFERENCED MESSAGE\n" + refText + "\nREFERENCED MESSAGE>>>\nThe message replies to a previous message (often the author's own) \u2014 the quoted content is above between the REFERENCED MESSAGE markers. Judge the posted text / images AND the quoted content together; a respelling may live in the quote rather than the new message."
 	if !strings.Contains(gotRef, wantRef) {
 		t.Errorf("ref form must contain the pinned ref block with the ref text")
@@ -325,7 +325,7 @@ func TestGimmickPromptMissingOptionalMarkers(t *testing.T) {
 	// The default template with the optional markers removed: a 2-image / ref form must substitute normally — no crash, the payoff elements are simply absent, everything else intact.
 	noOptional := strings.ReplaceAll(defaultPromptTemplate, "{{IMAGES}}\n", "")
 	noOptional = strings.ReplaceAll(noOptional, "{{REF}}\n", "")
-	got := gimmickPrompt(noOptional, "holler at zswiftf now", []string{"bike"}, 2, "the quoted earlier message")
+	got := gimmickPrompt(noOptional, "holler at zswiftf now", []string{"bike"}, 2, "", "the quoted earlier message")
 
 	for _, part := range []string{
 		"<<<UNTRUSTED MESSAGE",
@@ -349,7 +349,7 @@ func TestGimmickPromptMissingOptionalMarkers(t *testing.T) {
 func TestGimmickPromptCustomTemplate(t *testing.T) {
 	// A minimal valid custom template: markers replaced, the wrapper bytes
 	// come from the code (the fence is code-pinned, not in the template).
-	got := gimmickPrompt(`<<<{content}>>>{known}`, "holler at zswiftf now", []string{"bike"}, 0, "")
+	got := gimmickPrompt(`<<<{content}>>>{known}`, "holler at zswiftf now", []string{"bike"}, 0, "", "")
 	want := "<<<\n<<<UNTRUSTED MESSAGE\nholler at zswiftf now\n               UNTRUSTED MESSAGE>>>\n>>>-----< known gimmick words (sorted ascending) >-----\nbike"
 	if got != want {
 		t.Errorf("custom template substitution:\n got %q\nwant %q", got, want)
@@ -375,7 +375,7 @@ func TestGimmickPromptNoMarkerReTrigger(t *testing.T) {
 	// their marker bytes from the very message the LLM judges.
 	known := []string{"bike", "sw1ft"}
 	content := "hey {content} {known} {{IMAGES}} {{REF}} look"
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, "", "")
 
 	// 1) The legitimate known block appears EXACTLY ONCE — at the template
 	//    marker position, never inside the message region.
@@ -789,7 +789,7 @@ func TestFlowVerdictLearnsAndDeletes(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "", "")
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want %q", pi.prompts[0], want)
 	}
@@ -807,7 +807,7 @@ func TestFlowPromptFallbackOnStoreError(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "", "")
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the code-default substitution %q", pi.prompts[0], want)
 	}
@@ -827,7 +827,7 @@ func TestFlowPromptFallbackOnInvalidTemplate(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, "", "")
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the code-default substitution %q", pi.prompts[0], want)
 	}

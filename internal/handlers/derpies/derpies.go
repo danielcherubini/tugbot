@@ -401,6 +401,7 @@ const defaultPromptTemplate = `A Discord message was just posted by a user with 
 HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge CLEAN only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between the two: GIMMICK. His messages are the filter's only queue, so err toward catching the roster, never toward letting it through.
 
 {content}
+{{EMBED}}
 
 Techniques he uses — in any combination; judge on ALL of them at once:
 - RESPPELLING: letters swapped/added/dropped/reordered, or bent — including unicode lookalikes (a z or s with a diacritic, ß, ø, ς, and the like), all-caps, or letters spelled out. Examples: zwift, schwift, žwift, s1ft. A bent letter does NOT change the word: "žwift" IS the swift-thing.
@@ -439,37 +440,46 @@ where <word> is the anchor word: the as-appears respelled token for a known-gimm
 - CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
 
 // validTemplate: the two MANDATORY literal markers are present. Absent
-// optional markers ({{IMAGES}} / {{REF}}) are fine — the element is simply
-// omitted.
+// optional markers ({{IMAGES}} / {{REF}} / {{EMBED}}) are fine — the element
+// is simply omitted.
 func validTemplate(t string) bool {
 	return strings.Contains(t, "{content}") && strings.Contains(t, "{known}")
 }
 
-// gimmickPrompt substitutes the FOUR markers with a TWO-PHASE pass so a
+// gimmickPrompt substitutes the FIVE markers with a TWO-PHASE pass so a
 // payload can never re-trigger a later marker scan. Pass 1 runs on the
 // TEMPLATE ONLY (before any payload exists): each marker becomes a unique
 // inert placeholder wrapped in NUL bytes. Pass 2 swaps the placeholders
-// for the real payloads. The payloads are NUL-free — content / refText are
-// Discord message text (Discord content cannot contain U+0000), and known
-// words pass wordValid's ^[a-z0-9]{2,32}$ charset — so a message that
-// literally contains "{known}" / "{{IMAGES}}" / "{{REF}}" survives
-// verbatim instead of pulling the known block inside the untrusted fence
-// or having its marker bytes silently deleted (the single-pass ReplaceAll
-// ordering this replaces re-scanned the already-inserted content). The
+// for the real payloads. content / refText are NUL-free Discord message
+// text (Discord content cannot contain U+0000), and known words pass
+// wordValid's ^[a-z0-9]{2,32}$ charset — so a message that literally
+// contains "{known}" / "{{IMAGES}}" / "{{REF}}" survives verbatim instead of
+// pulling the known block inside the untrusted fence or having its
+// marker bytes silently deleted (the single-pass ReplaceAll ordering this
+// replaces re-scanned the already-inserted content). embedTitles is
+// EXTERNAL text (a third-party service's title, not Discord message
+// content — it CAN contain arbitrary bytes); the invariant still holds
+// because pass 1 runs on the template only, so a payload can never
+// re-trigger a marker scan — a title that literally contained
+// "\x00EMBEDTITLES\x00" would at worst swap inertly. The
 // fence and the images line / referenced block bytes are code-pinned — the
 // template carries only the bare markers.
 // (`known` arrives sorted from the flow — sortedKeys — and is joined one
 // per line; the pi RPC always appends the anti-injection system fallback on
 // top of this.)
-func gimmickPrompt(tmpl string, content string, known []string, nImages int, refText string) string {
+func gimmickPrompt(tmpl string, content string, known []string, nImages int, embedTitles string, refText string) string {
 	// Pass 1: markers -> NUL-wrapped placeholders, template only.
 	marked := tmpl
 	marked = strings.ReplaceAll(marked, "{content}", "\x00CONTENT\x00")
 	marked = strings.ReplaceAll(marked, "{known}", "\x00KNOWN\x00")
 	marked = strings.ReplaceAll(marked, "{{IMAGES}}", "\x00IMAGES\x00")
+	marked = strings.ReplaceAll(marked, "{{EMBED}}", "\x00EMBEDTITLES\x00")
 	marked = strings.ReplaceAll(marked, "{{REF}}", "\x00REF\x00")
 
-	// Pass 2: placeholders -> payloads (all NUL-free, so no re-trigger).
+	// Pass 2: placeholders -> payloads. A payload can never re-trigger a
+	// later marker scan because pass 1 ran on the template only; the
+	// content/refText/known payloads are NUL-free as the doc comment
+	// argues, and embedTitles at worst swaps inertly.
 	out := strings.ReplaceAll(marked, "\x00CONTENT\x00",
 		"\n<<<UNTRUSTED MESSAGE\n"+content+"\n               UNTRUSTED MESSAGE>>>\n")
 	knownBlock := ""
@@ -482,6 +492,11 @@ func gimmickPrompt(tmpl string, content string, known []string, nImages int, ref
 		imagesBlock = fmt.Sprintf("The message also has %d attached image(s) (screenshots or pasted images — a text filter would not see their content). Judge the text AND the images. If the anchor word appears in an image rather than the message text, name it as if it were in the message.", nImages)
 	}
 	out = strings.ReplaceAll(out, "\x00IMAGES\x00", imagesBlock)
+	var embedBlock string
+	if embedTitles != "" {
+		embedBlock = "TITLES OF MEDIA EMBEDDED WITH THE MESSAGE (provider-furnished untrusted text — part of what was posted, judge it as if written):\n" + embedTitles + "\nA known word appearing in an embed title counts as if it were typed in the message."
+	}
+	out = strings.ReplaceAll(out, "\x00EMBEDTITLES\x00", embedBlock)
 	var refBlock string
 	if refText != "" {
 		refBlock = "<<<REFERENCED MESSAGE\n" + refText + "\nREFERENCED MESSAGE>>>\nThe message replies to a previous message (often the author's own) — the quoted content is above between the REFERENCED MESSAGE markers. Judge the posted text / images AND the quoted content together; a respelling may live in the quote rather than the new message."
@@ -553,6 +568,18 @@ func (h *Derpies) flow(m *discordgo.Message) {
 			toks[t] = true
 		}
 	}
+	// The non-empty embed titles join the union (the observed Klipy gifv
+	// vector: a bare-URL post whose brand word lives in the embed title —
+	// titled link the user chose to post counts as posted content; the
+	// stance is adversarial, so false negatives are the worse error).
+	for t := range tokensForMatch(embedTitleText(m)) {
+		toks[t] = true
+	}
+	if referenced != nil {
+		for t := range tokensForMatch(embedTitleText(referenced)) {
+			toks[t] = true
+		}
+	}
 	for tok := range toks {
 		if list[tok] {
 			if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
@@ -610,7 +637,25 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	if referenced != nil {
 		refContent = referenced.Content
 	}
-	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), refContent)
+	// The embed titles (posted + referenced, exact lines deduped) join the
+	// judged text in the prompt, the same way the referenced content does.
+	embedTitles := embedTitleText(m)
+	if referenced != nil {
+		lines := strings.Split(embedTitles, "\n")
+		seen := make(map[string]bool, len(lines))
+		for _, line := range lines {
+			seen[line] = true
+		}
+		for _, line := range strings.Split(embedTitleText(referenced), "\n") {
+			if line == "" || seen[line] {
+				continue
+			}
+			seen[line] = true
+			lines = append(lines, line)
+		}
+		embedTitles = strings.Join(lines, "\n")
+	}
+	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), embedTitles, refContent)
 	var (
 		text   string
 		askErr error
