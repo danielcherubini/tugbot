@@ -6,6 +6,7 @@ require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/jackc/pgx/v5 v5.7.3
 	github.com/joho/godotenv v1.5.1
+	github.com/liqmix/govid v0.0.0-20260726214734-844820719b99
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	golang.org/x/image v0.44.0
 	golang.org/x/sync v0.22.0
@@ -13,6 +14,8 @@ require (
 )
 
 require (
+	github.com/Eyevinn/mp4ff v0.51.0 // indirect
+	github.com/at-wat/ebml-go v0.17.2 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

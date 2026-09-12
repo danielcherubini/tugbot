@@ -61,6 +61,12 @@ type Derpies struct {
 	// clock is the injectable clock (tests pin it; markEdit snapshots
 	// clock() at event time for the 60s window math).
 	clock func() time.Time
+	// videoFrameDecoder decodes a gifv embed video's (mp4/webm) bytes into
+	// <=8 seek-sampled JPEG frames. New() wires the real govidVideoFrames
+	// (pure Go, no cgo); tests wire a fake or leave it nil. A nil decoder
+	// or ANY decoder error means "no frames for that video" (slog.Warn,
+	// module derpies, degrade to thumbnail-only, never abort the flow).
+	videoFrameDecoder func(data []byte) ([]app.PiImage, error)
 	// lastNick is the per-member last-known nickname: after a successful
 	// reset the cache holds derpiesNickReset (the echo of our own set is
 	// skipped via the cur == evt.Nick check — the echo arrives with
@@ -82,7 +88,8 @@ type Derpies struct {
 // catch it).
 func New(a *app.App) *Derpies {
 	return &Derpies{app: a, store: &poolStore{pool: a.Pool}, ops: &realOps{d: a.D},
-		clock: time.Now, lastNick: map[string]string{},
+		clock: time.Now, videoFrameDecoder: govidVideoFrames,
+		lastNick: map[string]string{},
 		lastEdit: map[string]time.Time{}, busy: map[string]bool{}}
 }
 
@@ -261,8 +268,13 @@ type imagePlanEntry struct {
 // type (empty content_type falls back to application/octet-stream and is
 // skipped, like mention), then embed image/thumbnail urls deduped against the
 // ATTACHMENT urls and MIME'd by extension (query/fragment stripped first:
-// png→image/png, gif→image/gif, webp→image/webp, else image/jpeg). Every url
-// must pass isSafeURL.
+// png→image/png, gif→image/gif, webp→image/webp, else image/jpeg), then — the
+// derpies-specific video extension — EVERY gifv embed's video URL (a gifv embed
+// whose Video URL is non-empty) as an embed-video entry, isSafeURL-guarded.
+// The video mime is IRRELEVANT (the govid decoder sniffs the container), so the
+// entry's mime is left empty; a non-gifv embed carrying a video is NOT planned,
+// and an unsafe video URL is skipped with a log (mirroring the embed-URL guard).
+// Every url must pass isSafeURL.
 func imageURLPlan(m *discordgo.Message) []imagePlanEntry {
 	if m == nil {
 		return nil
@@ -311,6 +323,21 @@ func imageURLPlan(m *discordgo.Message) []imagePlanEntry {
 		}
 		plan = append(plan, imagePlanEntry{url: url, mime: mimeForURL(url), source: "embed"})
 	}
+	// The derpies video extension: every gifv embed carries the actual
+	// animation in MessageEmbed.Video (the thumbnail is only the first
+	// frame). Plan that video URL (isSafeURL-guarded, mime-irrelevant) so it
+	// downloads + decodes into <=8 frames. A non-gifv embed (e.g. Type
+	// "video") is NOT planned; an unsafe URL is skipped with a log.
+	for _, e := range m.Embeds {
+		if e.Type != "gifv" || e.Video == nil || e.Video.URL == "" {
+			continue
+		}
+		if !isSafeURL(e.Video.URL) {
+			slog.Info("Skipping unsafe embed video URL: "+e.Video.URL, "module", module)
+			continue
+		}
+		plan = append(plan, imagePlanEntry{url: e.Video.URL, source: "embed-video"})
+	}
 	return plan
 }
 
@@ -357,12 +384,48 @@ func mimeForURL(url string) string {
 // branch: a gif mime expands in-process (expandGIFFrames) into ≤8 evenly-
 // spaced JPEG frames (the gifFrames return counts emitted frames); a
 // single-frame / undecodable gif degrades to the status-quo RAW send with
-// an slog.Warn degradation log, and per-frame
-// encode failures are logged. Returns (images, gifFrames).
+// an slog.Warn degradation log, and per-frame encode failures are logged.
+// The derpies VIDEO leg branch (source == "embed-video", what imageURLPlan
+// appends per gifv embed video URL): downloadVideoBytes on the SAME client.
+// ANY download error (request failure, non-2xx, over-cap Content-Length or
+// body), a nil videoFrameDecoder, or ANY decoder error is logged (slog.Warn,
+// module derpies) + skipped — the thumbnail (if one was planned) still rides on
+// its own entry, so that IS the degrade. On success the emitted frames are
+// appended to the images and counted into gifFrames.
+//
+// Returns (images, gifFrames).
 func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, client *http.Client) ([]app.PiImage, int) {
 	var images []app.PiImage
 	gifFrames := 0
 	for _, entry := range plan {
+		// The gifv embed-video leg: download + decode the actual animation
+		// into <=8 frames. Every failure arm (download, decoder wiring,
+		// decoder error) logs + skips — the thumbnail, if planned, rides on
+		// its own entry, so this IS the degrade. Never aborts the flow.
+		if entry.source == "embed-video" {
+			slog.Info("Downloading embed video: "+entry.url, "module", module)
+			body, err := downloadVideoBytes(ctx, entry.url, client)
+			if err != nil {
+				slog.Warn("derpies video download failed — skipping (degrade to thumbnail-only)", "module", module, "url", entry.url, "error", err)
+				continue
+			}
+			if h.videoFrameDecoder == nil {
+				slog.Warn("derpies videoFrameDecoder not wired — skipping video frames (degrade)", "module", module, "url", entry.url)
+				continue
+			}
+			frames, err := h.videoFrameDecoder(body)
+			if err != nil {
+				slog.Warn("derpies video decode failed — skipping (degrade to thumbnail-only)", "module", module, "url", entry.url, "error", err)
+				continue
+			}
+			if len(frames) == 0 {
+				slog.Warn("derpies video yielded no frames — skipping (degrade to thumbnail-only)", "module", module, "url", entry.url)
+				continue
+			}
+			gifFrames += len(frames)
+			images = append(images, frames...)
+			continue
+		}
 		if entry.source == "attachment" {
 			slog.Info("Downloading image: "+entry.url+" ("+entry.mime+")", "module", module)
 		} else {
