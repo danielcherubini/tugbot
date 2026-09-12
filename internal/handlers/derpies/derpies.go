@@ -454,12 +454,17 @@ func (h *Derpies) downloadPlan(ctx context.Context, plan []imagePlanEntry, clien
 			// quo raw send (log, never abort the flow).
 			expanded, skipped, err := expandGIFFrames(body)
 			if err != nil {
-				// Oversize is a DISTINCT arm: budget refusal (log the
-				// byte length) rather than a decode failure — same
-				// raw-send shape as the other degraded gif arms.
-				if errors.Is(err, errGIFTooLarge) {
+				// Each budget refusal is a DISTINCT arm: the log must name
+				// WHICH bound fired (input bytes over the cap vs. decoded
+				// dimensions over the cap — a small-bytes / large-screen gif
+				// rejected by the dims bound), the decode work is never
+				// attempted in either — same raw-send shape as the other
+				switch {
+				case errors.Is(err, errGIFTooLarge):
 					slog.Warn("derpies gif over pre-decode input cap, raw send", "module", module, "url", entry.url, "bytes", len(body))
-				} else {
+				case errors.Is(err, errGIFDimsTooLarge):
+					slog.Warn("derpies gif over pre-decode decoded-dimension cap, raw send", "module", module, "url", entry.url, "bytes", len(body))
+				default:
 					slog.Warn("derpies gif expansion degraded to raw send", "module", module, "url", entry.url, "error", err)
 				}
 				images = append(images, app.PiImage{

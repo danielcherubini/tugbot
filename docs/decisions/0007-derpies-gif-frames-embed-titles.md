@@ -50,7 +50,13 @@ Kendalltoole" — `peloton` sits in `derpies_gimmicks` as an LLM-learn row,
    ONE existing ask.** An uploaded `image/gif` attachment expands in-process
    (stdlib `image/gif`, zero new dependencies; the input is capped at 16MB
    BEFORE decode — an over-cap input is a budget refusal, never a decode
-   — and every selected frame is composited onto the full canvas, a
+   — and the DECODED DIMENSIONS are similarly pre-decode capped, read via
+   `gif.DecodeConfig` (the global HEADER alone, no frame
+   materialization): a logical screen over 16MP is a DISTINCT budget
+   refusal (`errGIFDimsTooLarge` — a uniform large-screen gif
+   compresses to KBs on disk, so the byte cap alone cannot bound the
+   decode work; the degrade log names WHICH bound fired) — and every
+   selected frame is composited onto the full canvas, a
    partial-rectangle delta frame never encoded as-is: keep-previous
    disposal emulated with draw.Over on a persistent canvas); up to 60
    frames walked from the stream; consecutive-duplicate skip via 32×32
@@ -110,6 +116,7 @@ UNCHANGED.
 |---|---|
 | gif: single-frame or undecodable (`errSingleFrame` / `errGIFUnreadable`) | `slog.Warn` ("degraded to raw send") + the RAW gif bytes ride along (status quo) |
 | gif: over the 16MB pre-decode input cap (`errGIFTooLarge` — budget refusal, the decode work is never attempted) | `slog.Warn` (url + byte length) + the RAW gif bytes ride along (status quo) |
+| gif: logical screen over the 16MP pre-decode decoded-dimension cap (`errGIFDimsTooLarge` — budget refusal via `gif.DecodeConfig`, the full decode is never attempted) | `slog.Warn` (url + byte length; the log names the DECODED-DIMENSION bound, distinct from the input-byte-cap arm) + the RAW gif bytes ride along (status quo) |
 | gif: per-frame JPEG encode failure | `slog.Warn` with the skip count; that frame is skipped (fewer than 8 frames is correct) |
 | gifv video: download failure (request error, non-2xx, over-cap Content-Length, over-cap body) | `slog.Warn` ("degrade to thumbnail-only") + skip — the thumbnail, if planned, still rides on its own entry (status quo) |
 | gifv video: decoder not wired, decoder error, or zero frames | `slog.Warn` + skip — thumbnail-only (status quo); a sniffed container that yields zero frames is NOT an error (degrade to what we got) |

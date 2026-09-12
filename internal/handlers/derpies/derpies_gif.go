@@ -21,10 +21,11 @@ import (
 )
 
 const (
-	gifOutputFrames  = 8        // max frames emitted per gif
-	gifDecodeCap     = 60       // max frames walked from the stream
-	gifJpegQuality   = 80       // house quality
-	gifInputMaxBytes = 16 << 20 // pre-decode input cap (16MB)
+	gifOutputFrames     = 8        // max frames emitted per gif
+	gifDecodeCap        = 60       // max frames walked from the stream
+	gifJpegQuality      = 80       // house quality
+	gifInputMaxBytes    = 16 << 20 // pre-decode input cap (16MB)
+	gifMaxDecodedPixels = 16 << 20 // pre-decode decoded-dimension cap (16MP logical screen)
 )
 
 var (
@@ -38,6 +39,16 @@ var (
 	// errGIFUnreadable: the decode work is never attempted at all);
 	// the caller sends the RAW bytes instead.
 	errGIFTooLarge = errors.New("gif input over the pre-decode cap")
+	// errGIFDimsTooLarge: the LOGICAL SCREEN (logged via gif.DecodeConfig
+	// — the global header alone, no frame materialization) exceeds
+	// gifMaxDecodedPixels BEFORE any full decode — a budget refusal on
+	// the DECODED dimensions; a DISTINCT sentinel from errGIFTooLarge
+	// (input bytes) because the input bytes can be tiny (a uniform
+	// large-screen gif compresses to KBs on disk) and the caller's
+	// degrade log must name WHICH bound fired (input bytes vs. decoded
+	// dimensions); the caller sends the RAW bytes instead (same
+	// degrade shape as the other gif refusal arms — log, never abort).
+	errGIFDimsTooLarge = errors.New("gif decoded dimensions over the pre-decode cap")
 	// errGIFUnreadable: the bytes cannot be reliably decoded as a gif
 	// — the caller sends the RAW bytes instead (degrade, never lose the
 	// payload).
@@ -48,16 +59,28 @@ var (
 // most gifOutputFrames evenly-spaced JPEG frames, in-process.
 //
 // Input cap (pre-decode): len(data) > gifInputMaxBytes rejects with
-// errGIFTooLarge BEFORE gif.DecodeAll runs. Residual constraint
-// (documented): this toolchain's image/gif is all-or-nothing (no
-// streaming NewDecoder), so the bound is on the INPUT bytes, not the
-// decode work — DecodeAll still materializes EVERY frame of an
-// in-bounds gif, and a fully-uncompressed large-frame gif at the cap
-// still costs proportional decode work. The pre-decode cap is the
-// bounded option this toolchain offers (input bounded to ≤16MB, and a
-// crafted gif's decoded memory is proportionally bounded, not
-// arbitrary). Any stream error — first frame or mid-stream — lands in
-// errGIFUnreadable.
+// errGIFTooLarge BEFORE any decode. Decoded-dimension cap
+// (pre-decode): a logical screen of more than gifMaxDecodedPixels
+// (16MP — read via gif.DecodeConfig, the global HEADER ALONE, no
+// frame materialization) rejects with the DISTINCT sentinel
+// errGIFDimsTooLarge BEFORE gif.DecodeAll runs — a uniform
+// large-screen gif compresses to KBs on disk, so the input-byte cap
+// alone cannot bound the decode work of an in-bounds-bytes
+// transmission. A DecodeConfig ERROR is NO HARD REJECTION (a
+// malformed / truncated header is not a budget ground) — the decode
+// falls through to the DecodeAll path and lands in errGIFUnreadable
+// (or errSingleFrame). Residual constraint (documented): this
+// toolchain's image/gif is all-or-nothing (no streaming NewDecoder),
+// so the bounds are on the INPUT bytes and the INPUT logical
+// screen, not the decode work — DecodeAll still materializes EVERY
+// frame of an in-bounds gif, and a fully-uncompressed large-frame
+// gif at the caps still costs proportional decode work. The
+// pre-decode caps are the bounded option this toolchain offers
+// (input bounded to ≤16MB, a 16MP logical screen bounds the per-
+// walked-frame canvas — worst case 60 walked frames ≈ 960MB of canvas
+// materialization — and a crafted gif's decoded memory is
+// proportionally bounded, not arbitrary). Any stream error — first
+// frame or mid-stream — lands in errGIFUnreadable.
 //
 // Selection: k = min(gifOutputFrames, n) evenly-spaced indices over
 // the collected frames (i * (n-1) / (k-1) for k > 1 — the same
@@ -93,11 +116,21 @@ var (
 // frame as this toolchain's DecodeAll returns it) is applied before
 // the next frame draws: gif.DisposalBackground (0x02, spec "restore
 // to background") clears ONLY the just-drawn frame's OWN rectangle
-// to blank (a transparent wipe over the frame's bounds — the gif
-// screen background is transparent on this NRGBA canvas, and a
-// full-canvas wipe would lose content a previous frame retained
-// OUTSIDE the frame's bounds;
-// TestExpandGIFFramesBackgroundDisposalKeepsOutsideContent); gif.DisposalPrevious (0x03) restores the canvas
+// to blank — CLEARED BY DIRECT PER-ROW SPAN ZERO of the parent
+// canvas's own Pix (subscript-bounded to the rectangle; INDEPENDENT
+// of SubImage semantics — on this toolchain
+// *image.NRGBA.SubImage returns a Pix slice backed to the PARENT
+// buffer's remaining tail, so ranging over SubImage().Pix clears
+// pixels OUTSIDE the frame rectangle — the in-toolchain Pix-tail
+// caveat is noted in the code comment and the clear sidesteps
+// SubImage entirely) — a transparent wipe over the frame's bounds
+// (the gif screen background is transparent on this NRGBA canvas,
+// and a full-canvas wipe would lose content a previous frame
+// retained OUTSIDE the frame's bounds;
+// TestExpandGIFFramesBackgroundDisposalKeepsOutsideContent, which
+// now ALSO regression-asserts that rows/columns OUTSIDE the frame
+// rectangle are untouched — the old SubImage-Pix-tail clear loses
+// them). gif.DisposalPrevious (0x03) restores the canvas
 // to the state BEFORE that frame was drawn; everything else
 // (gif.DisposalNone 0x01, the raw 0x00 read-back of an unset flag,
 // and reserved 0x04+ values) keeps the canvas (the gif default).
@@ -128,13 +161,28 @@ var (
 // error for a frame skips that frame (counted in returned `skipped` so
 // the caller logs it — THIS function is pure, it returns only data).
 //
-// Degradation contract (status quo): errGIFTooLarge / errSingleFrame /
-// errGIFUnreadable all mean "send the raw bytes"; the cap is a
-// DISTINCT sentinel — different log semantics (budget refusal vs.
-// decode failure) — so the caller can log the size.
+// Degradation contract (status quo): errGIFTooLarge /
+// errGIFDimsTooLarge / errSingleFrame / errGIFUnreadable all mean
+// "send the raw bytes" (log, never abort); the bytes cap and the
+// DIMENSIONS cap are DISTINCT sentinels — different log semantics
+// (which budget refusal fired vs. decode failure) — so the caller
+// can log which bound tripped.
 func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error) {
 	if len(data) > gifInputMaxBytes {
 		return nil, 0, errGIFTooLarge
+	}
+	// PRE-DECODE DIMENSION BOUND: gif.DecodeConfig reads the global
+	// HEADER ALONE (the logical screen size — no frame
+	// materialization) and is cheap even in a large file. A
+	// DecodeConfig ERROR is NOT a rejection ground (malformed /
+	// truncated header) — it falls to the full DecodeAll path and
+	// lands in errGIFUnreadable there. ONLY W×H exceeding the pixel
+	// cap is a budget refusal with its own sentinel; a 0×0 header is
+	// NOT rejected — only the `> gifMaxDecodedPixels` comparison
+	// exists (the DecodeAll path handles it, as it handles any other
+	// in-bounds case).
+	if cfg, err := gif.DecodeConfig(bytes.NewReader(data)); err == nil && cfg.Width*cfg.Height > gifMaxDecodedPixels {
+		return nil, 0, errGIFDimsTooLarge
 	}
 	g, err := gif.DecodeAll(bytes.NewReader(data))
 	if err != nil || len(g.Image) == 0 {
@@ -260,13 +308,19 @@ func expandGIFFrames(data []byte) (frames []app.PiImage, skipped int, err error)
 			// bounds (an empty rect needs no zeroing — defensive, no
 			// panic). canvas is a *image.NRGBA throughout (it starts
 			// as one; DisposalPrevious restores the NRGBA snapshot
-			// `prev`).
-			if cr := interRect(canvas.Bounds(), frame.Bounds()); !cr.Empty() {
-				clip := canvas.SubImage(cr).(*image.NRGBA)
-				for i := range clip.Pix {
-					clip.Pix[i] = 0
-				}
-			}
+			// `prev`). The clear is DIRECT PER-ROW SPAN ZERO of the
+			// canvas's own Pix — NOT canvas.SubImage(rect).Pix: on
+			// this toolchain's *image.NRGBA.SubImage returns a Pix
+			// slice backed to the PARENT buffer's remaining tail
+			// (confirmed by an in-toolchain caveat, and empirically
+			// — ranging over SubImage().Pix zeroed pixels outside the
+			// rectangle), so the clear is subscript-bounded to the
+			// rectangle itself, independent of SubImage's Pix-tail
+			// semantics. (The helper intersects once more — double
+			// safety, both are cheap — and this toolchain's
+			// image.Rectangle has no Inter method, so the intersect is
+			// spelled out).
+			rectClearNRGBA(canvas, canvas.Bounds().Intersect(frame.Bounds()))
 		case gif.DisposalPrevious: // 0x03 — restore.
 			// Restore to the canvas state before frame i was drawn —
 			// the immediately-prior snapshot, the bounded one-step
@@ -313,17 +367,23 @@ func sameFrame32(a, b image.Image) bool {
 	return true
 }
 
-// interRect — the intersection of two rectangles (the empty rect when
-// they do not overlap; draw.Draw on an empty rect is a documented no-op,
-// so this is also the guard for frames extending past the canvas
-// bounds — defensive, no panic).
-func interRect(a, b image.Rectangle) image.Rectangle {
-	return image.Rect(
-		max(a.Min.X, b.Min.X),
-		max(a.Min.Y, b.Min.Y),
-		min(a.Max.X, b.Max.X),
-		min(a.Max.Y, b.Max.Y),
-	)
+// rectClearNRGBA clears the exact rectangle r (intersected with m's
+// bounds) to transparent by zeroing each row's pixel span directly in
+// m.Pix — subscript-bounded to r, independent of SubImage's Pix-tail
+// semantics (which on this toolchain extend to the parent buffer's
+// end).
+func rectClearNRGBA(m *image.NRGBA, r image.Rectangle) {
+	r = r.Intersect(m.Rect)
+	if r.Empty() {
+		return
+	}
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		off := (y-m.Rect.Min.Y)*m.Stride + (r.Min.X-m.Rect.Min.X)*4
+		n := (r.Max.X - r.Min.X) * 4
+		for i := off; i < off+n; i++ {
+			m.Pix[i] = 0
+		}
+	}
 }
 
 // luma8 — 8-bit luma (0..255) of 16-bit RGBA components (0..65535);

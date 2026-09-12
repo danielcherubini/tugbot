@@ -117,6 +117,43 @@ func TestExpandGIFFrames(t *testing.T) {
 		}
 	})
 
+	t.Run("logical screen over the decoded pixel cap refuses before the full decode", func(t *testing.T) {
+		// A uniform 4400x4400 (19.36MP > 16MP cap) single frame LZW
+		// compresses to KBs on disk — the INPUT is well under the 16MB
+		// byte cap, so ONLY a pre-decode DIMENSION bound can reject
+		// this (the full DecodeAll — which would materialize the 4400x4400
+		// frame — must not run). Assert errGIFDimsTooLarge (and NOT
+		// errGIFTooLarge: the bytes are in-bound — the DIMS sentinel —
+		// the distinct one).
+		big := solidFrameAt(0, 0, 4400, 4400, 230)
+		body := buildGIF(t, []*image.Paletted{big, solidFrame(20)})
+		if len(body) >= gifInputMaxBytes {
+			t.Fatalf("test gif is %d bytes — must stay under the 16MB input cap so the DIMS, not bytes, bound fires", len(body))
+		}
+		_, _, err := expandGIFFrames(body)
+		if !errors.Is(err, errGIFDimsTooLarge) {
+			t.Errorf("err = %v, want errGIFDimsTooLarge (logical screen 4400x4400 = 19.36MP > 16MP cap, input = %d bytes < 16MB — the DIMS bound must refuse before DecodeAll)", err, len(body))
+		}
+		if errors.Is(err, errGIFTooLarge) {
+			t.Errorf("err = %v, must NOT be errGIFTooLarge — the input bytes are under the cap; the LOGICAL SCREEN bound fired (distinct log semantics)", err)
+		}
+	})
+
+	t.Run("below-cap logical screen is not dims-refused", func(t *testing.T) {
+		// Control: a single 2048x2048 (4MP ≤ 16MP cap) frame must NOT trip
+		// any pre-decode bound — it lands at errSingleFrame (the
+		// single-frame sentinel proves the dims check neither over-rejects.
+		med := solidFrameAt(0, 0, 2048, 2048, 120)
+		body := buildGIF(t, []*image.Paletted{med})
+		if len(body) >= gifInputMaxBytes {
+			t.Fatalf("test gif is %d bytes — must stay under the 16MB input cap", len(body))
+		}
+		_, _, err := expandGIFFrames(body)
+		if err != errSingleFrame {
+			t.Errorf("err = %v, want errSingleFrame (a 4MP single frame — the dims check must not over-reject below the cap)", err)
+		}
+	})
+
 	t.Run("garbage over the input cap degrades with the distinct cap sentinel", func(t *testing.T) {
 		// Garbage (a real giant gif is not needed) — the cap check runs
 		// BEFORE the decode, so undecodable-but-oversized input must be
@@ -571,6 +608,27 @@ func TestExpandGIFFramesBackgroundDisposalKeepsOutsideContent(t *testing.T) {
 	// (luma ~135).
 	if l := lumaAt(t, d2, 5, 35); l < 100 {
 		t.Errorf("frame[2] pixel (5,35) luma = %d, want ~>135 (S3 green in frame 2's own rectangle)", l)
+	}
+	// (x=35, y=15): row 15 is within frame 1's rows (10-29) but column
+	// 35 is OUTSIDE its columns (10-29) — S1 red must survive. The
+	// SubImage-Pix-range clear (this toolchain's *image.NRGBA.SubImage
+	// returns a Pix slice backed to the parent canvas's own Buffer's END)
+	// zeroes row 15's remainder from within the rectangle to its end:
+	// asserting this is the RED signal for that bug (it was blank under
+	// the tail-wipe, and is S1 red under the rectangle-bounded clear).
+	if l := lumaAt(t, d2, 35, 15); l < 55 {
+		t.Errorf("frame[2] pixel (35,15) luma = %d, want ~>76 (S1 red on row 15, OUTSIDE frame 1's 20x20 columns — the 0x02 clear must not extend past the frame rectangle)", l)
+	}
+	// (x=35, y=35): row 35 is BELOW frame 1's rectangle (35 > 29) — S1
+	// red (outside frame 2's (0,30)-(20,38) rectangle, not covered by
+	// S3). Blank under the tail-wipe bug; S1 under the bounded clear.
+	if l := lumaAt(t, d2, 35, 35); l < 55 {
+		t.Errorf("frame[2] pixel (35,35) luma = %d, want ~>76 (S1 red on row 35, BELOW frame 1's rectangle — the 0x02 clear must not zero rows past the frame rectangle)", l)
+	}
+	// (x=15, y=15): inside frame 1's OWN rectangle, fully inside one
+	// 8x8 JPEG block — blank (the rectangle itself was cleared).
+	if l := lumaAt(t, d2, 15, 15); l > 30 {
+		t.Errorf("frame[2] pixel (15,15) luma = %d, want BLANK <30 (inside frame 1's own rectangle — the clear still wipes the rectangle itself)", l)
 	}
 }
 
