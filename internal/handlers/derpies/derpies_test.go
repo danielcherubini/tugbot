@@ -503,6 +503,41 @@ func TestTokensForMatchUnicode(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// tokensForMatch (unicode edge punctuation — PR #3 review follow-up)
+// ---------------------------------------------------------------------------
+
+func TestTokensForMatchArabicPunctTrim(t *testing.T) {
+	// «خفيف؟» (؟ U+061F ARABIC QUESTION MARK, category Po): the edge
+	// punctuation must be trimmed off the folded token so the key is the
+	// verdict word خفيف (slow path) and the stored word (fast path).
+	got := tokensForMatch("ما هذا؟ خفيف؟")
+	if !got["خفيف"] {
+		t.Errorf("tokens %v: missing key خفيف (؟ edge punctuation must be trimmed)", got)
+	}
+	if got["خفيف؟"] {
+		t.Errorf("tokens %v: key خفيف؟ must not survive (؟ is edge punctuation)", got)
+	}
+
+	// Leading Arabic comma (، U+060C, Po) trims the same way.
+	got2 := tokensForMatch("،خفيف")
+	if len(got2) != 1 || !got2["خفيف"] {
+		t.Errorf("tokens = %v, want {خفيف} (leading ، trimmed)", got2)
+	}
+
+	// An all-punctuation token must not yield an empty key.
+	if got3 := tokensForMatch("؟"); len(got3) != 0 {
+		t.Errorf("tokens = %v, want {} (a pure-punctuation token yields no key)", got3)
+	}
+
+	// Controls: the ASCII path is byte-identical (trim is EDGES ONLY —
+	// interior "s-w1ft" survives, "sw1ft." loses the dot).
+	got4 := tokensForMatch("swift sw1ft. s-w1ft")
+	if len(got4) != 3 || !got4["swift"] || !got4["sw1ft"] || !got4["s-w1ft"] {
+		t.Errorf("tokens = %v, want {swift, sw1ft, s-w1ft} (ASCII path unchanged; interior - preserved)", got4)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The flow (unicode cases)
 // ---------------------------------------------------------------------------
 
@@ -561,6 +596,27 @@ func TestFlowZeroWidthSpacedFastHit(t *testing.T) {
 	}
 	if pi.asks != 0 {
 		t.Errorf("pi.asks = %d, want 0", pi.asks)
+	}
+	assertNothingLearned(t, store)
+}
+
+// PR #3 review follow-up: the message token «خفف؟» (؟ = U+061F ARABIC
+// QUESTION MARK, category Po) — before the unicode edge-trim the folded
+// token «خفف؟» was NOT equal to the stored word, so the fast path
+// missed; now the edge punctuation is trimmed off and the fast path
+// catches it with no pi ask.
+func TestFlowFastPathArabicPunctHit(t *testing.T) {
+	pi := &fakePi{}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"خفف": true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("إعطني خفف؟"))
+
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one fast delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 0 {
+		t.Errorf("pi.asks = %d, want 0 (the fast path must not reach pi)", pi.asks)
 	}
 	assertNothingLearned(t, store)
 }
@@ -682,6 +738,31 @@ func TestFlowUnicodeVerdictAllDigitsRejected(t *testing.T) {
 
 	assertNothingLearned(t, store)
 	assertNoDeletes(t, ops)
+}
+
+// PR #3 review follow-up: the message «خفف؟» (Arabic, خفف followed by the
+// ARABIC QUESTION MARK U+061F, category Po). Before the unicode
+// token-edge trim the folded token was «خفف؟» — NOT equal to the verdict
+// word, so the gate rejected it ("verdict word not in the message —
+// doing nothing") and the message leaked. Now the trailing native-script
+// punctuation is trimmed off the folded token, so the word anchors: it is
+// learned and the message deleted.
+func TestFlowArabicPunctAnchoredVerdictLearnsAndDeletes(t *testing.T) {
+	pi := &fakePi{resp: "GIMMICK:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("خفيف؟ لا مشكلة"))
+
+	if len(store.added) != 1 || store.added[0] != "خفيف|llm" {
+		t.Errorf("added = %v, want [خفيف|llm]", store.added)
+	}
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 1 {
+		t.Errorf("pi.asks = %d, want 1", pi.asks)
+	}
 }
 
 func TestFlowVerdictBaseFormStillRejected(t *testing.T) {

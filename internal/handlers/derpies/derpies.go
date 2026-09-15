@@ -195,24 +195,54 @@ func (o *realOps) setNickname(guildID, memberID, nick string) error {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// punctTrim is the edge-punctuation set trimmed from each token before the
-// exact match (a trailing "sw1ft." must hit "sw1ft"). Split in two consts
-// because a raw string cannot contain the backtick inside it cleanly.
+// punctTrim is the ASCII edge-punctuation set trimmed from each token
+// before the exact match (a trailing "sw1ft." must hit "sw1ft"). Split
+// in two consts because a raw string cannot contain the backtick inside
+// it cleanly. It is the ASCI arm of the token-edge trim: edgePunct
+// combines it with the unicode punctuation/symbol categories, so a
+// native-script token trims the same way (a trailing "خفيف؟" must hit
+// "خفيف"; ؟ is Po).
 const punctA = `!"#$%&()*+,-./:;<=>?@[]^_`
 const punctB = "`{|}~"
 
 var punctTrim = punctA + punctB
 
-// tokensForMatch: fold each fielded token (foldToASCII — which includes the
-// lowercasing), trim leading and trailing punctuation off each FOLDED
-// token; keys of the result map are the folded tokens.
-// "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft} (ASCII —
-// unchanged). "A świft cog" -> {a, swift, cog}.
+// edgePunct: a rune that is stripped from token EDGES only (never
+// mid-token — "s-w1ft" keeps its interior dash) — the ASCII punctTrim
+// set PLUS the punctuation/symbol unicode categories: Po (other
+// punctuation — ؟ U+061F, ، U+060C), Pd (dashes), Pi/Pf (quotes),
+// Ps/Pe (brackets), and the symbol categories Sc/Sm/So/Sk (a symbol
+// wedged at a token edge is punctuation, not part of the word).
+// Space/format need no entry: FoldToASCII's Cf drop and strings.Fields
+// already handle them.
+func edgePunct(r rune) bool {
+	return strings.ContainsRune(punctTrim, r) ||
+		unicode.Is(unicode.Po, r) || unicode.Is(unicode.Pd, r) ||
+		unicode.Is(unicode.Pi, r) || unicode.Is(unicode.Pf, r) ||
+		unicode.Is(unicode.Ps, r) || unicode.Is(unicode.Pe, r) ||
+		unicode.Is(unicode.Sc, r) || unicode.Is(unicode.Sm, r) ||
+		unicode.Is(unicode.So, r) || unicode.Is(unicode.Sk, r)
+}
+
+// tokensForMatch: fold each fielded token (foldToASCII — which includes
+// the lowercasing), and trim leading and trailing punctuation off each
+// FOLDED token — ASCII punctTrim PLUS the unicode punctuation/symbol
+// categories at the token edges only (edgePunct — the LLM's verdict
+// word and the stored word space now include Arabic, so a message
+// «خفيف؟» anchors «خفيف»). Keys of the result map are the folded
+// tokens. "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft}
+// (ASCII — unchanged). "A świft cog" -> {a, swift, cog}.
+// "خفيف؟" -> {خفيف}. A token whose edges trim it entirely (a pure-
+// punctuation token) is dropped: an empty key would match nothing.
 func tokensForMatch(content string) map[string]bool {
 	tokens := strings.Fields(content)
 	out := make(map[string]bool, len(tokens))
 	for _, tok := range tokens {
-		out[strings.Trim(wordmatch.FoldToASCII(tok), punctTrim)] = true
+		key := strings.TrimFunc(wordmatch.FoldToASCII(tok), edgePunct)
+		if key == "" {
+			continue
+		}
+		out[key] = true
 	}
 	return out
 }
