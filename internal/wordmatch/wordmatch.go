@@ -6,6 +6,14 @@
 // that trim happens at match time only (tokensForMatch), never on stored
 // words; a trailing punctuation (e.g. "Swift." folding to "swift.") must
 // be REJECTED by WordValid, not trimmed to "swift".
+//
+// WordValid is the stored-space contract and stays pure ASCII UNCHANGED.
+// The derpies verdict gate (step 9, ADR 0008) is EXTENDED beyond it:
+// ASCII words follow WordValid; a non-ASCII verdict word is accepted
+// ONLY when it is a verbatim folded token of the judged text (letters
+// 2..32 runes, at least one letter, no punctuation), after which it is
+// stored (a no-confusable non-ASCII word folds to itself and is matched
+// by exact token on the fast path). WordValid itself is never relaxed.
 package wordmatch
 
 import (
@@ -24,10 +32,14 @@ import (
 // "świft" -> "swift", "zw\u0438ft" (и U+0438) -> "zwift",
 // "l\u0663t" (Arabic-Indic ٣) -> "l3t", "sw\u00DFft" (ß) -> "sswift".
 //
-// Letters with NO Latin confusable (the rest of a non-Latin script)
-// stay as-is: they remain wordValid-ineligible and are only catchable
-// via the LLM naming an ASCII form (the LLM sees them in the prompt
-// verbatim).
+// Letters with NO Latin confusable (the rest of a non-Latin script,
+// e.g. Arabic خفيف) stay as-is: they remain wordValid-ineligible
+// (WordValid is the stored-space contract and stays pure ASCII
+// UNCHANGED), but the derpies step-9 gate (ADR 0008) accepts them
+// text-anchored — a no-confusable folded verdict word is accepted ONLY
+// when it is a verbatim folded token of the judged text (letters
+// 2..32 runes, at least one letter, no punctuation), so they are
+// catchable directly, not only via the LLM naming an ASCII form.
 //
 // confusableFold is a CONSERVATIVE, visually unambiguous map, built once
 // at init: NFD already decomposes diacritic-Latin (ś->s+Mn, ø->o+Mn)

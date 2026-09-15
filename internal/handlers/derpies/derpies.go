@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -194,24 +195,54 @@ func (o *realOps) setNickname(guildID, memberID, nick string) error {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// punctTrim is the edge-punctuation set trimmed from each token before the
-// exact match (a trailing "sw1ft." must hit "sw1ft"). Split in two consts
-// because a raw string cannot contain the backtick inside it cleanly.
+// punctTrim is the ASCII edge-punctuation set trimmed from each token
+// before the exact match (a trailing "sw1ft." must hit "sw1ft"). Split
+// in two consts because a raw string cannot contain the backtick inside
+// it cleanly. It is the ASCI arm of the token-edge trim: edgePunct
+// combines it with the unicode punctuation/symbol categories, so a
+// native-script token trims the same way (a trailing "خفيف؟" must hit
+// "خفيف"; ؟ is Po).
 const punctA = `!"#$%&()*+,-./:;<=>?@[]^_`
 const punctB = "`{|}~"
 
 var punctTrim = punctA + punctB
 
-// tokensForMatch: fold each fielded token (foldToASCII — which includes the
-// lowercasing), trim leading and trailing punctuation off each FOLDED
-// token; keys of the result map are the folded tokens.
-// "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft} (ASCII —
-// unchanged). "A świft cog" -> {a, swift, cog}.
+// edgePunct: a rune that is stripped from token EDGES only (never
+// mid-token — "s-w1ft" keeps its interior dash) — the ASCII punctTrim
+// set PLUS the punctuation/symbol unicode categories: Po (other
+// punctuation — ؟ U+061F, ، U+060C), Pd (dashes), Pi/Pf (quotes),
+// Ps/Pe (brackets), and the symbol categories Sc/Sm/So/Sk (a symbol
+// wedged at a token edge is punctuation, not part of the word).
+// Space/format need no entry: FoldToASCII's Cf drop and strings.Fields
+// already handle them.
+func edgePunct(r rune) bool {
+	return strings.ContainsRune(punctTrim, r) ||
+		unicode.Is(unicode.Po, r) || unicode.Is(unicode.Pd, r) ||
+		unicode.Is(unicode.Pi, r) || unicode.Is(unicode.Pf, r) ||
+		unicode.Is(unicode.Ps, r) || unicode.Is(unicode.Pe, r) ||
+		unicode.Is(unicode.Sc, r) || unicode.Is(unicode.Sm, r) ||
+		unicode.Is(unicode.So, r) || unicode.Is(unicode.Sk, r)
+}
+
+// tokensForMatch: fold each fielded token (foldToASCII — which includes
+// the lowercasing), and trim leading and trailing punctuation off each
+// FOLDED token — ASCII punctTrim PLUS the unicode punctuation/symbol
+// categories at the token edges only (edgePunct — the LLM's verdict
+// word and the stored word space now include Arabic, so a message
+// «خفيف؟» anchors «خفيف»). Keys of the result map are the folded
+// tokens. "Who's giving me a sw1ft." -> {who's, giving, me, a, sw1ft}
+// (ASCII — unchanged). "A świft cog" -> {a, swift, cog}.
+// "خفيف؟" -> {خفيف}. A token whose edges trim it entirely (a pure-
+// punctuation token) is dropped: an empty key would match nothing.
 func tokensForMatch(content string) map[string]bool {
 	tokens := strings.Fields(content)
 	out := make(map[string]bool, len(tokens))
 	for _, tok := range tokens {
-		out[strings.Trim(wordmatch.FoldToASCII(tok), punctTrim)] = true
+		key := strings.TrimFunc(wordmatch.FoldToASCII(tok), edgePunct)
+		if key == "" {
+			continue
+		}
+		out[key] = true
 	}
 	return out
 }
@@ -237,6 +268,44 @@ func parseVerdict(text string) (kind, word string) {
 		return "unknown", ""
 	}
 	return "unknown", ""
+}
+
+// unicodeVerdictShape (ADR 0008): the FOLDED non-ASCII verdict word's
+// plausible-word shape — letters-only (every rune in the COMBINED
+// Unicode L category: no whitespace, no punctuation, no digits — which
+// also guarantees at least one letter), 2..32 runes (inclusive, on the
+// RUNE count). Deliberately NOT [a-z0-9]-based — that is the ASCII arm
+// (wordValid); the flow checks arm (a) first, so a word that had
+// already passed wordValid never reaches this check, and an all-digit
+// string is rejected upstream (the shared precondition).
+func unicodeVerdictShape(fw string) bool {
+	if fw == "" {
+		return false
+	}
+	n := 0
+	for _, r := range fw {
+		if !unicode.Is(unicode.L, r) {
+			return false
+		}
+		n++
+	}
+	return n >= 2 && n <= 32
+}
+
+// allDigitVerdict: shared precondition (ADR 0008) — is fw a PURE digit
+// string (every rune a Unicode digit)? wordValid's charset admits
+// digits, but a twist word must contain at least ONE letter, so
+// "12345" is invalid on both arms regardless of its 2..32 shape.
+func allDigitVerdict(fw string) bool {
+	if fw == "" {
+		return false
+	}
+	for _, r := range fw {
+		if !unicode.Is(unicode.Nd, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // sortedKeys returns the map keys sorted (deterministic prompt text, so the
@@ -793,17 +862,47 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 9. SANITY before learning: charset/length — on the FOLDED verdict word
-	//    (shipped form) — AND, when the (union of posted + referenced) text
-	//    has tokens, the folded word must have appeared as a folded token of
-	//    that text (same tokenization as the fast path). A message with NO
-	//    text tokens at all (image-only, or empty text with an empty/absent
-	//    reference) is bounded by wordValid alone: the verdict word may come
-	//    from image text (the message is being filtered — a wrong word can
-	//    only delete the gated user's own future message containing that
-	//    word). A hallucinated word can never enter the list.
+	// 9. SANITY before learning: the two-arm gate (ADR 0008), on the FOLDED
+	//    verdict word (the shipped form), plus the shared pure-digit
+	//    precondition:
+	//      - SHARED — a pure digit string is NEVER a valid verdict word
+	//        (the twist word must contain at least one letter): "12345"
+	//        is invalid on both arms.
+	//      - ARM (a) ASCII — the unchanged wordValid ^[a-z0-9]{2,32}$
+	//        stored-space contract — plus: when the (union of posted +
+	//        referenced + embed-title) text has tokens, the folded word
+	//        must have appeared as a folded token of that text (same
+	//        tokenization as the fast path). A message with NO text tokens
+	//        at all (image-only, or empty text with an empty/absent
+	//        reference) is bounded by wordValid alone: the verdict word may
+	//        come from image text (the message is being filtered — a wrong
+	//        word can only delete the gated user's own future message
+	//        containing that word).
+	//      - ARM (b) non-ASCII — for a word whose folded form is NOT
+	//        wordValid (e.g. letters with NO Latin confusable, like Arabic
+	//        خفيف — the fold passes it through unchanged), the
+	//        ONLY accepted path is text-anchored: the word must be a
+	//        plausible shaped word (letters-only — every rune in the
+	//        combined Unicode L category: no whitespace, no punctuation, no
+	//        digits — 2..32 runes, so at least one letter) AND a VERBATIM
+	//        folded token of the judged text (the toks[fw] hit; the fold
+	//        leaves a no-confusable script like خفيف unchanged, so a
+	//        verbatim خفيف in the message hits that exact key). A
+	//        non-ASCII verdict word therefore can never act on a textless
+	//        (image-only / frame-only) post — frame-only words remain the
+	//        ADR 0007 dead-end, deliberately NOT relaxed.
+	//    A hallucinated word can never enter the list.
 	fw := wordmatch.FoldToASCII(word)
-	if !wordmatch.WordValid(fw) {
+	if fw == "" {
+		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
+	if allDigitVerdict(fw) {
+		slog.Warn("derpies all-digit verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
+	asc := wordmatch.WordValid(fw)
+	if !asc && !unicodeVerdictShape(fw) {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
@@ -818,12 +917,20 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		slog.Warn("derpies verdict word not in the message — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
+	if !asc && !hasTextTokens {
+		// Arm (b) is text-anchored only: with no text tokens (image-only /
+		// empty text with no reference) a non-ASCII verdict word cannot
+		// be anchored — the frame-only dead-end stays dead (ADR 0007).
+		slog.Warn("derpies non-ASCII verdict word not anchored to the message — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
 
-	// 10. Learn, then delete. Learn the FOLDED word (the list is a
-	//     pure-ASCII token space — the fast path's tokens fold identically,
-	//     so the next occurrence of the respelling is a fast hit). A delete
-	//     failure is LOG ONLY — the word was actually used and stays learned
-	//     (the next occurrence is a fast hit).
+	// 10. Learn, then delete. Learn the FOLDED word (ASCII words stay
+	//     pure-ASCII; no-confusable non-ASCII words (ADR 0008) fold to
+	//     themselves and are matched by the fast path on exact token), so
+	//     the next occurrence of the respelling is a fast hit. A delete
+	//     failure is LOG ONLY — the word was actually used and stays
+	//     learned (the next occurrence is a fast hit).
 	if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
 		slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
 	}
