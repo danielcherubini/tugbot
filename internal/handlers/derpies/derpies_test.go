@@ -609,6 +609,81 @@ func TestFlowUnicodeVerdictLearnsFolds(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0008 — non-ASCII verdict words, text-anchored
+// ---------------------------------------------------------------------------
+
+func TestFlowUnicodeVerdictWordLearnsAndDeletes(t *testing.T) {
+	// خفيف (Arabic, "light") passes the fold UNCHANGED (it has no Latin
+	// confusable, so it is not wordValid), but — ADR 0008 — it IS a
+	// verbatim folded token of the message, so the extended gate accepts
+	// it: the FOLDED word (= the same string) is learned and the message
+	// deleted. The fast path then catches the next verbatim occurrence.
+	// Pre-fix this FAILS ("derpies invalid verdict word — doing nothing").
+	pi := &fakePi{resp: "GIMMICK:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("once you guy me a خفيف no problem"))
+
+	if len(store.added) != 1 || store.added[0] != "خفيف|llm" {
+		t.Errorf("added = %v, want [خفيف|llm] (the folded form of a no-confusable non-ASCII word folds to itself)", store.added)
+	}
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one delete [[c1 msg1]]", ops.deleted)
+	}
+	if pi.asks != 1 {
+		t.Errorf("pi.asks = %d, want 1", pi.asks)
+	}
+}
+
+func TestFlowUnicodeVerdictWordNotInMessageStillRejected(t *testing.T) {
+	// The text-anchored arm still REJECTS a non-ASCII word that is absent
+	// from the judged text (word not in the message — the toks[fw] gate is
+	// unchanged for it): not learned, not deleted.
+	pi := &fakePi{resp: "GIMMICK:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("once you guy me a no problem"))
+
+	assertNothingLearned(t, store)
+	assertNoDeletes(t, ops)
+	if pi.asks != 1 {
+		t.Errorf("pi.asks = %d, want 1 (the gate rejects after the ask)", pi.asks)
+	}
+}
+
+func TestFlowUnicodeVerdictWordPunctuationRejected(t *testing.T) {
+	// A verdict word with PUNCTUATION wedged in (a trailing comma) is not
+	// a letters-only shape: the shape check rejects it — the token-trim
+	// escape ("خفيف!" would fold+trim to a token) does NOT apply to
+	// verdict words. Not learned, not deleted.
+	pi := &fakePi{resp: "GIMMICK:خفيف,"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("a b c"))
+
+	assertNothingLearned(t, store)
+	assertNoDeletes(t, ops)
+}
+
+func TestFlowUnicodeVerdictAllDigitsRejected(t *testing.T) {
+	// A PURE digit string is NEVER a valid verdict word — even though it
+	// satisfies wordValid's ASCII charset and IS a folded token of the
+	// (verbatim numeric) text: the twist word must contain at least one
+	// letter. Not learned, not deleted.
+	pi := &fakePi{resp: "GIMMICK:12345"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("12345"))
+
+	assertNothingLearned(t, store)
+	assertNoDeletes(t, ops)
+}
+
 func TestFlowVerdictBaseFormStillRejected(t *testing.T) {
 	// A base/known word that is NOT a token of the message is rejected
 	// by the token gate (the prod rejection case: "swift" is not a

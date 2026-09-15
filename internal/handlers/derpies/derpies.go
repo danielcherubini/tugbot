@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -237,6 +238,44 @@ func parseVerdict(text string) (kind, word string) {
 		return "unknown", ""
 	}
 	return "unknown", ""
+}
+
+// unicodeVerdictShape (ADR 0008): the FOLDED non-ASCII verdict word's
+// plausible-word shape — letters-only (every rune in the COMBINED
+// Unicode L category: no whitespace, no punctuation, no digits — which
+// also guarantees at least one letter), 2..32 runes (inclusive, on the
+// RUNE count). Deliberately NOT [a-z0-9]-based — that is the ASCII arm
+// (wordValid); the flow checks arm (a) first, so a word that had
+// already passed wordValid never reaches this check, and an all-digit
+// string is rejected upstream (the shared precondition).
+func unicodeVerdictShape(fw string) bool {
+	if fw == "" {
+		return false
+	}
+	n := 0
+	for _, r := range fw {
+		if !unicode.Is(unicode.L, r) {
+			return false
+		}
+		n++
+	}
+	return n >= 2 && n <= 32
+}
+
+// allDigitVerdict: shared precondition (ADR 0008) — is fw a PURE digit
+// string (every rune a Unicode digit)? wordValid's charset admits
+// digits, but a twist word must contain at least ONE letter, so
+// "12345" is invalid on both arms regardless of its 2..32 shape.
+func allDigitVerdict(fw string) bool {
+	if fw == "" {
+		return false
+	}
+	for _, r := range fw {
+		if !unicode.Is(unicode.Nd, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // sortedKeys returns the map keys sorted (deterministic prompt text, so the
@@ -793,17 +832,47 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 
-	// 9. SANITY before learning: charset/length — on the FOLDED verdict word
-	//    (shipped form) — AND, when the (union of posted + referenced) text
-	//    has tokens, the folded word must have appeared as a folded token of
-	//    that text (same tokenization as the fast path). A message with NO
-	//    text tokens at all (image-only, or empty text with an empty/absent
-	//    reference) is bounded by wordValid alone: the verdict word may come
-	//    from image text (the message is being filtered — a wrong word can
-	//    only delete the gated user's own future message containing that
-	//    word). A hallucinated word can never enter the list.
+	// 9. SANITY before learning: the two-arm gate (ADR 0008), on the FOLDED
+	//    verdict word (the shipped form), plus the shared pure-digit
+	//    precondition:
+	//      - SHARED — a pure digit string is NEVER a valid verdict word
+	//        (the twist word must contain at least one letter): "12345"
+	//        is invalid on both arms.
+	//      - ARM (a) ASCII — the unchanged wordValid ^[a-z0-9]{2,32}$
+	//        stored-space contract — plus: when the (union of posted +
+	//        referenced + embed-title) text has tokens, the folded word
+	//        must have appeared as a folded token of that text (same
+	//        tokenization as the fast path). A message with NO text tokens
+	//        at all (image-only, or empty text with an empty/absent
+	//        reference) is bounded by wordValid alone: the verdict word may
+	//        come from image text (the message is being filtered — a wrong
+	//        word can only delete the gated user's own future message
+	//        containing that word).
+	//      - ARM (b) non-ASCII — for a word whose folded form is NOT
+	//        wordValid (e.g. letters with NO Latin confusable, like Arabic
+	//        خفيف — the fold passes it through unchanged), the
+	//        ONLY accepted path is text-anchored: the word must be a
+	//        plausible shaped word (letters-only — every rune in the
+	//        combined Unicode L category: no whitespace, no punctuation, no
+	//        digits — 2..32 runes, so at least one letter) AND a VERBATIM
+	//        folded token of the judged text (the toks[fw] hit; the fold
+	//        leaves a no-confusable script like خفيف unchanged, so a
+	//        verbatim خفيف in the message hits that exact key). A
+	//        non-ASCII verdict word therefore can never act on a textless
+	//        (image-only / frame-only) post — frame-only words remain the
+	//        ADR 0007 dead-end, deliberately NOT relaxed.
+	//    A hallucinated word can never enter the list.
 	fw := wordmatch.FoldToASCII(word)
-	if !wordmatch.WordValid(fw) {
+	if fw == "" {
+		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
+	if allDigitVerdict(fw) {
+		slog.Warn("derpies all-digit verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
+	asc := wordmatch.WordValid(fw)
+	if !asc && !unicodeVerdictShape(fw) {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
@@ -818,12 +887,20 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		slog.Warn("derpies verdict word not in the message — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
 	}
+	if !asc && !hasTextTokens {
+		// Arm (b) is text-anchored only: with no text tokens (image-only /
+		// empty text with no reference) a non-ASCII verdict word cannot
+		// be anchored — the frame-only dead-end stays dead (ADR 0007).
+		slog.Warn("derpies non-ASCII verdict word not anchored to the message — doing nothing", "module", module, "word", word, "message", m.ID)
+		return
+	}
 
-	// 10. Learn, then delete. Learn the FOLDED word (the list is a
-	//     pure-ASCII token space — the fast path's tokens fold identically,
-	//     so the next occurrence of the respelling is a fast hit). A delete
-	//     failure is LOG ONLY — the word was actually used and stays learned
-	//     (the next occurrence is a fast hit).
+	// 10. Learn, then delete. Learn the FOLDED word (ASCII words stay
+	//     pure-ASCII; no-confusable non-ASCII words (ADR 0008) fold to
+	//     themselves and are matched by the fast path on exact token), so
+	//     the next occurrence of the respelling is a fast hit. A delete
+	//     failure is LOG ONLY — the word was actually used and stays
+	//     learned (the next occurrence is a fast hit).
 	if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
 		slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
 	}
