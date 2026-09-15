@@ -727,7 +727,7 @@ func TestListToolsIncludesReadMessages(t *testing.T) {
 	}
 	for _, tool := range tools.Tools {
 		if tool.Name == "read_messages" {
-			want := "Reads a channel's recent message history. channel_id accepts a numeric snowflake or a channel name (name form requires guild_id). Author filter matches exact username (author_name) or user ID (author_id). On Discord rate-limit (429) the tool returns a rate_limited error with a retry-after — no retry loop; re-call later."
+			want := "Reads a channel's recent message history. channel_id accepts a numeric snowflake or a channel name (name form requires guild_id). Author filter matches exact username (author_name) or user ID (author_id). The text result renders one line per message — [id] author at timestamp (RFC3339): content (n attachments) — followed by a trailing \"--- N messages (first .. last)\" summary; embedded newlines in content collapse to \" ⏎ \". On Discord rate-limit (429) the tool returns a rate_limited error with a retry-after — no retry loop; re-call later."
 			if tool.Description != want {
 				t.Errorf("read_messages description =\n%q\nwant\n%q", tool.Description, want)
 			}
@@ -752,8 +752,18 @@ func TestReadMessagesHappyPath(t *testing.T) {
 		t.Fatalf("IsError, text %q", textOf(t, res))
 	}
 	text := textOf(t, res)
-	if !strings.Contains(text, "3 messages") || !strings.Contains(text, ts1) || !strings.Contains(text, ts3) {
-		t.Errorf("text = %q, want \"3 messages\" + first/last timestamps %s / %s", text, ts1, ts3)
+	for _, want := range []string{
+		"[m1] alice at " + ts1 + ": hello (1 attachment)",
+		"[m2] alice at " + ts2 + ": world (0 attachments)",
+		"[m3] bob at " + ts3 + ": bye (2 attachments)",
+		"--- 3 messages (" + ts1 + " .. " + ts3 + ")",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text =\n%q\nwant it to contain %q", text, want)
+		}
+	}
+	if !strings.Contains(text, "3 messages") {
+		t.Errorf("text = %q, want the trailing summary with \"3 messages\"", text)
 	}
 	rows := structuredRows(t, res)
 	if len(rows) != 3 {
@@ -1068,6 +1078,55 @@ func TestReadMessagesEmpty(t *testing.T) {
 	}
 	if string(b) != `{"messages":[]}` {
 		t.Errorf("structured payload = %s, want %s (not nil, not an error result)", b, `{"messages":[]}`)
+	}
+}
+
+// review I3: embedded newlines in content must collapse to a single
+// " ⏎ " (U+23CE) so the line stays single-line; empty content renders
+// as "(no text)"; the attachment noun is singular at 1. The exact text
+// block (all four lines + trailing summary) is asserted verbatim.
+func TestReadMessagesTextRendersContent(t *testing.T) {
+	f := &fakeDiscord{channelMessages: []*discordgo.Message{
+		readMessageFixture("m1", "u1", "alice", "2026-02-02T10:00:00Z", "line1\nline2", 1),
+		readMessageFixture("m2", "u1", "alice", "2026-02-02T11:00:00Z", "", 0),
+		readMessageFixture("m3", "u2", "bob", "2026-02-02T12:00:00Z", "bye", 2),
+	}}
+	srv := NewServer(f, 0)
+	cs := connectInProcess(t, srv)
+	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
+	if res.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, res))
+	}
+	want := "[m1] alice at 2026-02-02T10:00:00Z: line1 ⏎ line2 (1 attachment)\n" +
+		"[m2] alice at 2026-02-02T11:00:00Z: (no text) (0 attachments)\n" +
+		"[m3] bob at 2026-02-02T12:00:00Z: bye (2 attachments)\n" +
+		"--- 3 messages (2026-02-02T10:00:00Z .. 2026-02-02T12:00:00Z)"
+	if got := textOf(t, res); got != want {
+		t.Errorf("text =\n%q\nwant\n%q", got, want)
+	}
+	// The structured payload is unchanged: the multi-line content is NOT
+	// flattened in the record payload (only in the text rendering).
+	rows := structuredRows(t, res)
+	if rows[0]["text"] != "line1\nline2" {
+		t.Errorf("row0[\"text\"] = %v, want %q (newlines preserved in the payload)", rows[0]["text"], "line1\nline2")
+	}
+	if rows[1]["text"] != "" || rows[1]["attachment_count"] != float64(0) {
+		t.Errorf("row1 = %v, want text \"\" + attachment_count 0", rows[1])
+	}
+}
+
+// Zero-message fetch: the text is exactly "0 messages" — no message
+// lines, no ".." timestamp range.
+func TestReadMessagesZeroMessagesText(t *testing.T) {
+	f := &fakeDiscord{}
+	srv := NewServer(f, 0)
+	cs := connectInProcess(t, srv)
+	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
+	if res.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, res))
+	}
+	if text := textOf(t, res); text != "0 messages" {
+		t.Errorf("text = %q, want exactly \"0 messages\" (no lines, no range)", text)
 	}
 }
 

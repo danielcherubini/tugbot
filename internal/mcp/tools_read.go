@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	mcpSDK "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,7 +34,7 @@ const (
 func registerReadTools(srv *mcpSDK.Server, d DiscordAPI) {
 	mcpSDK.AddTool(srv, &mcpSDK.Tool{
 		Name:        "read_messages",
-		Description: "Reads a channel's recent message history. channel_id accepts a numeric snowflake or a channel name (name form requires guild_id). Author filter matches exact username (author_name) or user ID (author_id). On Discord rate-limit (429) the tool returns a rate_limited error with a retry-after — no retry loop; re-call later.",
+		Description: "Reads a channel's recent message history. channel_id accepts a numeric snowflake or a channel name (name form requires guild_id). Author filter matches exact username (author_name) or user ID (author_id). The text result renders one line per message — [id] author at timestamp (RFC3339): content (n attachments) — followed by a trailing \"--- N messages (first .. last)\" summary; embedded newlines in content collapse to \" ⏎ \". On Discord rate-limit (429) the tool returns a rate_limited error with a retry-after — no retry loop; re-call later.",
 	}, func(_ context.Context, _ *mcpSDK.CallToolRequest, args readMessagesArgs) (*mcpSDK.CallToolResult, any, error) {
 		return handleReadMessages(d, args)
 	})
@@ -116,12 +117,62 @@ func handleReadMessages(d DiscordAPI, args readMessagesArgs) (*mcpSDK.CallToolRe
 		})
 	}
 
-	text := fmt.Sprintf("%d messages", len(out))
-	if len(out) > 0 {
-		text = fmt.Sprintf("%d messages (%s .. %s)", len(out), firstTs, lastTs)
+	// Text result: one rendered line per included message (fetch order —
+	// Discord REST order, NOT reversed) so any MCP client that surfaces
+	// only the text sees the message content itself; the existing summary
+	// (count + first/last timestamps, plus the clamp note) is kept as a
+	// trailing block. The structured payload is untouched.
+	var fb strings.Builder
+	for _, row := range out {
+		fb.WriteString(renderMessageLine(
+			row["id"].(string), row["author"].(string), row["timestamp"].(string),
+			row["text"].(string), row["attachment_count"].(int)))
+		fb.WriteByte('\n')
+	}
+	msg := "messages"
+	if len(out) == 1 {
+		msg = "message"
+	}
+	var text string
+	if len(out) == 0 {
+		// Empty page: exactly "0 messages" (no lines, no timestamp range).
+		text = "0 messages"
+	} else {
+		text = fb.String() + fmt.Sprintf("--- %d %s (%s .. %s)", len(out), msg, firstTs, lastTs)
 	}
 	if note != "" {
 		text += note
 	}
 	return textResult(text), map[string]any{"messages": out}, nil
+}
+
+// renderMessageLine renders ONE message row as a single text line:
+//
+//	[<id>] <author> at <timestamp (RFC3339)>: <content> (<n> attachment[s])
+//
+// A webhook message (author == "") omits the author token entirely:
+// "[<id>] at <timestamp>: …". Empty content renders as "(no text)"
+// (with "(0 attachments)" still appended — the count is part of the row
+// info). The trailing "(n attachment[s])" is always present and the noun
+// is singular only for n == 1. Embedded newlines in content collapse to
+// one " ⏎ " (U+23CE LINE SEPARATOR between two spaces) each, so a
+// multi-line Discord message stays a single line — deterministic, using
+// strings.ReplaceAll.
+func renderMessageLine(id, author, timestamp, content string, attachments int) string {
+	authorPart := ""
+	if author != "" {
+		authorPart = author + " "
+	}
+	var contentPart string
+	switch content {
+	case "":
+		contentPart = "(no text)"
+	default:
+		contentPart = strings.ReplaceAll(content, "\n", " ⏎ ")
+	}
+	noun := "attachments"
+	if attachments == 1 {
+		noun = "attachment"
+	}
+	return fmt.Sprintf("[%s] %sat %s: %s (%d %s)", id, authorPart, timestamp, contentPart, attachments, noun)
 }
