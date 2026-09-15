@@ -6,10 +6,11 @@
 -- code; an invalid row falls back to the code default, so a bad edit can
 -- never leave the filter with a broken prompt). updated_at = last edit.
 --
--- The seed body is the code default template, byte-for-byte. It contains ONE
--- single quote (the apostrophe in `filter's`) — the SQL literal doubles it:
--- `filter''s`. No other characters need escaping (no backticks, no
--- backslashes; semicolons inside the literal are safe — the whole file is
+-- The seed body is the code default template, byte-for-byte. It contains TWO
+-- single quotes (the apostrophes in `filter's` / `message''s`) — the SQL
+-- literal doubles them: `filter''s` / `message''s`. No other characters need
+-- escaping (no backticks, no backslashes; semicolons inside the literal are
+-- safe — the whole file is
 -- one simple-protocol query through pgx, the 000002 mechanics). Editing is an
 -- operator UPDATE (no deploy, no restart — the next message picks it up);
 -- rollback is restoring the previous body text.
@@ -71,6 +72,7 @@ Known gimmick words (each was the anchor word of a past gimmick; respellings of 
 Judgement rules (these override politeness):
 - A known word or any respelling of one — even when the surrounding text looks mildly innocent — is GIMMICK.
 - A known word hidden inside another word, written in non-English letters, or shot full of punctuation and dashes is GIMMICK — dressing does not launder the word.
+- A KNOWN GIMMICK IN ANY LANGUAGE IS STILL A GIMMICK: he now posts the same roster in OTHER LANGUAGES (observed: Arabic دراجة زويفت / زويفت, Mandarin 骑行/飞快/长城, Persian دوچرخه). The roster is the MEANING — a message that asks someone to buy/give him a bicycle, a Zwift subscription, or riding gear, in any script, language, or wording, is GIMMICK. Translate the message in your head and judge what it MEANS, never let the script launder it.
 - An anchor word embedded inside a squeeze/blend is GIMMICK; the anchor word is the most distinctive token of the blend AS IT APPEARS.
 - If you have to imagine an innocent reading to call it CLEAN, you are probably wrong — he is very good at making solicitations look like questions.
 - When you are torn: GIMMICK.
@@ -80,6 +82,7 @@ Reply with EXACTLY one line, one of:
   CLEAN
 where <word> is the anchor word: the as-appears respelled token for a known-gimmick trace, or the single most distinctive word of the fresh gimmick. The rules for <word>:
 - It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift").
-- For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "GIMMICK:swift" for it is the INVALID answer. Never answer a known word that is not in the message.
+- When the anchor is in a NON-LATIN script, answer the message''s OWN foreign-script token as it appears (e.g. زويفت, دراجة, 骑行, دوچرخه) — NEVER the English-known-word translation unless that English word literally appears in the message. "GIMMICK:zwift" for a message containing only زويفت is the INVALID answer; "GIMMICK:زويفت" is correct.
+- For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "GIMMICK:swift" for it is the INVALID answer. Never answer a known word that is not in the message. The same rule holds across scripts: a foreign-script rendering of a known word is answered by its OWN script token, never by the English base.
 - When the anchor word lives ONLY in an image, answer the most distinctive word of that image as if it were in the message.
 - CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.');
