@@ -538,6 +538,55 @@ func TestTokensForMatchArabicPunctTrim(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// tokensForMatch (SPLIT — a known word spread over spaces)
+// ---------------------------------------------------------------------------
+
+func TestTokensForMatchCollapsedSplit(t *testing.T) {
+	// The SPLIT evasion (the 2026-09-17 prod case): a known word spread over
+	// spaces. "z w i f t" must yield the COLLAPSED "zwift" (in addition to
+	// the individual single-rune tokens) so the fast path (zwift is a seed)
+	// and the verdict gate (anchor) both see it.
+	got := tokensForMatch("I want to make sure you get the points and free dlc for recommending the z w i f t")
+	if !got["zwift"] {
+		t.Errorf("tokens = %v: missing collapsed key zwift (z w i f t must collapse)", got)
+	}
+	// The individual single-rune tokens are still present (the collapse is
+	// additive, not a replacement).
+	if !got["z"] || !got["w"] || !got["i"] || !got["f"] || !got["t"] {
+		t.Errorf("tokens = %v: single-rune tokens must still be present", got)
+	}
+
+	// A run broken by a multi-rune word does NOT collapse across it: "z wift"
+	// has "wift" (4 runes) breaking the single-rune run, so no "zwift".
+	got2 := tokensForMatch("z wift")
+	if got2["zwift"] {
+		t.Errorf("tokens = %v: 'z wift' must NOT collapse to zwift (wift is multi-rune and breaks the run)", got2)
+	}
+
+	// A lone single-rune token does not collapse (a run needs >=2).
+	got3 := tokensForMatch("a")
+	if len(got3) != 1 || !got3["a"] {
+		t.Errorf("tokens = %v: want exactly {a}", got3)
+	}
+
+	// A pure-punctuation token between letters does NOT break the run (a dot
+	// wedged between letters is part of the split, not a word boundary):
+	// "z . w i f t" still collapses to "zwift".
+	got4 := tokensForMatch("z . w i f t")
+	if !got4["zwift"] {
+		t.Errorf("tokens = %v: 'z . w i f t' must collapse to zwift (pure-punct does not break the run)", got4)
+	}
+
+	// A run longer than 32 runes is NOT added (wordValid's max — the
+	// collapsed form can never match a stored word beyond it): 33 single-rune
+	// tokens collapse to a 33-rune string that must be absent.
+	got5 := tokensForMatch(strings.Repeat("a ", 33))
+	if got5[strings.Repeat("a", 33)] {
+		t.Errorf("tokens = %v: a >32-rune collapsed run must not be added", got5)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The flow (unicode cases)
 // ---------------------------------------------------------------------------
 
@@ -949,6 +998,83 @@ func TestFlowVerdictLearnsAndDeletes(t *testing.T) {
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want %q", pi.prompts[0], want)
 	}
+}
+
+func TestFlowSplitFastHit(t *testing.T) {
+	// The 2026-09-17 prod case: zwift is a seed, and "z w i f t" (the SPLIT
+	// evasion) collapses to "zwift" in the token union -> fast delete, zero
+	// pi asks (the LLM is never consulted for a fast hit).
+	content := "I want to make sure you get the points and free dlc for recommending the z w i f t"
+	pi := &fakePi{}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"zwift": true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg(content))
+
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want [[c1 msg1]] (fast path)", ops.deleted)
+	}
+	if pi.asks != 0 {
+		t.Errorf("pi.asks = %d, want 0 (fast path must not reach pi)", pi.asks)
+	}
+	assertNothingLearned(t, store)
+}
+
+func TestFlowSplitVerdictLearnsAndDeletes(t *testing.T) {
+	// A NEW split word (not in the list): the LLM answers the COLLAPSED form
+	// "zwift"; the gate anchors it to the collapsed run and learns it, so the
+	// next identical post is a fast delete.
+	pi := &fakePi{resp: "GIMMICK:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	content := "recommending the z w i f t"
+	h.flow(derpMsg(content))
+
+	if len(store.added) != 1 || store.added[0] != "zwift|llm" {
+		t.Errorf("added = %v, want [zwift|llm]", store.added)
+	}
+	if len(ops.deleted) != 1 {
+		t.Errorf("deleted = %v, want one (llm path)", ops.deleted)
+	}
+	if pi.asks != 1 {
+		t.Errorf("pi.asks = %d, want 1 (fell through to the slow path)", pi.asks)
+	}
+}
+
+func TestFlowSplitVerdictSpacedFormLearns(t *testing.T) {
+	// The LLM answers the word AS IT APPEARS (with the spaces): "z w i f t".
+	// The gate collapses the whitespace -> "zwift", anchors it to the
+	// collapsed run, and learns the COLLAPSED form (robust to LLM compliance
+	// on the answer shape).
+	pi := &fakePi{resp: "GIMMICK:z w i f t"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	content := "recommending the z w i f t"
+	h.flow(derpMsg(content))
+
+	if len(store.added) != 1 || store.added[0] != "zwift|llm" {
+		t.Errorf("added = %v, want [zwift|llm] (a spaced verdict collapses to the folded form)", store.added)
+	}
+	if len(ops.deleted) != 1 {
+		t.Errorf("deleted = %v, want one", ops.deleted)
+	}
+}
+
+func TestFlowSplitVerdictNotAnchoredStillRejected(t *testing.T) {
+	// "zwift" is a valid word but the message has NO split "z w i f t" (no
+	// collapsed run): the token gate keeps it out. The collapse does NOT
+	// create an anchor out of nothing — a hallucinated "zwift" on clean text
+	// is still rejected.
+	pi := &fakePi{resp: "GIMMICK:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestDerpies(store, ops, pi)
+	h.flow(derpMsg("completely clean text"))
+
+	assertNothingLearned(t, store)
+	assertNoDeletes(t, ops)
 }
 
 func TestFlowPromptFallbackOnStoreError(t *testing.T) {

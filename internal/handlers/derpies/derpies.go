@@ -234,16 +234,49 @@ func edgePunct(r rune) bool {
 // (ASCII — unchanged). "A świft cog" -> {a, swift, cog}.
 // "خفيف؟" -> {خفيف}. A token whose edges trim it entirely (a pure-
 // punctuation token) is dropped: an empty key would match nothing.
+//
+// The map ALSO carries COLLAPSED runs of single-rune tokens (the SPLIT
+// evasion, the 2026-09-17 prod case: a known word spread over spaces —
+// "z w i f t" is zwift). A run is a maximal stretch of consecutive tokens
+// whose folded form is a SINGLE rune; a token that folded to "" (pure
+// punctuation) does NOT break the run (a dot wedged between letters is
+// part of the split, not a word boundary); a multi-rune token breaks it.
+// A run of >=2 single-rune tokens contributes its collapsed (space-free)
+// form, capped at 32 runes (wordValid's max — each run element is one
+// rune, so the collapsed form has exactly len(run) runes and can never
+// match a stored word beyond the charset bound). The collapse is ADDITIVE
+// — the individual single-rune tokens stay in the map — so the fast path
+// (zwift is a seed) and the verdict gate (anchor) both see "zwift" in a
+// message that posted "z w i f t".
 func tokensForMatch(content string) map[string]bool {
 	tokens := strings.Fields(content)
 	out := make(map[string]bool, len(tokens))
-	for _, tok := range tokens {
+	folded := make([]string, len(tokens))
+	for i, tok := range tokens {
 		key := strings.TrimFunc(wordmatch.FoldToASCII(tok), edgePunct)
-		if key == "" {
+		folded[i] = key
+		if key != "" {
+			out[key] = true
+		}
+	}
+	var run []string
+	flush := func() {
+		if len(run) >= 2 && len(run) <= 32 {
+			out[strings.Join(run, "")] = true
+		}
+		run = nil
+	}
+	for _, k := range folded {
+		if k == "" {
+			continue // pure punctuation: skip, do NOT break the run
+		}
+		if len([]rune(k)) == 1 {
+			run = append(run, k)
 			continue
 		}
-		out[key] = true
+		flush()
 	}
+	flush()
 	return out
 }
 
@@ -306,6 +339,26 @@ func allDigitVerdict(fw string) bool {
 		}
 	}
 	return true
+}
+
+// foldVerdictWord: the verdict word's FOLDED form with ALL whitespace
+// collapsed away (the SPLIT evasion, 2026-09-17: a known word spread over
+// spaces — "z w i f t" — is judged and answered as the spaced form, but
+// the stored / matched space is the COLLAPSED form, so the verdict is
+// normalized to it before the two-arm gate). FoldToASCII drops Mn/Cf but
+// NOT regular spaces, so the space collapse is explicit. The collapse is
+// safe: a collapsed form only passes the gate when it is a token of the
+// message (the collapsed run in tokensForMatch), so it is anchored — a
+// hallucinated word (spaced or not) that is not in the message still fails
+// the token check. A whitespace-only word collapses to "" and is rejected
+// by the same fw == "" guard as before.
+func foldVerdictWord(word string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, wordmatch.FoldToASCII(word))
 }
 
 // sortedKeys returns the map keys sorted (deterministic prompt text, so the
@@ -613,6 +666,7 @@ where <word> is the anchor word: the as-appears respelled token for a known-gimm
 - It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift").
 - When the anchor is in a NON-LATIN script, answer the message's OWN foreign-script token as it appears (e.g. زويفت, دراجة, 骑行, دوچرخه) — NEVER the English-known-word translation unless that English word literally appears in the message. "GIMMICK:zwift" for a message containing only زويفت is the INVALID answer; "GIMMICK:زويفت" is correct.
 - For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "GIMMICK:swift" for it is the INVALID answer. Never answer a known word that is not in the message. The same rule holds across scripts: a foreign-script rendering of a known word is answered by its OWN script token, never by the English base.
+- For a SPLIT word (letters spread over spaces or symbols between its letters), answer the COLLAPSED form — the letters joined without the spacing: "z w i f t" -> "zwift", "g i v e" -> "give". Never the spaced form; the spaced form is not a valid answer.
 - When the anchor word lives ONLY in an image, answer the most distinctive word of that image as if it were in the message.
 - CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
 
@@ -894,7 +948,11 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	//        (image-only / frame-only) post — frame-only words remain the
 	//        ADR 0007 dead-end, deliberately NOT relaxed.
 	//    A hallucinated word can never enter the list.
-	fw := wordmatch.FoldToASCII(word)
+	//    The verdict word is FOLDED and its whitespace COLLAPSED
+	//    (foldVerdictWord — the SPLIT evasion: "z w i f t" normalizes to
+	//    "zwift" before the gate, so a spaced split verdict is anchored to
+	//    the collapsed run and learns the collapsed form).
+	fw := foldVerdictWord(word)
 	if fw == "" {
 		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
 		return
