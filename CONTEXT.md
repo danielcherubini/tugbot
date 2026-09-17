@@ -43,3 +43,7 @@ _Avoid_: MCP tools (unqualified), Discord API tools
 **Feature tools**:
 Follow-on MCP tools wrapping the bot's feature handlers (feature toggles, gimmick, gulag, ask-pi) — distinct from bridge tools; each needs a small `Invoke`-style public surface on the event-callback-shaped handlers.
 _Avoid_: feature MCP, command tools
+
+**Instagram rewrite**:
+The Instagram handler's mechanic — the 1:1 port of `instagram.rs` (feature-gated, suppresses the matched message's embeds, posts a new message with only the matched URL, `www.` prefix preserved) **except the target domain**: the Go bot rewrites it to `oginstagram.com`, deliberately diverging from Rust's `kkinstagram.com` (the port's first deliberate Go-vs-Rust divergence).
+_Avoid_: kkinstagram rewrite, rewriter

@@ -1,12 +1,13 @@
 // Package instagram is the Go port of the Rust bot's
 // src/handlers/instagram.rs.
 //
-// Mechanic parity (port 1:1, see docs/parity/checklist.md — instagram
+// Port of the Rust bot's mechanic (see docs/parity/checklist.md — instagram
 // section): when the "instagram" feature flag is enabled and the message
 // content matches the instagram-URL regex, the bot (1) edits the ORIGINAL
 // message to suppress its embeds, then (2) posts a NEW message containing
-// only the matched URL with its domain rewritten to kkinstagram.com while
-// the optional "www." prefix is preserved. This is NOT an in-place edit —
+// only the matched URL with its domain rewritten to oginstagram.com while
+// the optional "www." prefix is preserved — a deliberate divergence from
+// Rust, which rewrites to kkinstagram.com. This is NOT an in-place edit —
 // Rust does the same: `edit(...suppress_embeds(true))` followed by
 // `channel.say(fixed)`.
 package instagram
@@ -75,10 +76,12 @@ func (h *Instagram) suppressEmbeds(m *discordgo.Message) error {
 	return err
 }
 
-// rewrite mirrors Rust's fx_rewriter (instagram.rs:26-40): find the first
-// match and replace EVERY occurrence of the domain group ("instagram.com",
-// group 2 — group 1 "www." is untouched) inside the matched substring with
-// "kkinstagram.com" (Rust's String::replace replaces all occurrences).
+// rewrite mirrors Rust's fx_rewriter (instagram.rs:26-40) with ONE
+// deliberate divergence: find the first match and replace EVERY occurrence
+// of the domain group ("instagram.com", group 2 — group 1 "www." is
+// untouched) inside the matched substring with "oginstagram.com" (Rust
+// rewrites to "kkinstagram.com"; Rust's String::replace also replaces all
+// occurrences).
 // Returns "" when there is no match. It returns only the matched URL —
 // Rust's `channel.say(fixed_message)` posts exactly that string.
 func rewrite(content string) string {
@@ -86,5 +89,5 @@ func rewrite(content string) string {
 	if m == nil {
 		return ""
 	}
-	return strings.ReplaceAll(m[0], m[2], "kkinstagram.com")
+	return strings.ReplaceAll(m[0], m[2], "oginstagram.com")
 }

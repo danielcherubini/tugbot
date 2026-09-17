@@ -5,14 +5,16 @@ import (
 	"testing"
 )
 
-// Port of fx_rewriter's regex `https://(www\.)?(instagram\.com)/.+` with the
-// SECOND capture group ("instagram.com") replaced by "kkinstagram.com" while
-// the optional "www." prefix is preserved (src/handlers/instagram.rs:28-40).
+// Follows the regex `https://(www\.)?(instagram\.com)/.+` from the Rust
+// fx_rewriter (src/handlers/instagram.rs:28-40), with the SECOND capture
+// group ("instagram.com") replaced by "oginstagram.com" while the optional
+// "www." prefix is preserved — a deliberate divergence: Rust rewrites to
+// "kkinstagram.com".
 
 // Mirrors instagram.rs test `instagram_rewrite`.
 func TestInstagramRewrite(t *testing.T) {
 	got := rewrite("https://www.instagram.com/reel/DCkUQSry42v/?igsh=MXNrMDFwbTEzZnFvMg==")
-	want := "https://www.kkinstagram.com/reel/DCkUQSry42v/?igsh=MXNrMDFwbTEzZnFvMg=="
+	want := "https://www.oginstagram.com/reel/DCkUQSry42v/?igsh=MXNrMDFwbTEzZnFvMg=="
 	if got != want {
 		t.Errorf("rewrite = %q, want %q", got, want)
 	}
@@ -21,7 +23,7 @@ func TestInstagramRewrite(t *testing.T) {
 // Mirrors instagram.rs test `instagram_rewrite_without_www`.
 func TestInstagramRewriteWithoutWWW(t *testing.T) {
 	got := rewrite("https://instagram.com/p/ABC123/")
-	want := "https://kkinstagram.com/p/ABC123/"
+	want := "https://oginstagram.com/p/ABC123/"
 	if got != want {
 		t.Errorf("rewrite = %q, want %q", got, want)
 	}
@@ -44,7 +46,7 @@ func TestInstagramEmptyString(t *testing.T) {
 // Mirrors instagram.rs test `instagram_post_url`.
 func TestInstagramPostURL(t *testing.T) {
 	got := rewrite("https://www.instagram.com/p/ABC123/")
-	want := "https://www.kkinstagram.com/p/ABC123/"
+	want := "https://www.oginstagram.com/p/ABC123/"
 	if got != want {
 		t.Errorf("rewrite = %q, want %q", got, want)
 	}
@@ -56,7 +58,7 @@ func TestInstagramStoryURL(t *testing.T) {
 	if got == "" {
 		t.Fatal("rewrite(story url) = empty, want Some")
 	}
-	if !strings.Contains(got, "kkinstagram.com") {
-		t.Errorf("rewrite(story url) = %q, want it to contain \"kkinstagram.com\"", got)
+	if !strings.Contains(got, "oginstagram.com") {
+		t.Errorf("rewrite(story url) = %q, want it to contain \"oginstagram.com\"", got)
 	}
 }

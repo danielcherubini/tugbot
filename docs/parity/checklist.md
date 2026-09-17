@@ -41,9 +41,9 @@
 ## instagram
 - [ ] gated on the `instagram` feature flag via silent `IsEnabled` (src: instagram.rs:12)
 - [ ] trigger regex `https://(www\.)?(instagram\.com)/.+` — optional `www.` prefix (group 1, left untouched), domain in group 2 (src: instagram.rs:28)
-- [ ] on match: rewrites by replacing only the domain group (group 2) with `kkinstagram.com`, preserving a leading `www.` when present, and posts the matched URL substring as a NEW message (src: instagram.rs:16,25,43-44)
+- [ ] on match: rewrites by replacing only the domain group (group 2) with `oginstagram.com`, preserving a leading `www.` when present, and posts the matched URL substring as a NEW message — **deliberate divergence from Rust**, which rewrites to `kkinstagram.com`; all other mechanics 1:1 (src: instagram.rs:16,25,43-44)
 - [ ] BEFORE posting: edits the ORIGINAL message to set the suppress-embeds flag (src: instagram.rs:17-18)
-- [ ] parity test anchors (ported 1:1): `www.instagram.com` URL → `https://www.kkinstagram.com/...`; `instagram.com` without www → `https://kkinstagram.com/...`; empty / non-instagram → no match (src: instagram.rs:48-99)
+- [ ] test anchors (Go, deliberately diverged on the target domain from the Rust anchors of `kkinstagram.com`): `www.instagram.com` URL → `https://www.oginstagram.com/...`; `instagram.com` without www → `https://oginstagram.com/...`; empty / non-instagram → no match (src: instagram.rs:48-99)
 - [ ] logging parity: "Error supressing embeds" / "Suppressed Embed" / "Error posting Instagram message" / "Posted Instagram" (src: instagram.rs:21,24,26,29)
 - [ ] no guild/channel guards (entire file: instagram.rs); wired on every message create (src: mod.rs:110)
 
