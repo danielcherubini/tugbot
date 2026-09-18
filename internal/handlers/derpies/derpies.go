@@ -1353,7 +1353,12 @@ func (h *Derpies) flow(m *discordgo.Message) {
 				// anchor to the quoted content). Arm (b) stays
 				// text-anchored on the same word-like scope: a non-ASCII
 				// word needs a word-like anchor, and a word-less post has
-				// none — the frame-only dead-end stays dead (ADR 0007).
+				// none — the frame-only dead-end stays dead (ADR 0007). The
+				// cost also lands on quoted-anchored non-ASCII words: a
+				// word-less post that quotes a referenced message containing
+				// a non-ASCII anchor gets its LEARN rejected by the
+				// !asc && !hasWordLikeTokens arm even though the word is
+				// genuinely anchored in the quote (the ASCII arm would pass).
 				hasWordLikeTokens := false
 				for tok := range postedToks {
 					if wordLike(tok) {

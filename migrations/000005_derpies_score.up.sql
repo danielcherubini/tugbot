@@ -26,6 +26,8 @@
 CREATE TABLE public.derpies_config (
     id integer NOT NULL,
     delete_threshold integer DEFAULT 50 NOT NULL,
+    -- updated_at is NOT auto-updated (no trigger): an operator UPDATE of
+    -- delete_threshold should also set updated_at = now().
     updated_at timestamp without time zone DEFAULT now() NOT NULL
 );
 CREATE SEQUENCE public.derpies_config_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
