@@ -143,8 +143,10 @@ func (h *Derpies) nickFlow(evt *discordgo.GuildMemberUpdate) {
 		}
 	}
 	content := "New nickname set by the user: " + evt.Nick
-	// The nickname prompt has no embeds: embedTitles "" (nImages 0).
-	prompt := gimmickPrompt(tmpl, content, sortedKeys(list), 0, 0, "", "")
+	// The nickname prompt has no embeds: embedTitles "" (nImages 0) and
+	// no phrases (the phrase sub-block is the message flow's; the
+	// nickname score matrix is Task 3).
+	prompt := gimmickPrompt(tmpl, content, sortedKeys(list), 0, 0, "", "", []string{})
 	text, askErr := h.app.Pi.Ask(ctx, prompt)
 	if askErr != nil {
 		slog.Error("derpies nickname ask failed", "module", module, "error", askErr)

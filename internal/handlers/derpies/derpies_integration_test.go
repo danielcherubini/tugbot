@@ -363,3 +363,143 @@ func TestMigration000004AppliesAndSeeds(t *testing.T) {
 		t.Errorf("rows with source != 'seed' = %d, want 0", nonSeed)
 	}
 }
+
+// TestMigration000005AppliesAndSeeds — runs the REAL migration file (not
+// an inline copy) through dbmigrate.Run against the test PG and asserts
+// the seeded state: the derpies_config row (id=1, delete_threshold=50),
+// the derpies_gimmick_phrases shape (the UNIQUE phrase constraint), and
+// derpies_prompt.body == defaultPromptTemplate (which also pins the
+// 000005 UPDATE text to the code constant — the forever sync guard for
+// the prompt flip, the same way TestMigration000003AppliesAndSeeds pins
+// the seed). The precondition drops the three new tables (so the test
+// is rerunnable) and recreates derpies_prompt with a STALE row so the
+// UPDATE has a row to apply to.
+func TestMigration000005AppliesAndSeeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: PG not guaranteed available (testing.Short)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	url := os.Getenv("TUGBOT_TEST_DATABASE_URL")
+	if url == "" {
+		url = "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test"
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Skipf("cannot create pool: %v (is the compose PG running?)", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("cannot reach PG: %v (is the compose PG running?)", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// 1. Run the real migration file (not an inline copy) from temp dir.
+	dir := t.TempDir()
+	src, err := os.ReadFile("../../../migrations/000005_derpies_score.up.sql")
+	if err != nil {
+		t.Fatalf("read migration file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "000005_derpies_score.up.sql"), src, 0o644); err != nil {
+		t.Fatalf("write migration to temp dir: %v", err)
+	}
+
+	// 2. Precondition (the shared test DB may already have any of these;
+	//    never TRUNCATE features — other packages own it). The DROP ... CASCADE
+	//    first makes the test rerunnable on the same test DB. derpies_prompt
+	//    is recreated (mirroring 000003's DDL) with a STALE row so the
+	//    migration's UPDATE has a row to apply to — a missing row would make
+	//    the UPDATE a no-op and the body assert fail. Never touch the
+	//    features rows or derpies_gimmicks.
+	if _, err := pool.Exec(ctx, `
+		DROP TABLE IF EXISTS derpies_config CASCADE;
+		DROP TABLE IF EXISTS derpies_decisions CASCADE;
+		DROP TABLE IF EXISTS derpies_gimmick_phrases CASCADE;
+		DROP TABLE IF EXISTS derpies_prompt CASCADE;
+		CREATE TABLE public.derpies_prompt (
+		    id integer NOT NULL,
+		    body text NOT NULL,
+		    updated_at timestamp without time zone DEFAULT now() NOT NULL
+		);
+		CREATE SEQUENCE public.derpies_prompt_id_seq
+		    AS integer
+		    START WITH 1
+		    INCREMENT BY 1
+		    NO MINVALUE
+		    NO MAXVALUE
+		    CACHE 1;
+		ALTER SEQUENCE public.derpies_prompt_id_seq OWNED BY public.derpies_prompt.id;
+		ALTER TABLE ONLY public.derpies_prompt ALTER COLUMN id SET DEFAULT nextval('public.derpies_prompt_id_seq'::regclass);
+		ALTER TABLE ONLY public.derpies_prompt
+		    ADD CONSTRAINT derpies_prompt_pkey PRIMARY KEY (id);
+		INSERT INTO public.derpies_prompt (body) VALUES ('stale pre-score prompt');
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+		    version text PRIMARY KEY,
+		    applied_at timestamptz DEFAULT now()
+		);
+		DELETE FROM schema_migrations WHERE version = '000005_derpies_score';
+	`); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+
+	// 3. The real migration file runs clean.
+	if err := dbmigrate.Run(ctx, pool, dir); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// 4. Clean up (leave derpies_prompt and schema_migrations' other rows
+	//    intact — this test only owns its three new tables + version row).
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `
+			DROP TABLE IF EXISTS derpies_config CASCADE;
+			DROP TABLE IF EXISTS derpies_decisions CASCADE;
+			DROP TABLE IF EXISTS derpies_gimmick_phrases CASCADE;
+			DELETE FROM schema_migrations WHERE version = '000005_derpies_score';
+		`); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	// 5. Asserts.
+	// 5a. derpies_config: the seeded row (id=1, delete_threshold=50 — the
+	//     code default) and the CHECK constraint.
+	var id int
+	var threshold int
+	if err := pool.QueryRow(ctx, `SELECT id, delete_threshold FROM derpies_config`).Scan(&id, &threshold); err != nil {
+		t.Fatalf("derpies_config row: %v", err)
+	}
+	if id != 1 || threshold != 50 {
+		t.Errorf("derpies_config row = (id=%d, delete_threshold=%d), want (1, 50)", id, threshold)
+	}
+	var contype string
+	if err := pool.QueryRow(ctx,
+		`SELECT contype::text FROM pg_constraint WHERE conname = 'derpies_config_threshold_check'`).Scan(&contype); err != nil {
+		t.Errorf("derpies_config_threshold_check: %v (missing?)", err)
+		return
+	}
+	if contype != "c" {
+		t.Errorf("derpies_config_threshold_check contype = %q, want c", contype)
+	}
+
+	// 5b. derpies_gimmick_phrases: the UNIQUE (phrase) constraint.
+	var phraseContype string
+	if err := pool.QueryRow(ctx,
+		`SELECT contype::text FROM pg_constraint WHERE conname = 'derpies_gimmick_phrases_phrase_key'`).Scan(&phraseContype); err != nil {
+		t.Errorf("derpies_gimmick_phrases_phrase_key: %v (missing?)", err)
+		return
+	}
+	if phraseContype != "u" {
+		t.Errorf("derpies_gimmick_phrases_phrase_key contype = %q, want u", phraseContype)
+	}
+
+	// 5c. The prompt flip: the live row's body is the code default
+	//     template BYTE-FOR-BYTES (which also pins the 000005 UPDATE text
+	//     to the constant — the forever sync guard for the flip).
+	var body string
+	if err := pool.QueryRow(ctx, `SELECT body FROM derpies_prompt`).Scan(&body); err != nil {
+		t.Fatalf("derpies_prompt body: %v", err)
+	}
+	if body != defaultPromptTemplate {
+		t.Errorf("derpies_prompt.body != defaultPromptTemplate constant (the 000005 UPDATE text is out of sync with the code default)")
+	}
+}

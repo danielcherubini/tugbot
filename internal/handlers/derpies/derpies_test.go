@@ -431,7 +431,7 @@ func TestGimmickPromptDefault(t *testing.T) {
 	content := "holler at zswiftf now"
 
 	// 0-image / no-ref form.
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "", nil)
 	for _, part := range []string{
 		"<<<UNTRUSTED MESSAGE",
 		content,
@@ -439,7 +439,8 @@ func TestGimmickPromptDefault(t *testing.T) {
 		"HE WILL TEST THIS FILTER",
 		"Techniques he uses",
 		"Judgement rules",
-		"  GIMMICK:<word>",
+		"  SCORE:<0-100>",
+		"  WORD:<anchor>",
 	} {
 		if !strings.Contains(got, part) {
 			t.Errorf("prompt must contain %q", part)
@@ -463,18 +464,18 @@ func TestGimmickPromptDefault(t *testing.T) {
 		t.Errorf("no-ref form must not contain the referenced block")
 	}
 	// An empty known list: the block is empty, not a header without a body.
-	if gotEmpty := gimmickPrompt(defaultPromptTemplate, content, nil, 0, 0, "", ""); strings.Contains(gotEmpty, "known gimmick words (sorted ascending)") {
+	if gotEmpty := gimmickPrompt(defaultPromptTemplate, content, nil, 0, 0, "", "", nil); strings.Contains(gotEmpty, "known gimmick words (sorted ascending)") {
 		t.Errorf("empty known list must omit the block header")
 	}
 
 	// 2-image form: the pinned images line with N = 2.
-	gotImg := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "")
+	gotImg := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "", nil)
 	if !strings.Contains(gotImg, "The message also has 2 attached image(s) (screenshots or pasted images \u2014 a text filter would not see their content). Judge the text AND the images. If the anchor word appears in an image rather than the message text, name it as if it were in the message.") {
 		t.Errorf("2-image form must contain the pinned images line with 2 in: %q", gotImg)
 	}
 	// Ref form: the pinned ref block around the ref text.
 	const refText = "the quoted earlier message"
-	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", refText)
+	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", refText, nil)
 	wantRef := "<<<REFERENCED MESSAGE\n" + refText + "\nREFERENCED MESSAGE>>>\nThe message replies to a previous message (often the author's own) \u2014 the quoted content is above between the REFERENCED MESSAGE markers. Judge the posted text / images AND the quoted content together; a respelling may live in the quote rather than the new message."
 	if !strings.Contains(gotRef, wantRef) {
 		t.Errorf("ref form must contain the pinned ref block with the ref text")
@@ -497,14 +498,15 @@ func TestGimmickPromptMissingOptionalMarkers(t *testing.T) {
 	// The default template with the optional markers removed: a 2-image / ref form must substitute normally — no crash, the payoff elements are simply absent, everything else intact.
 	noOptional := strings.ReplaceAll(defaultPromptTemplate, "{{IMAGES}}\n", "")
 	noOptional = strings.ReplaceAll(noOptional, "{{REF}}\n", "")
-	got := gimmickPrompt(noOptional, "holler at zswiftf now", []string{"bike"}, 2, 0, "", "the quoted earlier message")
+	got := gimmickPrompt(noOptional, "holler at zswiftf now", []string{"bike"}, 2, 0, "", "the quoted earlier message", nil)
 
 	for _, part := range []string{
 		"<<<UNTRUSTED MESSAGE",
 		"holler at zswiftf now",
 		"UNTRUSTED MESSAGE>>>",
 		"HE WILL TEST THIS FILTER",
-		"  GIMMICK:<word>",
+		"  SCORE:<0-100>",
+		"  WORD:<anchor>",
 	} {
 		if !strings.Contains(got, part) {
 			t.Errorf("prompt must still contain %q", part)
@@ -521,7 +523,7 @@ func TestGimmickPromptMissingOptionalMarkers(t *testing.T) {
 func TestGimmickPromptCustomTemplate(t *testing.T) {
 	// A minimal valid custom template: markers replaced, the wrapper bytes
 	// come from the code (the fence is code-pinned, not in the template).
-	got := gimmickPrompt(`<<<{content}>>>{known}`, "holler at zswiftf now", []string{"bike"}, 0, 0, "", "")
+	got := gimmickPrompt(`<<<{content}>>>{known}`, "holler at zswiftf now", []string{"bike"}, 0, 0, "", "", nil)
 	want := "<<<\n<<<UNTRUSTED MESSAGE\nholler at zswiftf now\n               UNTRUSTED MESSAGE>>>\n>>>-----< known gimmick words (sorted ascending) >-----\nbike"
 	if got != want {
 		t.Errorf("custom template substitution:\n got %q\nwant %q", got, want)
@@ -547,7 +549,7 @@ func TestGimmickPromptNoMarkerReTrigger(t *testing.T) {
 	// their marker bytes from the very message the LLM judges.
 	known := []string{"bike", "sw1ft"}
 	content := "hey {content} {known} {{IMAGES}} {{REF}} look"
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "", nil)
 
 	// 1) The legitimate known block appears EXACTLY ONCE — at the template
 	//    marker position, never inside the message region.
@@ -849,8 +851,8 @@ func TestFlowFastPathArabicPunctHit(t *testing.T) {
 // Pre-fold this exact verdict was rejected ("verdict word not in the
 // message") and the message leaked.
 func TestFlowConfusableVerdictCoherence(t *testing.T) {
-	pi := &fakePi{resp: "GIMMICK:zwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("im pretty sure they make one for big handed individuals, zw\u0438ft tries to cater to all groups"))
@@ -867,10 +869,10 @@ func TestFlowConfusableVerdictCoherence(t *testing.T) {
 }
 
 func TestFlowUnicodeVerdictLearnsFolds(t *testing.T) {
-	// "GIMMICK:žwift" evaluates as the folded word "zwift": the gate
+	// "SCORE:95\nWORD:žwift" evaluates as the folded word "zwift": the gate
 	// passes and the FOLDED word is stored.
-	pi := &fakePi{resp: "GIMMICK:žwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:žwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("You should save the money and get me a žwift instead"))
@@ -897,8 +899,8 @@ func TestFlowUnicodeVerdictWordLearnsAndDeletes(t *testing.T) {
 	// it: the FOLDED word (= the same string) is learned and the message
 	// deleted. The fast path then catches the next verbatim occurrence.
 	// Pre-fix this FAILS ("derpies invalid verdict word — doing nothing").
-	pi := &fakePi{resp: "GIMMICK:خفيف"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("once you guy me a خفيف no problem"))
@@ -917,9 +919,12 @@ func TestFlowUnicodeVerdictWordLearnsAndDeletes(t *testing.T) {
 func TestFlowUnicodeVerdictWordNotInMessageStillRejected(t *testing.T) {
 	// The text-anchored arm still REJECTS a non-ASCII word that is absent
 	// from the judged text (word not in the message — the toks[fw] gate is
-	// unchanged for it): not learned, not deleted.
-	pi := &fakePi{resp: "GIMMICK:خفيف"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// unchanged for it): not learned, not deleted. The 40..T-1 score band
+	// attempts the learn (the word is what is rejected, not the score),
+	// and the delete stays out on score — the rejection's discriminating
+	// intent is preserved.
+	pi := &fakePi{resp: "SCORE:45\nWORD:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("once you guy me a no problem"))
@@ -935,9 +940,10 @@ func TestFlowUnicodeVerdictWordPunctuationRejected(t *testing.T) {
 	// A verdict word with PUNCTUATION wedged in (a trailing comma) is not
 	// a letters-only shape: the shape check rejects it — the token-trim
 	// escape ("خفيف!" would fold+trim to a token) does NOT apply to
-	// verdict words. Not learned, not deleted.
-	pi := &fakePi{resp: "GIMMICK:خفيف,"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// verdict words. Not learned, not deleted (the 40..T-1 band attempts
+	// the learn; the word rejection is what keeps it out).
+	pi := &fakePi{resp: "SCORE:45\nWORD:خفيف,"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("a b c"))
@@ -950,9 +956,10 @@ func TestFlowUnicodeVerdictAllDigitsRejected(t *testing.T) {
 	// A PURE digit string is NEVER a valid verdict word — even though it
 	// satisfies wordValid's ASCII charset and IS a folded token of the
 	// (verbatim numeric) text: the twist word must contain at least one
-	// letter. Not learned, not deleted.
-	pi := &fakePi{resp: "GIMMICK:12345"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// letter. Not learned, not deleted (the 40..T-1 band attempts the
+	// learn; the word rejection is what keeps it out).
+	pi := &fakePi{resp: "SCORE:45\nWORD:12345"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("12345"))
@@ -969,8 +976,8 @@ func TestFlowUnicodeVerdictAllDigitsRejected(t *testing.T) {
 // punctuation is trimmed off the folded token, so the word anchors: it is
 // learned and the message deleted.
 func TestFlowArabicPunctAnchoredVerdictLearnsAndDeletes(t *testing.T) {
-	pi := &fakePi{resp: "GIMMICK:خفيف"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:خفيف"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("خفيف؟ لا مشكلة"))
@@ -989,9 +996,10 @@ func TestFlowArabicPunctAnchoredVerdictLearnsAndDeletes(t *testing.T) {
 func TestFlowVerdictBaseFormStillRejected(t *testing.T) {
 	// A base/known word that is NOT a token of the message is rejected
 	// by the token gate (the prod rejection case: "swift" is not a
-	// folded token of a "zwift" message).
-	pi := &fakePi{resp: "GIMMICK:swift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// folded token of a "zwift" message). The 40..T-1 band attempts the
+	// learn; the word rejection is what keeps it out.
+	pi := &fakePi{resp: "SCORE:45\nWORD:swift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("Can it fish me a zwift ?"))
@@ -1113,9 +1121,10 @@ func TestFlowVerdictUnknownGibberish(t *testing.T) {
 
 func TestFlowVerdictHallucinatedWordAbsentFromMessage(t *testing.T) {
 	// "xyzzy" is a valid word but NOT a token of the content: the token
-	// gate keeps a hallucinated word out of the list.
-	pi := &fakePi{resp: "GIMMICK:xyzzy"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// gate keeps a hallucinated word out of the list. The 40..T-1 band
+	// attempts the learn; the word rejection is what keeps it out.
+	pi := &fakePi{resp: "SCORE:45\nWORD:xyzzy"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("completely clean text"))
@@ -1126,8 +1135,8 @@ func TestFlowVerdictHallucinatedWordAbsentFromMessage(t *testing.T) {
 
 func TestFlowVerdictInvalidWord(t *testing.T) {
 	t.Run("charset gate rejects s-w1ft", func(t *testing.T) {
-		pi := &fakePi{resp: "GIMMICK:s-w1ft"}
-		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+		pi := &fakePi{resp: "SCORE:45\nWORD:s-w1ft"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 		ops := &fakeOps{}
 		h := newTestDerpies(store, ops, pi)
 		h.flow(derpMsg("s-w1ft here"))
@@ -1138,8 +1147,8 @@ func TestFlowVerdictInvalidWord(t *testing.T) {
 	t.Run("token gate rejects sw1ft for content sw-1ft", func(t *testing.T) {
 		// wordValid("sw1ft") passes, but sw1ft is not a token of
 		// "sw-1ft" (tokenization yields "sw-1ft").
-		pi := &fakePi{resp: "GIMMICK:sw1ft"}
-		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+		pi := &fakePi{resp: "SCORE:45\nWORD:sw1ft"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 		ops := &fakeOps{}
 		h := newTestDerpies(store, ops, pi)
 		h.flow(derpMsg("sw-1ft here"))
@@ -1150,8 +1159,8 @@ func TestFlowVerdictInvalidWord(t *testing.T) {
 }
 
 func TestFlowVerdictLearnsAndDeletes(t *testing.T) {
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	content := "holler at zswiftf now"
@@ -1166,7 +1175,7 @@ func TestFlowVerdictLearnsAndDeletes(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", nil)
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want %q", pi.prompts[0], want)
 	}
@@ -1196,8 +1205,8 @@ func TestFlowSplitVerdictLearnsAndDeletes(t *testing.T) {
 	// A NEW split word (not in the list): the LLM answers the COLLAPSED form
 	// "zwift"; the gate anchors it to the collapsed run and learns it, so the
 	// next identical post is a fast delete.
-	pi := &fakePi{resp: "GIMMICK:zwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	content := "recommending the z w i f t"
@@ -1219,8 +1228,8 @@ func TestFlowSplitVerdictSpacedFormLearns(t *testing.T) {
 	// The gate collapses the whitespace -> "zwift", anchors it to the
 	// collapsed run, and learns the COLLAPSED form (robust to LLM compliance
 	// on the answer shape).
-	pi := &fakePi{resp: "GIMMICK:z w i f t"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:z w i f t"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	content := "recommending the z w i f t"
@@ -1238,9 +1247,10 @@ func TestFlowSplitVerdictNotAnchoredStillRejected(t *testing.T) {
 	// "zwift" is a valid word but the message has NO split "z w i f t" (no
 	// collapsed run): the token gate keeps it out. The collapse does NOT
 	// create an anchor out of nothing — a hallucinated "zwift" on clean text
-	// is still rejected.
-	pi := &fakePi{resp: "GIMMICK:zwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// is still rejected. The 40..T-1 band attempts the learn; the word
+	// rejection is what keeps it out.
+	pi := &fakePi{resp: "SCORE:45\nWORD:zwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("completely clean text"))
@@ -1261,7 +1271,7 @@ func TestFlowPromptFallbackOnStoreError(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", nil)
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the code-default substitution %q", pi.prompts[0], want)
 	}
@@ -1281,7 +1291,7 @@ func TestFlowPromptFallbackOnInvalidTemplate(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", nil)
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the code-default substitution %q", pi.prompts[0], want)
 	}
@@ -1289,11 +1299,283 @@ func TestFlowPromptFallbackOnInvalidTemplate(t *testing.T) {
 	assertNothingLearned(t, store)
 }
 
+func TestFlowConfigFallback(t *testing.T) {
+	// The config fallback (1): a configThreshold error (or a missing row)
+	// degrades to defaultThreshold (50) — the matrix still runs on the
+	// default T, and the decision row carries it.
+	t.Run("threshold error: the default T (50) applies", func(t *testing.T) {
+		// The errored value (90) must NOT apply: 55 >= 50 deletes, 55 < 90
+		// would not — the delete is the assertion that the default ran.
+		pi := &fakePi{resp: "SCORE:55\nWORD:zswiftf"}
+		store := &fakeStore{
+			enabled:      map[string]bool{FeatureKey: true},
+			threshold:    90,
+			thresholdErr: errors.New("db down"),
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the default T=50 applied, not the errored 90)", ops.deleted)
+		}
+		if len(store.decisions) != 1 {
+			t.Fatalf("decisions = %d rows, want 1: %+v", len(store.decisions), store.decisions)
+		}
+		d := store.decisions[0]
+		if d.Score == nil || *d.Score != 55 {
+			t.Errorf("score = %v, want 55", d.Score)
+		}
+		if d.Threshold == nil || *d.Threshold != 50 {
+			t.Errorf("threshold = %v, want 50 (the default)", d.Threshold)
+		}
+	})
+	t.Run("threshold error, score below the default: no delete", func(t *testing.T) {
+		// The other side of the assertion: a score below the default T
+		// (but above the errored value's complement) must not delete —
+		// the default T is what the matrix ran on.
+		pi := &fakePi{resp: "SCORE:45\nWORD:zswiftf"}
+		store := &fakeStore{
+			enabled:      map[string]bool{FeatureKey: true},
+			threshold:    40, // clamps to the default 50 anyway; the error is the point
+			thresholdErr: errors.New("db down"),
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		// 45 >= 40 learns, 45 < 50 (the default) does not delete.
+		if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
+			t.Errorf("added = %v, want [zswiftf|llm] (the learn band)", store.added)
+		}
+		assertNoDeletes(t, ops)
+	})
+}
+
+// TestFlowDecisionLogArms — the decision log (C): every terminal arm writes
+// exactly one derpies_decisions row with the arm's shape; pre-gate arms
+// write none; a write failure degrades (log, no abort).
+func TestFlowDecisionLogArms(t *testing.T) {
+	// assertDecision — the identity fields are set up front (after the
+	// author gate) for every row.
+	assertIdentity := func(t *testing.T, d *decisionRecord, content string) {
+		t.Helper()
+		if d.MessageID != "msg1" || d.ChannelID != "c1" || d.AuthorID != "163055057254875136" || d.Content != content {
+			t.Errorf("identity = (msg=%q chan=%q author=%q content=%q), want (msg1 c1 163055057254875136 %q)",
+				d.MessageID, d.ChannelID, d.AuthorID, d.Content, content)
+		}
+	}
+	assertPtr := func(t *testing.T, got *string, want string, name string) {
+		t.Helper()
+		if (got == nil) != (want == "") {
+			t.Errorf("%s = %v, want %q (nil-ness mismatch)", name, got, want)
+			return
+		}
+		if got != nil && *got != want {
+			t.Errorf("%s = %v, want %q", name, *got, want)
+		}
+	}
+	assertIntPtr := func(t *testing.T, got *int, want int, name string) {
+		t.Helper()
+		if (got == nil) != (want < 0) {
+			t.Errorf("%s = %v, want %v (nil-ness mismatch)", name, got, want)
+			return
+		}
+		if got != nil && *got != want {
+			t.Errorf("%s = %v, want %v", name, *got, want)
+		}
+	}
+
+	run := func(t *testing.T, store *fakeStore, ops *fakeOps, pi app.PiBackend, content string) *decisionRecord {
+		t.Helper()
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg(content))
+		if len(store.decisions) != 1 {
+			t.Fatalf("decisions = %d rows, want exactly 1: %+v", len(store.decisions), store.decisions)
+		}
+		return store.decisions[0]
+	}
+
+	t.Run("list fetch failed: reject_reason, no path/score/threshold", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, listErr: errors.New("db down")}
+		d := run(t, store, &fakeOps{}, pi, "completely clean text")
+		assertIdentity(t, d, "completely clean text")
+		assertPtr(t, d.Path, "", "path")
+		assertIntPtr(t, d.Score, -1, "score")
+		assertIntPtr(t, d.Threshold, -1, "threshold")
+		assertPtr(t, d.Word, "", "word")
+		assertPtr(t, d.RejectReason, "list fetch failed", "reject_reason")
+		if d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both false", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("fast word hit: path=fast, word, deleted", func(t *testing.T) {
+		pi := &fakePi{}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"sw1ft": true}}
+		d := run(t, store, &fakeOps{}, pi, "who's giving me a sw1ft.")
+		assertIdentity(t, d, "who's giving me a sw1ft.")
+		assertPtr(t, d.Path, "fast", "path")
+		assertIntPtr(t, d.Score, -1, "score")
+		assertIntPtr(t, d.Threshold, -1, "threshold")
+		assertPtr(t, d.Word, "sw1ft", "word")
+		assertPtr(t, d.RejectReason, "", "reject_reason")
+		if !d.Deleted || d.Learned {
+			t.Errorf("deleted=%v learned=%v, want deleted=true learned=false", d.Deleted, d.Learned)
+		}
+	})
+	t.Run("fast word hit, delete failed: reject_reason overrides, deleted=false", func(t *testing.T) {
+		pi := &fakePi{}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, words: map[string]bool{"sw1ft": true}}
+		d := run(t, store, &fakeOps{delErr: errors.New("discord 500")}, pi, "who's giving me a sw1ft.")
+		assertPtr(t, d.Path, "fast", "path")
+		assertPtr(t, d.Word, "sw1ft", "word")
+		assertPtr(t, d.RejectReason, "delete failed", "reject_reason")
+		if d.Deleted {
+			t.Errorf("deleted = true, want false (the delete failed)")
+		}
+	})
+	t.Run("pi unavailable: reject_reason, no path", func(t *testing.T) {
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+		d := run(t, store, &fakeOps{}, nil, "completely clean text")
+		assertPtr(t, d.Path, "", "path")
+		assertPtr(t, d.RejectReason, "pi unavailable", "reject_reason")
+		if d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both false", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("ask failed: reject_reason, no path", func(t *testing.T) {
+		pi := &fakePi{askErr: errors.New("pi down")}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+		d := run(t, store, &fakeOps{}, pi, "completely clean text")
+		assertPtr(t, d.Path, "", "path")
+		assertIntPtr(t, d.Score, -1, "score")
+		assertPtr(t, d.RejectReason, "ask failed", "reject_reason")
+	})
+	t.Run("unrecognized verdict: reject_reason, slow path set", func(t *testing.T) {
+		// A legacy CLEAN / old GIMMICK verdict carries no SCORE line.
+		pi := &fakePi{resp: "CLEAN"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+		d := run(t, store, &fakeOps{}, pi, "completely clean text")
+		assertPtr(t, d.Path, "", "path")
+		assertIntPtr(t, d.Score, -1, "score")
+		assertIntPtr(t, d.Threshold, -1, "threshold")
+		assertPtr(t, d.RejectReason, "unrecognized verdict", "reject_reason")
+		if d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both false", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("score < 40: slow path + score + threshold, no rejection", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:10\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		d := run(t, store, &fakeOps{}, pi, "completely clean text")
+		assertPtr(t, d.Path, "slow", "path")
+		assertIntPtr(t, d.Score, 10, "score")
+		assertIntPtr(t, d.Threshold, 60, "threshold")
+		assertPtr(t, d.Word, "", "word")
+		assertPtr(t, d.RejectReason, "", "reject_reason")
+		if d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both false (the do-nothing band)", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("40 <= score < T: learned, no delete, no rejection", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:45\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		d := run(t, store, &fakeOps{}, pi, "holler at zswiftf now")
+		assertPtr(t, d.Path, "slow", "path")
+		assertIntPtr(t, d.Score, 45, "score")
+		assertIntPtr(t, d.Threshold, 60, "threshold")
+		assertPtr(t, d.Word, "zswiftf", "word")
+		assertPtr(t, d.RejectReason, "", "reject_reason")
+		if !d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want learned=true deleted=false", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("score >= T: learned + deleted", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		d := run(t, store, &fakeOps{}, pi, "holler at zswiftf now")
+		assertPtr(t, d.Path, "slow", "path")
+		assertIntPtr(t, d.Score, 95, "score")
+		assertIntPtr(t, d.Threshold, 60, "threshold")
+		assertPtr(t, d.Word, "zswiftf", "word")
+		assertPtr(t, d.RejectReason, "", "reject_reason")
+		if !d.Learned || !d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both true", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("score >= T, delete failed: learned, deleted=false, reject_reason overrides", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		d := run(t, store, &fakeOps{delErr: errors.New("discord 500")}, pi, "holler at zswiftf now")
+		if !d.Learned {
+			t.Errorf("learned = false, want true (a delete failure must not un-learn the word)")
+		}
+		if d.Deleted {
+			t.Errorf("deleted = true, want false")
+		}
+		assertPtr(t, d.RejectReason, "delete failed", "reject_reason")
+	})
+	t.Run("word rejected: the specific reject_reason, no learn, no delete", func(t *testing.T) {
+		// 40..T-1 band: the learn is attempted, the word is rejected (not
+		// in the message), the delete stays out on score.
+		pi := &fakePi{resp: "SCORE:45\nWORD:xyzzy"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		d := run(t, store, &fakeOps{}, pi, "completely clean text")
+		assertPtr(t, d.Path, "slow", "path")
+		assertIntPtr(t, d.Score, 45, "score")
+		assertIntPtr(t, d.Threshold, 60, "threshold")
+		assertPtr(t, d.Word, "", "word")
+		assertPtr(t, d.RejectReason, "verdict word not in message", "reject_reason")
+		if d.Learned || d.Deleted {
+			t.Errorf("learned=%v deleted=%v, want both false", d.Learned, d.Deleted)
+		}
+	})
+	t.Run("recordDecision insert failure: degrades, does not abort the delete", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60, recordErr: errors.New("db down")}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now")) // must not panic
+
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the delete must not be aborted by a record failure)", ops.deleted)
+		}
+		if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
+			t.Errorf("added = %v, want [zswiftf|llm] (the learn must not be aborted)", store.added)
+		}
+		if len(store.decisions) != 0 {
+			t.Errorf("decisions = %d rows, want 0 (the insert failed)", len(store.decisions))
+		}
+	})
+	t.Run("pre-gate arms write no row", func(t *testing.T) {
+		// Feature off / not a guild / author not gated: the defer is never
+		// reached, so no decision row.
+		for _, tc := range []struct {
+			name  string
+			store *fakeStore
+			msg   *discordgo.Message
+		}{
+			{"feature off", &fakeStore{enabled: map[string]bool{FeatureKey: false}}, derpMsg("x")},
+			{"not a guild", &fakeStore{enabled: map[string]bool{FeatureKey: true}}, func() *discordgo.Message { m := derpMsg("x"); m.GuildID = ""; return m }()},
+			{"author not gated", &fakeStore{enabled: map[string]bool{FeatureKey: true}}, otherMsg("x")},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h := newTestDerpies(tc.store, &fakeOps{}, &fakePi{})
+				h.flow(tc.msg)
+				if len(tc.store.decisions) != 0 {
+					t.Errorf("decisions = %d rows, want 0 (pre-gate arm)", len(tc.store.decisions))
+				}
+			})
+		}
+	})
+}
+
 func TestFlowDeleteFailsAfterSuccessfulAdd(t *testing.T) {
 	// A delete failure is LOG ONLY — the word was actually used and stays
 	// learned (the next occurrence is a fast hit).
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{delErr: errors.New("discord 500")}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("holler at zswiftf now"))
@@ -1304,4 +1586,247 @@ func TestFlowDeleteFailsAfterSuccessfulAdd(t *testing.T) {
 	if len(ops.deleted) != 0 {
 		t.Errorf("deleted = %v, want empty (the delete failed)", ops.deleted)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The decision matrix (the score model)
+// ---------------------------------------------------------------------------
+
+// TestFlowDecisionMatrix — the matrix is defined for T > learnFloor: learn
+// at score >= 40, delete at score >= T, INDEPENDENTLY; the word gate only
+// bounds the learn (a rejected word never blocks a score-driven delete).
+func TestFlowDecisionMatrix(t *testing.T) {
+	t.Run("score < 40: no learn, no delete (the do-nothing band)", func(t *testing.T) {
+		// The word is valid + anchored — the score alone keeps it out.
+		pi := &fakePi{resp: "SCORE:10\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		assertNoDeletes(t, ops)
+		assertNothingLearned(t, store)
+	})
+	t.Run("40 <= score < T: learn, no delete", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:45\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
+			t.Errorf("added = %v, want [zswiftf|llm] (the learn band)", store.added)
+		}
+		assertNoDeletes(t, ops)
+	})
+	t.Run("score >= T: learn + delete", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		if len(store.added) != 1 || store.added[0] != "zswiftf|llm" {
+			t.Errorf("added = %v, want [zswiftf|llm]", store.added)
+		}
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]]", ops.deleted)
+		}
+	})
+	t.Run("score >= T with no word: delete, no learn", func(t *testing.T) {
+		// No WORD line: the learn gate has no word to gate on, the delete
+		// is pure score.
+		pi := &fakePi{resp: "SCORE:95"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		assertNothingLearned(t, store)
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the delete is pure score)", ops.deleted)
+		}
+	})
+	t.Run("all-digit word rejected: delete still reflects score >= T", func(t *testing.T) {
+		// The word gate rejects (no learn), but the delete is independent —
+		// a rejected word never blocks a score-driven delete.
+		pi := &fakePi{resp: "SCORE:95\nWORD:12345"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("12345"))
+
+		assertNothingLearned(t, store)
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (delete-despite-rejection)", ops.deleted)
+		}
+	})
+	t.Run("invalid word rejected: delete still reflects score >= T", func(t *testing.T) {
+		// "s-w1ft" is neither wordValid (the dash) nor a unicode shape.
+		pi := &fakePi{resp: "SCORE:95\nWORD:s-w1ft"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("s-w1ft here"))
+
+		assertNothingLearned(t, store)
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (delete-despite-rejection)", ops.deleted)
+		}
+	})
+	t.Run("unanchored word rejected: delete still reflects score >= T", func(t *testing.T) {
+		// "xyzzy" is a valid word but NOT a token of the message: the
+		// anchor gate rejects the learn, the delete still fires on score.
+		pi := &fakePi{resp: "SCORE:95\nWORD:xyzzy"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("completely clean text"))
+
+		assertNothingLearned(t, store)
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (delete-despite-rejection)", ops.deleted)
+		}
+	})
+}
+
+// TestFlowAnchorGateEmoji — the emoji fix (A): the anchor requirement is
+// scoped to the POSTED message's word-like tokens. A "mention + emoji"
+// post (a mention snowflake is all-digit, an emoji-ref has a colon, a
+// pure-emoji token folds to "") has NO word-like tokens, so the anchor
+// requirement drops: a valid ASCII word passes wordValid alone and the
+// score decides (the observed case: 💸 + 🚵 = "buy me a bike" = zwift).
+func TestFlowAnchorGateEmoji(t *testing.T) {
+	t.Run("mention + emoji: no word-like tokens, the word passes, the score decides", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:95\nWORD:zwift"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("<@272889785318768641> 💸 <:derpies:1021692390177775657> 🚵"))
+
+		if len(store.added) != 1 || store.added[0] != "zwift|llm" {
+			t.Errorf("added = %v, want [zwift|llm] (a word-less post's valid ASCII word passes wordValid alone)", store.added)
+		}
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the score decides)", ops.deleted)
+		}
+	})
+	t.Run("word-like text tokens + a word not in the message: rejected", func(t *testing.T) {
+		// The posted message HAS word-like tokens, so the anchor
+		// requirement applies: "xyzzy" is not a folded token of the
+		// message and the learn is rejected (the delete still fires on
+		// score — delete-despite-rejection is pinned in
+		// TestFlowDecisionMatrix).
+		pi := &fakePi{resp: "SCORE:95\nWORD:xyzzy"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("completely clean text"))
+
+		assertNothingLearned(t, store)
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the delete is independent of the word rejection)", ops.deleted)
+		}
+	})
+}
+
+// TestFlowPhraseFastMatch — the phrase fast path (B): a stored phrase
+// matched as an EXACT consecutive run of the posted (or referenced)
+// content's folded tokens -> fast delete, zero pi asks. A SPLIT word
+// inside the phrase is NOT fast-matched (v1 is exact-consecutive only —
+// it falls to the slow path); a phrase spanning the message/reply
+// boundary is NOT matched (the sequences are scanned separately, never
+// concatenated).
+func TestFlowPhraseFastMatch(t *testing.T) {
+	t.Run("exact consecutive run: fast delete, zero asks, the decision row", func(t *testing.T) {
+		pi := &fakePi{}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			phrases: []string{"buy me a bike"},
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("who wants to buy me a bike"))
+
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want [[c1 msg1]] (the phrase fast path)", ops.deleted)
+		}
+		if pi.asks != 0 || pi.imageAsks != 0 {
+			t.Errorf("pi.asks = %d, pi.imageAsks = %d, want both 0 (zero asks)", pi.asks, pi.imageAsks)
+		}
+		// The decision row: path=fast, word=the phrase, deleted.
+		if len(store.decisions) != 1 {
+			t.Fatalf("decisions = %d rows, want exactly 1: %+v", len(store.decisions), store.decisions)
+		}
+		d := store.decisions[0]
+		if d.Path == nil || *d.Path != "fast" {
+			t.Errorf("path = %v, want fast", d.Path)
+		}
+		if d.Word == nil || *d.Word != "buy me a bike" {
+			t.Errorf("word = %v, want buy me a bike", d.Word)
+		}
+		if !d.Deleted {
+			t.Errorf("deleted = false, want true")
+		}
+		if d.RejectReason != nil {
+			t.Errorf("reject_reason = %v, want nil", *d.RejectReason)
+		}
+	})
+	t.Run("curation casing: the folded phrase matches", func(t *testing.T) {
+		// Curation is SQL-only, so operator casing is a real case: the
+		// curated phrase is folded (FoldToASCII + edge trim) before the
+		// window match, so "Buy me a bike" matches the folded "buy".
+		pi := &fakePi{}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			phrases: []string{"Buy me a bike"},
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("who wants to buy me a bike."))
+
+		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+			t.Errorf("deleted = %v, want one (the curated casing folds; the trailing . trims)", ops.deleted)
+		}
+		if pi.asks != 0 {
+			t.Errorf("pi.asks = %d, want 0", pi.asks)
+		}
+	})
+	t.Run("a SPLIT word inside the phrase: NOT fast-matched, falls to the slow path", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			phrases: []string{"buy me a bike"},
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("who wants to buy me a b i k e"))
+
+		if len(ops.deleted) != 0 {
+			t.Errorf("deleted = %v, want none (a split word is not exact-consecutive)", ops.deleted)
+		}
+		if pi.asks != 1 {
+			t.Errorf("pi.asks = %d, want 1 (fell to the slow path)", pi.asks)
+		}
+	})
+	t.Run("a phrase spanning the message/reply boundary: NOT matched", func(t *testing.T) {
+		// The posted + referenced sequences are scanned SEPARATELY, never
+		// concatenated: a phrase that would match across the boundary
+		// must not fast-hit.
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			phrases: []string{"to buy me a bike"},
+		}
+		ops := &fakeOps{ref: &discordgo.Message{Content: "me a bike"}}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(msgWithRef("who wants to buy"))
+
+		if len(ops.deleted) != 0 {
+			t.Errorf("deleted = %v, want none (the phrase spans the message/reply boundary)", ops.deleted)
+		}
+		if pi.asks != 1 {
+			t.Errorf("pi.asks = %d, want 1 (fell to the slow path)", pi.asks)
+		}
+	})
 }

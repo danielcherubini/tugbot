@@ -868,7 +868,7 @@ func (h *Derpies) downloadImages(ctx context.Context, m *discordgo.Message, clie
 // the filter never runs with a broken prompt.
 const defaultPromptTemplate = `A Discord message was just posted by a user with a documented history of spamming this server with a ROTATING ROSTER of short, repetitive, annoying gimmicks — and of evading, over and over, the word filters built to catch them. He is notorious for this.
 
-HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge CLEAN only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between the two: GIMMICK. His messages are the filter's only queue, so err toward catching the roster, never toward letting it through.
+HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge it innocent only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between two bands: score toward the HIGHER side. His messages are the filter's only queue, so err toward catching the roster, never toward letting it through.
 
 {content}
 {{EMBED}}
@@ -885,33 +885,42 @@ Techniques he uses — in any combination; judge on ALL of them at once:
 - ASK-PHRASING (the core of the roster): asking OTHER users to buy/give him something — a Zwift subscription, a free bicycle, a "gift" keyed to a known word — OR a fresh short repetitive solicitation in the same style (a FRESH gimmick in the roster style counts).
 - QUOTING/REFERENCING: replying to or quoting one of his own earlier messages so the gimmick lives in the quote (quoted text counts as part of the message).
 - IMAGES: the gimmick inside an attached/quoted screenshot or pasted image (images arrive with the message for you to read; a word visible in an image counts as if it were written).
+- EMOJI-ENCODING: a sequence of emojis whose COMBINED meaning is a roster solicitation (💸 + 🚵 = "buy me a bike" = zwift; 💰 + a face + 🚲 = "buy me a bike"). Judge the COMBINATION, not the individual emojis — a single emoji (money, a bike, a face) is harmless alone; the combo is the gimmick. A combo that plainly means a roster solicitation scores 90-100.
 
 {{IMAGES}}
 {{REF}}
 
 His gimmicks are short, repetitive solicitations he posts over and over. Example from the roster: trying to get other users to buy HIM a Zwift subscription, or to give him a free bicycle. The roster rotates — old gimmicks come back — so the known-word list below spans EVERY past gimmick, not just the current one.
 
+Scoring scale (score the WHOLE message, all techniques at once):
+- 90-100: an unambiguous roster solicitation — a known word as-is (any script), or a combo (emoji/image/text) that plainly means one.
+- 60-89: a clear trace — a recognizable respelling / squeeze / split / foreign-script rendering of a known word, or a solicitation phrasing in the roster style.
+- 40-59: a possible trace — a bent letter, a partial pattern, a combo that could go either way.
+- 0-39: no meaningful trace — a plainly innocent reading.
+
 Known gimmick words (each was the anchor word of a past gimmick; respellings of them are how he dodges the fast filter):
 {known}
 
 Judgement rules (these override politeness):
-- A known word or any respelling of one — even when the surrounding text looks mildly innocent — is GIMMICK.
-- A known word hidden inside another word, written in non-English letters, or shot full of punctuation and dashes is GIMMICK — dressing does not launder the word.
-- A KNOWN GIMMICK IN ANY LANGUAGE IS STILL A GIMMICK: he now posts the same roster in OTHER LANGUAGES (observed: Arabic دراجة زويفت / زويفت, Mandarin 骑行/飞快/长城, Persian دوچرخه). The roster is the MEANING — a message that asks someone to buy/give him a bicycle, a Zwift subscription, or riding gear, in any script, language, or wording, is GIMMICK. Translate the message in your head and judge what it MEANS, never let the script launder it.
-- An anchor word embedded inside a squeeze/blend is GIMMICK; the anchor word is the most distinctive token of the blend AS IT APPEARS.
-- If you have to imagine an innocent reading to call it CLEAN, you are probably wrong — he is very good at making solicitations look like questions.
-- When you are torn: GIMMICK.
+- A known word or any respelling of one — even when the surrounding text looks mildly innocent — is a GIMMICK (score it 60-100 by the scale).
+- A known word hidden inside another word, written in non-English letters, or shot full of punctuation and dashes is a GIMMICK — dressing does not launder the word.
+- A KNOWN GIMMICK IN ANY LANGUAGE IS STILL A GIMMICK: he now posts the same roster in OTHER LANGUAGES (observed: Arabic دراجة زويفت / زويفت, Mandarin 骑行/飞快/长城, Persian دوچرخه). The roster is the MEANING — a message that asks someone to buy/give him a bicycle, a Zwift subscription, or riding gear, in any script, language, or wording, is a GIMMICK. Translate the message in your head and judge what it MEANS, never let the script launder it.
+- An anchor word embedded inside a squeeze/blend is a GIMMICK; the anchor word is the most distinctive token of the blend AS IT APPEARS.
+- If you have to imagine an innocent reading to score it 0-39, you are probably wrong — he is very good at making solicitations look like questions.
+- When you are torn between two bands: score toward the HIGHER side.
 
-Reply with EXACTLY one line, one of:
-  GIMMICK:<word>
-  CLEAN
+Reply with one or two lines — the SCORE line always, the WORD line only when
+the message carries a real trace (score >= 40):
+  SCORE:<0-100>
+  WORD:<anchor>
 where <word> is the anchor word: the as-appears respelled token for a known-gimmick trace, or the single most distinctive word of the fresh gimmick. The rules for <word>:
-- It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift").
-- When the anchor is in a NON-LATIN script, answer the message's OWN foreign-script token as it appears (e.g. زويفت, دراجة, 骑行, دوچرخه) — NEVER the English-known-word translation unless that English word literally appears in the message. "GIMMICK:zwift" for a message containing only زويفت is the INVALID answer; "GIMMICK:زويفت" is correct.
-- For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "GIMMICK:swift" for it is the INVALID answer. Never answer a known word that is not in the message. The same rule holds across scripts: a foreign-script rendering of a known word is answered by its OWN script token, never by the English base.
+- It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift") — EXCEPT when the gimmick lives ONLY in the emojis (the message has no other text words): then answer the most distinctive word of what the emojis MEAN (e.g. "zwift" for 💸🚵).
+- When the anchor is in a NON-LATIN script, answer the message's OWN foreign-script token as it appears (e.g. زويفت, دراجة, 骑行, دوچرخه) — NEVER the English-known-word translation unless that English word literally appears in the message. "zwift" for a message containing only زويفت is the INVALID answer; "زويفت" is correct.
+- For a respelling, answer the respelled token AS IT APPEARS. NEVER answer the base/known word unless that base token itself appears in the message text — for "zwift" the answer is "zwift"; "swift" for it is the INVALID answer. Never answer a known word that is not in the message. The same rule holds across scripts: a foreign-script rendering of a known word is answered by its OWN script token, never by the English base.
 - For a SPLIT word (letters spread over spaces or symbols between its letters), answer the COLLAPSED form — the letters joined without the spacing: "z w i f t" -> "zwift", "g i v e" -> "give". Never the spaced form; the spaced form is not a valid answer.
 - When the anchor word lives ONLY in an image, answer the most distinctive word of that image as if it were in the message.
-- CLEAN only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
+- When the anchor word lives ONLY in the emojis (the message has no other text words), answer the most distinctive word of what the emojis MEAN (e.g. "zwift" for 💸🚵) — not a token of the message.
+- Score 0-39 only when the message carries NO trace of the roster at all and the innocent reading is obvious.`
 
 // validTemplate: the two MANDATORY literal markers are present. Absent
 // optional markers ({{IMAGES}} / {{GIFS}} / {{REF}} / {{EMBED}}) are fine — the element
@@ -937,11 +946,13 @@ func validTemplate(t string) bool {
 // re-trigger a marker scan — a title that literally contained
 // "\x00EMBEDTITLES\x00" would at worst swap inertly. The
 // fence and the images line / gif-frames block / referenced block bytes are code-pinned — the
-// template carries only the bare markers.
-// (`known` arrives sorted from the flow — sortedKeys — and is joined one
-// per line; the pi RPC always appends the anti-injection system fallback on
-// top of this.)
-func gimmickPrompt(tmpl string, content string, known []string, nImages, nGifFrames int, embedTitles string, refText string) string {
+// template carries only the bare markers. The {known} block carries a
+// second sub-block for the stored phrases (the optimizer): the phrases
+// sub-block is emitted ONLY when phrases exist, appended after the
+// words; the words sub-block is unchanged. (`known` arrives sorted from
+// the flow — sortedKeys — and is joined one per line; the pi RPC always
+// appends the anti-injection system fallback on top of this.)
+func gimmickPrompt(tmpl string, content string, known []string, nImages, nGifFrames int, embedTitles string, refText string, phrases []string) string {
 	// Pass 1: markers -> NUL-wrapped placeholders, template only.
 	marked := tmpl
 	marked = strings.ReplaceAll(marked, "{content}", "\x00CONTENT\x00")
@@ -960,6 +971,14 @@ func gimmickPrompt(tmpl string, content string, known []string, nImages, nGifFra
 	knownBlock := ""
 	if len(known) > 0 {
 		knownBlock = "-----< known gimmick words (sorted ascending) >-----\n" + strings.Join(known, "\n")
+	}
+	// The phrases sub-block (the optimizer): appended after the words,
+	// emitted ONLY when phrases exist (the words sub-block is unchanged).
+	if len(phrases) > 0 {
+		if knownBlock != "" {
+			knownBlock += "\n"
+		}
+		knownBlock += "-----< known gimmick phrases (exact multi-word patterns) >-----\n" + strings.Join(phrases, "\n")
 	}
 	out = strings.ReplaceAll(out, "\x00KNOWN\x00", knownBlock)
 	var imagesBlock string
@@ -982,6 +1001,44 @@ func gimmickPrompt(tmpl string, content string, known []string, nImages, nGifFra
 		refBlock = "<<<REFERENCED MESSAGE\n" + refText + "\nREFERENCED MESSAGE>>>\nThe message replies to a previous message (often the author's own) — the quoted content is above between the REFERENCED MESSAGE markers. Judge the posted text / images AND the quoted content together; a respelling may live in the quote rather than the new message."
 	}
 	return strings.ReplaceAll(out, "\x00REF\x00", refBlock)
+}
+
+// phraseWindowMatch: does the phrase's folded token sequence appear as an
+// EXACT consecutive run of the content's folded token sequence? (v1 is
+// exact-consecutive only — a SPLIT word inside the phrase does not
+// match.) Both sequences are already folded (FoldToASCII + edge-punct
+// trim), so the comparison is a plain string match — a curated "Buy me a
+// bike" matches the posted "buy".
+func phraseWindowMatch(seq, phrase []string) bool {
+	if len(phrase) == 0 || len(seq) < len(phrase) {
+		return false
+	}
+	for i := 0; i+len(phrase) <= len(seq); i++ {
+		match := true
+		for j := range phrase {
+			if seq[i+j] != phrase[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// strPtr — a pointer to a string (the decision record's nullable fields
+// take a pointer per rejection reason).
+func strPtr(s string) *string { return &s }
+
+// recordDecision — the decision log's best-effort write (C): a failure
+// logs (module derpies) and does not abort — the delete/learn already
+// happened.
+func (h *Derpies) recordDecision(ctx context.Context, m *discordgo.Message, d *decisionRecord) {
+	if err := h.store.recordDecision(ctx, d); err != nil {
+		slog.Error("derpies decision record failed", "module", module, "message", m.ID, "error", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1076,19 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	}
 	slog.Info("derpies message from filtered user", "module", module, "user", m.Author.ID, "guild", m.GuildID)
 
+	// The decision log (C): one defer for every terminal arm — the
+	// pointer is captured at defer-time, so the flow populates dec as it
+	// progresses and the deferred write sees the final state. Pre-gate
+	// arms (feature off, not a guild, author not gated) returned before
+	// this point and write no row.
+	dec := &decisionRecord{
+		MessageID: m.ID,
+		ChannelID: m.ChannelID,
+		AuthorID:  m.Author.ID,
+		Content:   m.Content,
+	}
+	defer h.recordDecision(ctx, m, dec)
+
 	// 3.5 Referenced message (reply/quote-reply): one REST GET (mention
 	//     parity, via the discordOps seam). On failure (already deleted,
 	//     rate limit) log and continue WITHOUT a reference — never abort
@@ -1040,6 +1110,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	list, err := h.store.listGimmicks(ctx)
 	if err != nil {
 		slog.Error("derpies gimmick list fetch failed", "module", module, "error", err)
+		dec.RejectReason = strPtr("list fetch failed")
 		return
 	}
 	toks := tokensForMatch(m.Content)
@@ -1062,12 +1133,59 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	}
 	for tok := range toks {
 		if list[tok] {
+			fast := "fast"
+			dec.Path = &fast
+			dec.Word = &tok
 			if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
 				slog.Error("derpies delete (fast) failed", "module", module, "word", tok, "channel", m.ChannelID, "message", m.ID, "error", err)
+				dec.RejectReason = strPtr("delete failed")
 			} else {
 				slog.Info("derpies delete (fast)", "module", module, "word", tok, "channel", m.ChannelID, "message", m.ID)
+				dec.Deleted = true
 			}
 			return
+		}
+	}
+
+	// 4b. Phrase fast path (the optimizer): the stored multi-word phrases
+	//     (derpies_gimmick_phrases, manual-only) matched as an EXACT
+	//     consecutive run of the folded token sequence — a curated phrase
+	//     hits with zero asks, the same way the word fast path does. A
+	//     fetch error skips the phrase match (log + continue to the slow
+	//     path — never act on a half-loaded phrase list). The posted and
+	//     the referenced content are scanned SEPARATELY, never
+	//     concatenated (a phrase spanning the message/reply boundary must
+	//     not match); embed titles are NOT scanned for phrases in v1. A
+	//     SPLIT word inside a phrase is NOT fast-matched (v1 is
+	//     exact-consecutive only — it falls to the slow path).
+	var phrases []string
+	if pl, err := h.store.listPhrases(ctx); err != nil {
+		slog.Error("derpies phrase list fetch failed", "module", module, "error", err)
+	} else {
+		phrases = pl
+		postSeq := foldedTokenSequence(m.Content)
+		var refSeq []string
+		if referenced != nil {
+			refSeq = foldedTokenSequence(referenced.Content)
+		}
+		for _, phrase := range phrases {
+			phr := foldedTokenSequence(phrase)
+			if len(phr) == 0 {
+				continue // a phrase with no non-empty tokens matches nothing
+			}
+			if phraseWindowMatch(postSeq, phr) || (refSeq != nil && phraseWindowMatch(refSeq, phr)) {
+				fast := "fast"
+				dec.Path = &fast
+				dec.Word = &phrase
+				if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
+					slog.Error("derpies delete (fast phrase) failed", "module", module, "phrase", phrase, "channel", m.ChannelID, "message", m.ID, "error", err)
+					dec.RejectReason = strPtr("delete failed")
+				} else {
+					slog.Info("derpies delete (fast phrase)", "module", module, "phrase", phrase, "channel", m.ChannelID, "message", m.ID)
+					dec.Deleted = true
+				}
+				return
+			}
 		}
 	}
 
@@ -1096,6 +1214,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	//    degradation path, same shape).
 	if h.app.Pi == nil {
 		slog.Info("derpies pi RPC not available, skipping", "module", module)
+		dec.RejectReason = strPtr("pi unavailable")
 		return
 	}
 
@@ -1135,7 +1254,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		}
 		embedTitles = strings.Join(lines, "\n")
 	}
-	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), nGifFrames, embedTitles, refContent)
+	prompt := gimmickPrompt(tmpl, m.Content, sortedKeys(list), len(images), nGifFrames, embedTitles, refContent, phrases)
 	var (
 		text   string
 		askErr error
@@ -1147,99 +1266,124 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	}
 	if askErr != nil {
 		slog.Error("derpies pi ask failed", "module", module, "error", askErr)
+		dec.RejectReason = strPtr("ask failed")
 		return
 	}
 
-	// 8. Parse the verdict.
-	kind, word := parseVerdict(text)
-	switch kind {
-	case "clean":
-		slog.Info("derpies verdict clean", "module", module, "message", m.ID)
-		return
-	case "unknown":
+	// 8. Parse the verdict (the score model). No valid SCORE line -> the
+	//    existing degradation arm: log + do nothing (a legacy CLEAN / old
+	//    GIMMICK verdict carries no score line and is unrecognized here —
+	//    the nickname flow still parses those via parseVerdict).
+	score, hasScore, word := parseVerdictScore(text)
+	if !hasScore {
 		slog.Warn("derpies unrecognized verdict — doing nothing", "module", module, "verdict", strings.TrimSpace(text))
+		dec.RejectReason = strPtr("unrecognized verdict")
 		return
 	}
 
-	// 9. SANITY before learning: the two-arm gate (ADR 0008), on the FOLDED
-	//    verdict word (the shipped form), plus the shared pure-digit
-	//    precondition:
-	//      - SHARED — a pure digit string is NEVER a valid verdict word
-	//        (the twist word must contain at least one letter): "12345"
-	//        is invalid on both arms.
-	//      - ARM (a) ASCII — the unchanged wordValid ^[a-z0-9]{2,32}$
-	//        stored-space contract — plus: when the (union of posted +
-	//        referenced + embed-title) text has tokens, the folded word
-	//        must have appeared as a folded token of that text (same
-	//        tokenization as the fast path). A message with NO text tokens
-	//        at all (image-only, or empty text with an empty/absent
-	//        reference) is bounded by wordValid alone: the verdict word may
-	//        come from image text (the message is being filtered — a wrong
-	//        word can only delete the gated user's own future message
-	//        containing that word).
-	//      - ARM (b) non-ASCII — for a word whose folded form is NOT
-	//        wordValid (e.g. letters with NO Latin confusable, like Arabic
-	//        خفيف — the fold passes it through unchanged), the
-	//        ONLY accepted path is text-anchored: the word must be a
-	//        plausible shaped word (letters-only — every rune in the
-	//        combined Unicode L category: no whitespace, no punctuation, no
-	//        digits — 2..32 runes, so at least one letter) AND a VERBATIM
-	//        folded token of the judged text (the toks[fw] hit; the fold
-	//        leaves a no-confusable script like خفيف unchanged, so a
-	//        verbatim خفيف in the message hits that exact key). A
-	//        non-ASCII verdict word therefore can never act on a textless
-	//        (image-only / frame-only) post — frame-only words remain the
-	//        ADR 0007 dead-end, deliberately NOT relaxed.
-	//    A hallucinated word can never enter the list.
-	//    The verdict word is FOLDED and its whitespace COLLAPSED
-	//    (foldVerdictWord — the SPLIT evasion: "z w i f t" normalizes to
-	//    "zwift" before the gate, so a spaced split verdict is anchored to
-	//    the collapsed run and learns the collapsed form).
-	fw := foldVerdictWord(word)
-	if fw == "" {
-		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
-		return
+	// The live threshold T (derpies_config, one row; the store clamps a
+	// valid-but-out-of-range read). A DB error OR a missing row degrades
+	// to the default — the matrix still runs on it.
+	t, err := h.store.configThreshold(ctx)
+	if err != nil {
+		t = defaultThreshold
+		slog.Warn("derpies config threshold unavailable — using default", "module", module, "error", err)
 	}
-	if allDigitVerdict(fw) {
-		slog.Warn("derpies all-digit verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
-		return
-	}
-	asc := wordmatch.WordValid(fw)
-	if !asc && !unicodeVerdictShape(fw) {
-		slog.Warn("derpies invalid verdict word — doing nothing", "module", module, "word", word, "message", m.ID)
-		return
-	}
-	hasTextTokens := false
-	for tok := range toks {
-		if tok != "" {
-			hasTextTokens = true
-			break
+	slowPath := "slow"
+	dec.Path = &slowPath
+	dec.Score = &score
+	dec.Threshold = &t
+
+	// 9. Learn (independent of the delete), gated on score >= learnFloor:
+	//    the two-arm gate (ADR 0008) on the FOLDED verdict word — the
+	//    SPLIT evasion: foldVerdictWord collapses the whitespace, so a
+	//    spaced split verdict ("z w i f t") normalizes to "zwift" before
+	//    the gate, is anchored to the collapsed run, and learns the
+	//    collapsed form. The gate: the shared pure-digit precondition
+	//    (a twist word must contain at least one letter), arm (a)
+	//    wordValid, arm (b) unicodeVerdictShape — with the anchor
+	//    requirement scoped to the POSTED message's word-like tokens
+	//    (the emoji fix A): a mention-snowflake (all-digit) / emoji-ref
+	//    (colon) / pure-emoji token (folds to "") is not word-like, so a
+	//    "mention + emoji" post is judged like an image-only post — a
+	//    valid ASCII word passes wordValid alone and the score decides.
+	//    A rejection only stops the LEARN — the delete (step 10) is an
+	//    independent score, and a delete failure overrides any word-
+	//    rejection reason on the decision row.
+	if score >= learnFloor {
+		fw := foldVerdictWord(word)
+		switch {
+		case fw == "":
+			// An absent or whitespace-only word collapses to nothing:
+			// no valid word to learn.
+			slog.Warn("derpies invalid verdict word — not learning", "module", module, "word", word, "message", m.ID)
+			dec.RejectReason = strPtr("no valid word")
+		case allDigitVerdict(fw):
+			slog.Warn("derpies all-digit verdict word — not learning", "module", module, "word", word, "message", m.ID)
+			dec.RejectReason = strPtr("all-digit word")
+		default:
+			asc := wordmatch.WordValid(fw)
+			if !asc && !unicodeVerdictShape(fw) {
+				// Neither arm: not a plausible word shape at all.
+				slog.Warn("derpies invalid verdict word — not learning", "module", module, "word", word, "message", m.ID)
+				dec.RejectReason = strPtr("invalid word")
+			} else {
+				// The anchor gate (the emoji fix A): the anchor
+				// requirement applies only when the POSTED message
+				// carries word-like text tokens (the prompt's "the
+				// message has no other text words" scope) — hasWordLikeTokens
+				// is computed from the posted content ONLY. The anchor
+				// check itself still uses the UNION toks (posted +
+				// referenced + embed titles — the word may legitimately
+				// anchor to the quoted content). Arm (b) stays
+				// text-anchored on the same word-like scope: a non-ASCII
+				// word needs a word-like anchor, and a word-less post has
+				// none — the frame-only dead-end stays dead (ADR 0007).
+				hasWordLikeTokens := false
+				for tok := range tokensForMatch(m.Content) {
+					if wordLike(tok) {
+						hasWordLikeTokens = true
+						break
+					}
+				}
+				if hasWordLikeTokens && !toks[fw] {
+					slog.Warn("derpies verdict word not in the message — not learning", "module", module, "word", word, "message", m.ID)
+					dec.RejectReason = strPtr("verdict word not in message")
+				} else if !asc && !hasWordLikeTokens {
+					slog.Warn("derpies non-ASCII verdict word not anchored to the message — not learning", "module", module, "word", word, "message", m.ID)
+					dec.RejectReason = strPtr("verdict word not in message")
+				} else {
+					// A hallucinated word can never enter the list: a pass
+					// means the word is a folded token of the judged text
+					// (or a word-less post, bounded by the shape arm alone
+					// — the message is being filtered, so a wrong word can
+					// only delete the gated user's own future message
+					// containing that word). Learn the FOLDED word (ASCII
+					// words stay pure-ASCII; no-confusable non-ASCII words
+					// fold to themselves and are matched by the fast path
+					// on exact token) so the next occurrence is a fast hit.
+					if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
+						slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
+					}
+					dec.Word = &fw
+					dec.Learned = true
+				}
+			}
 		}
 	}
-	if hasTextTokens && !toks[fw] {
-		slog.Warn("derpies verdict word not in the message — doing nothing", "module", module, "word", word, "message", m.ID)
-		return
-	}
-	if !asc && !hasTextTokens {
-		// Arm (b) is text-anchored only: with no text tokens (image-only /
-		// empty text with no reference) a non-ASCII verdict word cannot
-		// be anchored — the frame-only dead-end stays dead (ADR 0007).
-		slog.Warn("derpies non-ASCII verdict word not anchored to the message — doing nothing", "module", module, "word", word, "message", m.ID)
-		return
-	}
 
-	// 10. Learn, then delete. Learn the FOLDED word (ASCII words stay
-	//     pure-ASCII; no-confusable non-ASCII words (ADR 0008) fold to
-	//     themselves and are matched by the fast path on exact token), so
-	//     the next occurrence of the respelling is a fast hit. A delete
-	//     failure is LOG ONLY — the word was actually used and stays
-	//     learned (the next occurrence is a fast hit).
-	if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
-		slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
-	}
-	if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
-		slog.Error("derpies delete (llm) failed", "module", module, "word", fw, "channel", m.ChannelID, "message", m.ID, "error", err)
-	} else {
-		slog.Info("derpies delete (llm) learned", "module", module, "word", fw, "channel", m.ChannelID, "message", m.ID)
+	// 10. Delete (independent of the learn), score >= T. A delete failure
+	//     is LOG ONLY — a word learned in step 9 stays learned (the next
+	//     occurrence is a fast hit); the failure overrides any word-
+	//     rejection reason on the decision row.
+	if score >= t {
+		if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
+			slog.Error("derpies delete (llm) failed", "module", module, "score", score, "channel", m.ChannelID, "message", m.ID, "error", err)
+			dec.Deleted = false
+			dec.RejectReason = strPtr("delete failed")
+		} else {
+			slog.Info("derpies delete (llm)", "module", module, "score", score, "channel", m.ChannelID, "message", m.ID)
+			dec.Deleted = true
+		}
 	}
 }

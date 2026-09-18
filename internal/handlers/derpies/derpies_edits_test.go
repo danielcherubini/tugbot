@@ -122,8 +122,8 @@ func TestEditFlowFastPath(t *testing.T) {
 }
 
 func TestEditFlowSlowPathLearnsDeletes(t *testing.T) {
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.editFlow(editEvent("holler at zswiftf now"))
@@ -269,8 +269,8 @@ func TestEditFlowFetchedSlowPathLearnsDeletes(t *testing.T) {
 	// The bare payload fetches; the fetched message carries NOVEL content
 	// (no seeded token) -> the slow path runs exactly once on the FETCHED
 	// message: one ask, one learn, one delete of the fetched ref's ID.
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{ref: &discordgo.Message{
 		ID: "m1", ChannelID: "c1", GuildID: "g1",
 		Author:  &discordgo.User{ID: editUser},

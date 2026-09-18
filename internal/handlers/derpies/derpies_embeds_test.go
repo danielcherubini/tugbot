@@ -106,7 +106,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 	known := []string{"bike"}
 
 	t.Run("titles set: the block is substituted, the payload marker survives exactly once", func(t *testing.T) {
-		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "some title", "")
+		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "some title", "", nil)
 		if !strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("prompt with titles must contain the TITLES OF MEDIA EMBEDDED block header:\n%s", got)
 		}
@@ -122,7 +122,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 	})
 
 	t.Run("empty titles: the block is absent", func(t *testing.T) {
-		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "", "")
+		got := gimmickPrompt(defaultPromptTemplate, "x {{EMBED}}", known, 0, 0, "", "", nil)
 		if strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("no-title form must not contain the TITLES OF MEDIA EMBEDDED block:\n%s", got)
 		}
@@ -130,7 +130,7 @@ func TestGimmickPromptEmbed(t *testing.T) {
 
 	t.Run("a template without {{EMBED}} degrades by omission (titles set)", func(t *testing.T) {
 		noEmbed := strings.ReplaceAll(defaultPromptTemplate, "{{EMBED}}\n", "")
-		got := gimmickPrompt(noEmbed, "x", known, 0, 0, "some title", "")
+		got := gimmickPrompt(noEmbed, "x", known, 0, 0, "some title", "", nil)
 		if strings.Contains(got, "TITLES OF MEDIA EMBEDDED") {
 			t.Errorf("a template without the {{EMBED}} marker must not contain the block (degradation by omission):\n%s", got)
 		}
@@ -144,24 +144,31 @@ func TestGimmickPromptEmbed(t *testing.T) {
 // The flow — embed titles join the judged text
 // ---------------------------------------------------------------------------
 
-func TestFlowFrameWordVerdictRejectedWhenTitleHasTokens(t *testing.T) {
-	// Pins the gate tightening: the post has a title (a title with NO list
-	// words), so hasTextTokens == true; a word that appears ONLY in an image
-	// frame is rejected — the same as a typed-text post. Pre-task-1 the same
-	// message was wordValid-only and learned; this is the intentional
-	// tightening. (The No-title image tests keep passing — their fixtures have
-	// no embed titles.)
+func TestFlowFrameWordVerdictPassesWhenPostedMessageHasNoWords(t *testing.T) {
+	// The anchor gate's scope change (the emoji fix A, generalized): the
+	// anchor requirement is scoped to the POSTED message's word-like
+	// tokens — the embed title's tokens no longer count as "the message
+	// has other text words". The post has NO text (content ""), so a
+	// valid ASCII word from the image frame passes wordValid alone: it
+	// is learned and deleted, the same as an image-only post. Pre-score-
+	// model this exact message was REJECTED (the title's tokens made the
+	// union non-empty and the frame word was not in them) — the score
+	// model's anchor scope is the intentional relaxation.
 	srv, _ := newImgServer(t)
-	pi := &fakePi{resp: "GIMMICK:frameword"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}} // empty word list
+	pi := &fakePi{resp: "SCORE:95\nWORD:frameword"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60} // empty word list
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	m := msgWithImage("", srv.URL+"/a.png") // plain image attachment
 	m.Embeds = []*discordgo.MessageEmbed{{Title: "an ordinary clip"}}
 	h.flow(m)
 
-	assertNothingLearned(t, store)
-	assertNoDeletes(t, ops)
+	if len(store.added) != 1 || store.added[0] != "frameword|llm" {
+		t.Errorf("added = %v, want [frameword|llm] (a word-less post's valid ASCII word passes wordValid alone)", store.added)
+	}
+	if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
+		t.Errorf("deleted = %v, want exactly one delete [[c1 msg1]]", ops.deleted)
+	}
 	if pi.imageAsks != 1 {
 		t.Errorf("pi.imageAsks = %d, want 1 (the word is judged from the frame)", pi.imageAsks)
 	}
@@ -188,10 +195,12 @@ func TestFlowEmbedTitleFastHitDeletes(t *testing.T) {
 
 func TestFlowEmbedTitleSlowPathLearnsAndDeletes(t *testing.T) {
 	// A novel respelling named only in the embed title: no fast hit, the
-	// slow path judges it, and the gate accepts the word because the title
-	// now IS judged text — learned (source 'llm') and the message deleted.
-	pi := &fakePi{resp: "GIMMICK:swwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// slow path judges it, and the gate accepts the word because the
+	// posted message has no word-like tokens (the anchor requirement
+	// drops — the title's tokens no longer count as "the message has
+	// other text words"): learned (source 'llm') and the message deleted.
+	pi := &fakePi{resp: "SCORE:95\nWORD:swwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsgEmbed("", "unusual swwift"))
@@ -212,10 +221,11 @@ func TestFlowEmbedTitleSlowPathLearnsAndDeletes(t *testing.T) {
 
 func TestFlowEmbedTitleWordNotLearnedWithoutTitle(t *testing.T) {
 	// Regression guard: a verdict word absent from ALL judged text (no
-	// embeds) is neither learned nor deleted — the gate is unchanged in
-	// kind.
-	pi := &fakePi{resp: "GIMMICK:swwift"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// embeds) is neither learned nor deleted — the anchor gate is
+	// unchanged in kind. The 40..T-1 band attempts the learn; the word
+	// rejection is what keeps it out.
+	pi := &fakePi{resp: "SCORE:45\nWORD:swwift"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(derpMsg("hello"))
