@@ -1,8 +1,8 @@
 // Package derpies is the filter for the user(s) in
 // config.Config.DerpiesUserIDs: a fast path (exact gimmick-word token
 // match against the derpies_gimmicks list) then a slow path (a pi RPC
-// verdict — CLEAN / GIMMICK:<word> — that learners new words into the
-// list at runtime).
+// verdict — SCORE:<0-100> (+ WORD:<anchor>) — scored against the decision
+// matrix, that learns new words into the list at runtime).
 package derpies
 
 import (
@@ -234,34 +234,6 @@ func TestTokensForMatch(t *testing.T) {
 
 	if got2 := tokensForMatch("SWIFT A"); len(got2) != 2 || !got2["swift"] || !got2["a"] {
 		t.Errorf("tokensForMatch(\"SWIFT A\") = %v, want {swift, a}", got2)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// parseVerdict
-// ---------------------------------------------------------------------------
-
-func TestParseVerdict(t *testing.T) {
-	tests := []struct {
-		in       string
-		wantKind string
-		wantWord string
-	}{
-		{"GIMMICK:sw1ft", "gimmick", "sw1ft"},
-		{"gimmick:SW1FT", "gimmick", "sw1ft"},
-		{"clean", "clean", ""},
-		{"\n  CLEAN  ", "clean", ""},
-		{"GIMMICK sw1ft", "unknown", ""}, // no colon
-		{"MAYBE", "unknown", ""},
-		{"", "unknown", ""},
-		{"GIMMICK: zswiftf", "gimmick", "zswiftf"}, // space after the colon: remainder trimmed
-		{"GIMMICK:", "gimmick", ""},                // empty word: the validity gate then rejects it
-	}
-	for _, tt := range tests {
-		kind, word := parseVerdict(tt.in)
-		if kind != tt.wantKind || word != tt.wantWord {
-			t.Errorf("parseVerdict(%q) = (%q, %q), want (%q, %q)", tt.in, kind, word, tt.wantKind, tt.wantWord)
-		}
 	}
 }
 

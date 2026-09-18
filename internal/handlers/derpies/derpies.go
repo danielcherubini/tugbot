@@ -1,10 +1,10 @@
 // Package derpies is the other-side filter for the user(s) in
 // config.Config.DerpiesUserIDs: every message they post is first checked
 // against the derpies_gimmicks word list (fast path — exact token match);
-// a miss falls through to a pi RPC verdict (the slow path) that judges
-// respellings / fresh gimmicks and learners new words into the list at
-// runtime (a GIMMICK:<word> verdict learns <word> with source 'llm' and
-// deletes the message).
+// a miss falls through to a pi RPC verdict (the slow path) that scores
+// respellings / fresh gimmicks against the decision matrix (learn at
+// score >= 40, delete at score >= T) and learners new words into the list
+// at runtime.
 //
 // Degradation discipline (mirroring the mention feature): every failure
 // arm logs and stops — the flow never acts on a half-loaded list, and a
@@ -415,32 +415,6 @@ func tokensForMatch(content string) map[string]bool {
 	}
 	flush()
 	return out
-}
-
-// parseVerdict: scan the lines of the pi response, take the FIRST non-empty
-// (trimmed) line; "clean" (case-insensitive, exact) -> ("clean", "");
-// prefix "gimmick:" (case-insensitive) -> ("gimmick", remainder trimmed and
-// lowercased); anything else, including "GIMMICK" WITHOUT the colon, ->
-// ("unknown", "").
-//
-// (The binary parser — the message + nickname flows move to
-// parseVerdictScore in Tasks 2–3; it is removed in Task 3.)
-func parseVerdict(text string) (kind, word string) {
-	for _, line := range strings.Split(text, "\n") {
-		l := strings.TrimSpace(line)
-		if l == "" {
-			continue
-		}
-		lower := strings.ToLower(l)
-		if lower == "clean" {
-			return "clean", ""
-		}
-		if strings.HasPrefix(lower, "gimmick:") {
-			return "gimmick", strings.ToLower(strings.TrimSpace(strings.TrimPrefix(lower, "gimmick:")))
-		}
-		return "unknown", ""
-	}
-	return "unknown", ""
 }
 
 // parseVerdictScore: the score-model verdict parser. Scans ALL lines (not
@@ -1272,8 +1246,8 @@ func (h *Derpies) flow(m *discordgo.Message) {
 
 	// 8. Parse the verdict (the score model). No valid SCORE line -> the
 	//    existing degradation arm: log + do nothing (a legacy CLEAN / old
-	//    GIMMICK verdict carries no score line and is unrecognized here —
-	//    the nickname flow still parses those via parseVerdict).
+	//    GIMMICK verdict carries no score line and is unrecognized here;
+	//    the nickname flow parses the same way).
 	score, hasScore, word := parseVerdictScore(text)
 	if !hasScore {
 		slog.Warn("derpies unrecognized verdict — doing nothing", "module", module, "verdict", strings.TrimSpace(text))
