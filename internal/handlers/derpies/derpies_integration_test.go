@@ -483,6 +483,26 @@ func TestMigration000005AppliesAndSeeds(t *testing.T) {
 		t.Errorf("derpies_config_threshold_check contype = %q, want c", contype)
 	}
 
+	// 5a-bis. The singleton CHECK (id = 1): the constraint exists AND a
+	//         second row is actually rejected (the finding's concern — a
+	//         stray operator row must not be insertable).
+	var singletonContype string
+	if err := pool.QueryRow(ctx,
+		`SELECT contype::text FROM pg_constraint WHERE conname = 'derpies_config_singleton_check'`).Scan(&singletonContype); err != nil {
+		t.Errorf("derpies_config_singleton_check: %v (missing?)", err)
+		return
+	}
+	if singletonContype != "c" {
+		t.Errorf("derpies_config_singleton_check contype = %q, want c", singletonContype)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO derpies_config (id, delete_threshold) VALUES (2, 60)`); err == nil {
+		t.Errorf("inserting a second derpies_config row (id=2) succeeded, want the singleton CHECK to reject it")
+		// Clean up the stray row (if it slipped through) so the test is rerunnable.
+		if _, err := pool.Exec(context.Background(), `DELETE FROM derpies_config WHERE id = 2`); err != nil {
+			t.Errorf("cleanup stray derpies_config row: %v", err)
+		}
+	}
+
 	// 5b. derpies_gimmick_phrases: the UNIQUE (phrase) constraint.
 	var phraseContype string
 	if err := pool.QueryRow(ctx,

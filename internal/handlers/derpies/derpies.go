@@ -207,7 +207,9 @@ var errConfigThresholdMissing = errors.New("derpies_config row missing")
 
 func (p *poolStore) configThreshold(ctx context.Context) (int, error) {
 	var v int
-	err := p.pool.QueryRow(ctx, `SELECT delete_threshold FROM derpies_config LIMIT 1`).Scan(&v)
+	// Target the singleton row explicitly (id = 1, enforced by the DDL's
+	// CHECK) rather than LIMIT 1 — a stray second row can never be picked.
+	err := p.pool.QueryRow(ctx, `SELECT delete_threshold FROM derpies_config WHERE id = 1`).Scan(&v)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, errConfigThresholdMissing
@@ -1382,11 +1384,17 @@ func (h *Derpies) flow(m *discordgo.Message) {
 					// words stay pure-ASCII; no-confusable non-ASCII words
 					// fold to themselves and are matched by the fast path
 					// on exact token) so the next occurrence is a fast hit.
+					// Record the verdict word always (it passed the gate);
+					// mark it learned only when the insert succeeds — a failed
+					// insert is recorded separately (reject_reason) so the
+					// decision log never reports a failed learn as successful.
+					dec.Word = &fw
 					if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
 						slog.Error("derpies add gimmick failed", "module", module, "word", fw, "error", err)
+						dec.RejectReason = strPtr("learn failed")
+					} else {
+						dec.Learned = true
 					}
-					dec.Word = &fw
-					dec.Learned = true
 				}
 			}
 		}

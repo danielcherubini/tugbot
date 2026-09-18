@@ -35,6 +35,10 @@ ALTER SEQUENCE public.derpies_config_id_seq OWNED BY public.derpies_config.id;
 ALTER TABLE ONLY public.derpies_config ALTER COLUMN id SET DEFAULT nextval('public.derpies_config_id_seq'::regclass);
 ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_threshold_check CHECK (delete_threshold BETWEEN 41 AND 100);
+-- Enforce the singleton: the config is a single row (id = 1). A second
+-- insert is rejected, so the runtime `SELECT ... WHERE id = 1` can never
+-- pick an arbitrary row.
+ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_singleton_check CHECK (id = 1);
 INSERT INTO public.derpies_config (id, delete_threshold) VALUES (1, 50);
 
 -- derpies_decisions (append-only — one row per judged message/edit)

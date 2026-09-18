@@ -39,6 +39,9 @@ type fakeStore struct {
 	// listPhrases returns phrases (+ phrasesErr).
 	phrases    []string
 	phrasesErr error
+	// addGimmick returns addGimmickErr if set (the learn-failure degrade
+	// — a failed insert must not be recorded as a successful learn).
+	addGimmickErr error
 	// recordDecision returns recordErr if set; otherwise appends a COPY of
 	// the record to decisions (later mutations must not alias).
 	recordErr error
@@ -60,6 +63,9 @@ func (s *fakeStore) listGimmicks(_ context.Context) (map[string]bool, error) {
 }
 
 func (s *fakeStore) addGimmick(_ context.Context, word, source string) error {
+	if s.addGimmickErr != nil {
+		return s.addGimmickErr
+	}
 	s.added = append(s.added, word+"|"+source)
 	return nil
 }
@@ -1703,6 +1709,61 @@ func TestFlowDecisionMatrix(t *testing.T) {
 		assertNothingLearned(t, store)
 		if len(ops.deleted) != 1 || ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "msg1" {
 			t.Errorf("deleted = %v, want [[c1 msg1]] (delete-despite-rejection)", ops.deleted)
+		}
+	})
+}
+
+// TestFlowLearnFailure — a failed addGimmick insert must NOT be recorded
+// as a successful learn: the decision row carries the verdict word but
+// learned=false + a distinct reject_reason, so read_derpies_decisions never
+// hides why the next occurrence requires another model review.
+func TestFlowLearnFailure(t *testing.T) {
+	t.Run("addGimmick failure: not learned, reject_reason set, delete still fires", func(t *testing.T) {
+		// The word is valid + anchored + the score is >= T, but the insert
+		// fails: the decision must NOT report a successful learn.
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60, addGimmickErr: errors.New("db down")}
+		h := newTestDerpies(store, &fakeOps{}, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		if len(store.decisions) != 1 {
+			t.Fatalf("decisions = %d rows, want 1: %+v", len(store.decisions), store.decisions)
+		}
+		d := store.decisions[0]
+		if d.Learned {
+			t.Errorf("learned = true, want false (the insert failed)")
+		}
+		if d.Word == nil || *d.Word != "zswiftf" {
+			t.Errorf("word = %v, want zswiftf (the verdict word is recorded)", d.Word)
+		}
+		if d.RejectReason == nil || *d.RejectReason != "learn failed" {
+			t.Errorf("reject_reason = %v, want 'learn failed' (the failure is recorded separately)", d.RejectReason)
+		}
+		if !d.Deleted {
+			t.Errorf("deleted = false, want true (the delete is independent of the learn)")
+		}
+	})
+	t.Run("addGimmick + delete failure: delete failure overrides reject_reason", func(t *testing.T) {
+		// Both the learn and the delete fail: the delete failure is the
+		// more significant outcome and overrides the learn-failure reason.
+		pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60, addGimmickErr: errors.New("db down")}
+		ops := &fakeOps{delErr: errors.New("delete failed")}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("holler at zswiftf now"))
+
+		if len(store.decisions) != 1 {
+			t.Fatalf("decisions = %d rows, want 1: %+v", len(store.decisions), store.decisions)
+		}
+		d := store.decisions[0]
+		if d.Learned {
+			t.Errorf("learned = true, want false (the insert failed)")
+		}
+		if d.RejectReason == nil || *d.RejectReason != "delete failed" {
+			t.Errorf("reject_reason = %v, want 'delete failed' (overrides the learn failure)", d.RejectReason)
+		}
+		if d.Deleted {
+			t.Errorf("deleted = true, want false (the delete failed)")
 		}
 	})
 }
