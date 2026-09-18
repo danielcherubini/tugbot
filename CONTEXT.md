@@ -16,6 +16,26 @@ _Avoid_: 1:1 port, literal port, full rewrite
 An obfuscated token (e.g. `sw1ft`) that Derpie uses to evade the derpies filter's word matching. Persisted in the `derpies_gimmicks` table with `source` distinguishing `seed` (migration-seeded), `llm` (learnt at runtime via the pi RPC verdict), and `manual` (curated at runtime via the `/gimmick` slash command). Matched by lowercase, punctuation-trimmed exact token match — never substring.
 _Avoid_: blocklist entry, banned word, filter entry
 
+**Gimmick score**
+The LLM's 0–100 judgement of how much of a gimmick a derpies message is — the combo judgement (a harmless emoji alone vs. a soliciting combination). Returned as the `SCORE:` line of the slow-path verdict; the code thresholds it (learn floor, delete threshold). Persisted in the decision record.
+_Avoid_: confidence, verdict score, risk score
+
+**Delete threshold**
+The operator's live-tunable dial for derpies deletion (T): a message scoring ≥ T is deleted. Stored in `derpies_config.delete_threshold` (single row, default 50), fetched per-message like the prompt and the word list — tunable via SQL/MCP with no deploy.
+_Avoid_: cutoff, score limit, delete floor
+
+**Learn floor**
+The code-constant confidence floor (L=40) for learning a derpies word: a message scoring ≥ L is a "real trace" whose anchor word is learned (subject to the anchor gate); below L nothing is learned or deleted.
+_Avoid_: learn threshold, word floor
+
+**Word-like token**
+A derpies token that could be a verdict word: a valid non-digit word (`wordValid`, not `allDigitVerdict`) or a valid non-ASCII shape (`unicodeVerdictShape`). A mention snowflake, a custom-emoji ref, or a pure-emoji token is NOT word-like — a message with no word-like tokens is judged like an image-only post (the anchor gate is skipped).
+_Avoid_: valid token, matchable token
+
+**Decision record**
+A row in `derpies_decisions`: one per judged message/edit (append-only — an edit of the same `message_id` is a new row). Carries the posted content, the path (fast/slow), the gimmick score, the delete threshold applied, the anchor word, and the `learned`/`deleted`/`reject_reason` outcomes. The input to the improve-over-time loop (curate phrases/words, tune the threshold from observed scores).
+_Avoid_: verdict log, audit row, judgement row
+
 **Derpies filter**
 The Go bot's own original feature: silently deletes messages from author IDs in `TUGBOT_DERPIES_USER_IDS` via a fast-path token match against `derpies_gimmicks`, falling back on a fast-path miss to a pi RPC `GIMMICK:<word>` / `CLEAN` verdict that persists valid words back into the table. It also re-judges `GuildMessageUpdate` by a gated author — the full flow on the updated content (at most one ask per edit). The slow-path prompt carries the FULL known gimmick list (already in memory from the fast-path fetch) so the LLM pattern-matches respellings against the known family — the list lives in the DB, not in a static skills/ file. The only action is `DeleteMessage` — no bot response, no reaction, no gulag involvement on any message- or edit- path (the nickname flow's action is the member-reset PATCH — see **Nickname reset**). Repeated images are re-judged, never fast-deleted: the 2026-09-08 repeat-image fast delete (flow 4.6 — seen-content cache, zero-ask re-post delete) was REMOVED on 2026-09-10 (operator decision 2026-09-10) — a post carrying an already-judged image (or a re-post of one) goes into a fresh pi ask bounded by the per-ask image guard. The image leg (4.5: attachment + embed download, URL-deduped) is kept; no image post is ever fast-deleted on account of its content having been previously judged (the separate word fast path, which runs before any image handling, is unchanged).
 _Avoid_: mod action, anti-spam handler, derpies handler, repeat-image fast delete, seen-image cache

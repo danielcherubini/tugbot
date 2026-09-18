@@ -3,6 +3,7 @@ version: '3.9'
 services:
   postgres:
     image: postgres
+    command: postgres -c timezone=UTC
     ports:
       - 5432:5432
     volumes:

@@ -1,10 +1,14 @@
 // Package mcp is the Tugbot MCP Discord Bridge layer: an MCP (Model Context
 // Protocol) server that exposes Discord operations as tools over Streamable
-// HTTP. Everything hangs on ONE seam — the tools must be testable without a
+// HTTP. Everything hangs on two seams — the tools must be testable without a
 // live Discord connection, but *app.App carries a concrete
-// *discordgo.Session — so this package defines a small DiscordAPI interface
-// covering exactly the session methods the bridge tools use: production
-// wraps the real session (realDiscord), tests use a fake.
+// *discordgo.Session, so this package defines a small DiscordAPI interface
+// covering exactly the session methods the Discord tools use (production
+// wraps the real session (realDiscord), tests use a fake); and the
+// read_derpies_decisions tool's read hangs on the DecisionSource seam
+// (production wires the derpies handler, which owns the pool; tests use a
+// fake — the handler imports this package for the types, this package never
+// imports the handler, so there is no cycle).
 //
 // Error-handling convention: a recoverable Discord API failure is NOT a Go
 // error — it is mapped to an IsError tool result (wrapDiscordErr), and the
@@ -105,7 +109,19 @@ func (d *realDiscord) MessageReactionAdd(channelID, messageID, emoji string) err
 	return d.s.MessageReactionAdd(channelID, messageID, emoji, discordgo.WithRetryOnRatelimit(false))
 }
 
+// DecisionSource is the second seam: the read the read_derpies_decisions
+// tool serves (the derpies decision log). Production wires the derpies
+// handler (Derpies.ReadDecisions — which owns the pool); tests use a fake.
+// The handler imports this package for the types; this package never
+// imports the handler (no cycle).
+type DecisionSource interface {
+	ReadDecisions(ctx context.Context, f DecisionFilter) ([]DecisionRow, error)
+}
+
 // Server owns the SDK server object and (while running) the http.Server.
+// The DecisionSource is NOT held here: registerDecisionsTools captures it
+// directly via closure, so the field would be write-only (set in NewServer,
+// never read) and is deliberately omitted.
 type Server struct {
 	discord DiscordAPI
 	port    int
@@ -115,7 +131,7 @@ type Server struct {
 // NewServer constructs the Server (does NOT start, does NOT bind a port).
 // All tools registered on the SDK server happen here (later bridge tasks add
 // registrations).
-func NewServer(d DiscordAPI, port int) *Server {
+func NewServer(d DiscordAPI, decisions DecisionSource, port int) *Server {
 	srv := mcpSDK.NewServer(&mcpSDK.Implementation{
 		Name:    "tugbot",
 		Version: "1.0.0",
@@ -123,6 +139,7 @@ func NewServer(d DiscordAPI, port int) *Server {
 	// The bridge tool groups: discovery first, then reading, then the write tools last.
 	registerDiscoveryTools(srv, d)
 	registerReadTools(srv, d)
+	registerDecisionsTools(srv, decisions)
 	registerWriteTools(srv, d)
 	return &Server{discord: d, port: port, srv: srv}
 }
@@ -195,6 +212,40 @@ func (s *Server) handler() http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 	return mux
+}
+
+// DecisionFilter is the read_derpies_decisions query filter (the
+// parameterized SELECT behind the derpies store's queryDecisions). All
+// fields are optional and AND-combined; empty/nil fields are skipped.
+// Limit is clamped (default 50, max 500), not an error.
+type DecisionFilter struct {
+	AuthorID  string
+	ChannelID string
+	Path      string     // "fast" | "slow" | "" (unfiltered)
+	Deleted   *bool      // nil = unfiltered; matches the stored flag exactly
+	ScoreMin  *int       // score >= *ScoreMin
+	ScoreMax  *int       // score <= *ScoreMax
+	Since     *time.Time // created_at >= *Since
+	Until     *time.Time // created_at <= *Until
+	Limit     int        // default 50, max 500 — clamped, not an error
+}
+
+// DecisionRow mirrors the derpies_decisions columns (the nullable fields
+// are pointers so a NULL column scans as a nil pointer).
+type DecisionRow struct {
+	ID           int64
+	MessageID    string
+	ChannelID    string
+	AuthorID     string
+	Content      string
+	Path         *string // "fast" | "slow" | NULL
+	Score        *int    // NULL for fast rows + arms that never reached the matrix
+	Threshold    *int    // NULL, same as Score
+	Word         *string
+	Learned      bool
+	Deleted      bool
+	RejectReason *string // NULL when no rejection
+	CreatedAt    time.Time
 }
 
 // toolErr is the IsError tool-result convention: "<bots>: <msg>".

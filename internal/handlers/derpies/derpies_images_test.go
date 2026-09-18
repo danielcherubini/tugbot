@@ -216,13 +216,13 @@ func TestGimmickPromptImages(t *testing.T) {
 	known := []string{"bike"}
 
 	// 2 images, no ref: the pinned images line with N = 2.
-	got := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "")
+	got := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "", nil)
 	if !strings.Contains(got, "The message also has 2 attached image(s)") {
 		t.Errorf("2-image form must contain the pinned images line with 2")
 	}
 
 	// 0 images, ref text: the pinned referenced block; no images line.
-	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "ref text")
+	gotRef := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "ref text", nil)
 	for _, part := range []string{"<<<REFERENCED MESSAGE", "ref text", "REFERENCED MESSAGE>>>", "The message replies to a previous message (often the author's own)"} {
 		if !strings.Contains(gotRef, part) {
 			t.Errorf("ref form must contain %q", part)
@@ -233,7 +233,7 @@ func TestGimmickPromptImages(t *testing.T) {
 	}
 
 	// 2 images + ref text: BOTH elements.
-	gotBoth := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "ref text")
+	gotBoth := gimmickPrompt(defaultPromptTemplate, content, known, 2, 0, "", "ref text", nil)
 	if !strings.Contains(gotBoth, "The message also has 2 attached image(s)") || !strings.Contains(gotBoth, "<<<REFERENCED MESSAGE") {
 		t.Errorf("form with both must contain the images line AND the referenced block")
 	}
@@ -241,7 +241,7 @@ func TestGimmickPromptImages(t *testing.T) {
 	// 0 images / no ref: the shipped 0-image/no-ref prompt form — neither
 	// optional element, the rest intact (the shipped TestGimmickPromptDefault
 	// pins the full bytes; this restates it at the flow level).
-	gotZero := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "")
+	gotZero := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "", nil)
 	if strings.Contains(gotZero, "The message also has") {
 		t.Errorf("0-image no-ref form must not contain the images line")
 	}
@@ -290,8 +290,8 @@ func TestFlowImageOnlyLearnsAndDeletes(t *testing.T) {
 	// Image-only message (no text tokens): the verdict word may come from
 	// the image — wordValid alone bounds it, then learn + delete.
 	srv, _ := newImgServer(t)
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(msgWithImage("", srv.URL+"/a.png"))
@@ -311,10 +311,12 @@ func TestFlowImageOnlyLearnsAndDeletes(t *testing.T) {
 }
 
 func TestFlowImageOnlyVerdictInvalidWordRejected(t *testing.T) {
-	// The charset gate still applies to an image-only message.
+	// The charset gate still applies to an image-only message. The
+	// 40..T-1 band attempts the learn; the word rejection is what keeps
+	// it out (no learn, no delete).
 	srv, _ := newImgServer(t)
-	pi := &fakePi{resp: "GIMMICK:s-w1ft"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:45\nWORD:s-w1ft"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(msgWithImage("", srv.URL+"/a.png"))
@@ -324,12 +326,14 @@ func TestFlowImageOnlyVerdictInvalidWordRejected(t *testing.T) {
 }
 
 func TestFlowTextAndImageVerdictWordNotInTextRejected(t *testing.T) {
-	// Text + image: text tokens EXIST, so the folded verdict word must be
-	// a token of the text — a word only in the image is not learned (the
-	// text-token gate is preserved whenever text tokens exist).
+	// Text + image: the posted text HAS word-like tokens, so the folded
+	// verdict word must be a token of the text — a word only in the image
+	// is not learned (the anchor gate is preserved whenever the posted
+	// message carries word-like text). The 40..T-1 band attempts the
+	// learn; the word rejection is what keeps it out.
 	srv, _ := newImgServer(t)
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	pi := &fakePi{resp: "SCORE:45\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(msgWithImage("hi there", srv.URL+"/a.png"))
@@ -359,7 +363,7 @@ func TestFlowImageDownloadFailureDegradesToTextAsk(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", nil)
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the 0-image text prompt %q", pi.prompts[0], want)
 	}
@@ -444,8 +448,10 @@ func TestFlowReferencedPromptCarriesRefContent(t *testing.T) {
 func TestFlowReferencedVerdictWordOnlyInRefLearns(t *testing.T) {
 	// A valid verdict word present ONLY in the referenced text is learned
 	// (the quote is part of what's being posted): the union gate passes.
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// The posted content ("???") has no word-like tokens, so the anchor
+	// requirement drops and the word is bounded by wordValid alone.
+	pi := &fakePi{resp: "SCORE:95\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "holler at zswiftf now"}}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(msgWithRef("???"))
@@ -463,9 +469,10 @@ func TestFlowReferencedVerdictWordOnlyInRefLearns(t *testing.T) {
 
 func TestFlowReferencedVerdictWordNowhereRejected(t *testing.T) {
 	// A valid word in NEITHER the posted nor the referenced text is
-	// rejected by the (union) token gate.
-	pi := &fakePi{resp: "GIMMICK:zswiftf"}
-	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	// rejected by the (union) token gate. The 40..T-1 band attempts the
+	// learn; the word rejection is what keeps it out.
+	pi := &fakePi{resp: "SCORE:45\nWORD:zswiftf"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}, threshold: 60}
 	ops := &fakeOps{ref: &discordgo.Message{Content: "bbb"}}
 	h := newTestDerpies(store, ops, pi)
 	h.flow(msgWithRef("aaa"))

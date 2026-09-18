@@ -257,12 +257,150 @@ func TestNickFlowFastMissNilPiSilent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The score matrix (the nickname analog of the message matrix: the action
+// is the nick reset, not a delete)
+// ---------------------------------------------------------------------------
+
+// TestNickFlowMatrix pins the nickname score matrix (mirrors the message
+// matrix; the action is the nick reset, not a delete):
+//
+//	score < 40:      do nothing (no reset, no learn)
+//	40 <= score < T: learn the word (if valid + anchored to the nick); no reset
+//	score >= T:      learn the word (if valid + anchored) + reset the nick
+//
+// The wordLike anchor fix applies: a nick with NO word-like tokens (an
+// all-emoji nick) skips the anchor requirement — a valid word passes and
+// the score decides. (T is the store.configThreshold seam; the zero-value
+// fake yields the default 50, so the 40 <= score < T band is 40..49.)
+func TestNickFlowMatrix(t *testing.T) {
+	cases := []struct {
+		name      string
+		nick      string
+		resp      string
+		wantSets  int
+		wantLearn int // 0 = nothing learned, 1 = the word
+		wantWord  string
+	}{
+		{
+			name:      "score < 40: no reset, no learn",
+			nick:      "nice bike buyer",
+			resp:      "SCORE:20",
+			wantSets:  0,
+			wantLearn: 0,
+		},
+		{
+			name:      "40 <= score < T: learn, no reset",
+			nick:      "Purchase me a zwift for 9/11",
+			resp:      "SCORE:45\nWORD:zwift",
+			wantSets:  0,
+			wantLearn: 1,
+			wantWord:  "zwift|llm",
+		},
+		{
+			name:      "score >= T: learn + reset",
+			nick:      "Purchase me a zwift for 9/11",
+			resp:      "SCORE:90\nWORD:zwift",
+			wantSets:  1,
+			wantLearn: 1,
+			wantWord:  "zwift|llm",
+		},
+		{
+			name:      "all-emoji nick + semantic word: anchor skipped, score decides (reset)",
+			nick:      "💸🚵💰",
+			resp:      "SCORE:90\nWORD:zwift",
+			wantSets:  1,
+			wantLearn: 1,
+			wantWord:  "zwift|llm",
+		},
+		{
+			name:      "all-emoji nick + word, score < 40: no reset",
+			nick:      "💸🚵💰",
+			resp:      "SCORE:20\nWORD:zwift",
+			wantSets:  0,
+			wantLearn: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var fixed time.Time
+			// A fresh handler per case: the per-member cache/cooldown state
+			// must not leak across matrix arms.
+			store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+			ops := &fakeOps{}
+			if tc.name == "40 <= score < T: learn, no reset" {
+				// Make the band unambiguous: T = 46, so 45 is the top of the
+				// no-reset band (the zero-value fake would give T = 50 — the
+				// band still holds, but the explicit T pins the boundary math).
+				store.threshold = 46
+			}
+			if tc.name == "score >= T: learn + reset" {
+				store.threshold = 46 // 90 >= 46
+			}
+			if tc.name == "all-emoji nick + semantic word: anchor skipped, score decides (reset)" {
+				store.threshold = 46 // 90 >= 46
+			}
+			if tc.name == "all-emoji nick + word, score < 40: no reset" {
+				store.threshold = 46 // 20 < 46 (and < 40: no learn either)
+			}
+			h := newTestNickDerpies(store, ops, &fakePi{resp: tc.resp}, &fixed)
+			h.nickFlow(nickEvent("g", filteredNickUser, tc.nick))
+
+			if ops.sets != tc.wantSets {
+				t.Errorf("sets = %d (args %v), want %d", ops.sets, ops.setArgs, tc.wantSets)
+			}
+			if len(store.added) != tc.wantLearn {
+				t.Fatalf("added = %v, want %d entries", store.added, tc.wantLearn)
+			}
+			if tc.wantLearn == 1 && store.added[0] != tc.wantWord {
+				t.Errorf("added[0] = %q, want %q", store.added[0], tc.wantWord)
+			}
+		})
+	}
+}
+
+// TestNickFlowCacheNoResetArm is the pin for the no-reset arm's cache
+// write: a score < 40 verdict is a JUDGED terminal arm — it caches the
+// nick so a later same-nick event (a role change, a mute, ...) is
+// skipped by the change-detection check and never re-judged (zero pi
+// asks). (The pre-matrix failure arms — list fetch failed, pi
+// unavailable, ask failed — do NOT cache: a transient failure must stay
+// retryable, so the nick is re-judged on the next event.)
+func TestNickFlowCacheNoResetArm(t *testing.T) {
+	var fixed time.Time
+	pi := &fakePi{resp: "SCORE:20"}
+	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
+	ops := &fakeOps{}
+	h := newTestNickDerpies(store, ops, pi, &fixed)
+	h.nickFlow(nickEvent("g", filteredNickUser, "nice bike buyer"))
+
+	if pi.asks != 1 {
+		t.Fatalf("pi.asks = %d, want 1 (the first event was judged)", pi.asks)
+	}
+	assertNoEdits(t, ops)
+	assertNothingLearned(t, store)
+	// The second event: a role-only change — SAME nick. The low-score
+	// arm's cache write must make it skip (cur == evt.Nick) with zero
+	// pi asks.
+	h.nickFlow(nickEvent("g", filteredNickUser, "nice bike buyer"))
+	if pi.asks != 1 {
+		t.Errorf("after the same-nick repeat: pi.asks = %d, want still 1 (the low-score arm cached the nick; the repeat is skipped by the change-detection check)", pi.asks)
+	}
+	if store.listCalls != 1 {
+		t.Errorf("after the same-nick repeat: listCalls = %d, want still 1 (the skip is pre-list-fetch)", store.listCalls)
+	}
+	assertNoEdits(t, ops)
+}
+
+// ---------------------------------------------------------------------------
 // Slow-path verdicts
 // ---------------------------------------------------------------------------
 
-func TestNickFlowVerdictClean(t *testing.T) {
+func TestNickFlowLowScoreNoAction(t *testing.T) {
 	var fixed time.Time
-	pi := &fakePi{resp: "CLEAN"}
+	// The score model's "clean" analog: a low score is a judged terminal
+	// arm — no reset, no learn, and the nick is cached so a same-nick
+	// repeat is skipped.
+	pi := &fakePi{resp: "SCORE:10"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
@@ -271,7 +409,7 @@ func TestNickFlowVerdictClean(t *testing.T) {
 	assertNoEdits(t, ops)
 	assertNothingLearned(t, store)
 
-	// A same-nick event: the clean verdict cached the nick, and NO edit
+	// A same-nick event: the low-score arm cached the nick, and NO edit
 	// was performed so NO cooldown was marked — the repeat is blocked by
 	// the CACHED-EQUAL skip (either way, the list must not re-fetch).
 	if store.listCalls != 1 {
@@ -286,6 +424,8 @@ func TestNickFlowVerdictClean(t *testing.T) {
 
 func TestNickFlowVerdictUnknown(t *testing.T) {
 	var fixed time.Time
+	// A legacy verdict (no SCORE line) is unrecognized by the score model
+	// — the degradation arm: do nothing, cache the nick.
 	pi := &fakePi{resp: "gimmick without colon"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
@@ -307,31 +447,34 @@ func TestNickFlowVerdictUnknown(t *testing.T) {
 
 func TestNickFlowVerdictInvalidWord(t *testing.T) {
 	var fixed time.Time
-	// "x" is 1 char — fails wordmatch.WordValid.
-	pi := &fakePi{resp: "GIMMICK:x"}
+	// "swift" is a valid word but NOT a token of the nick — the learn
+	// gate fails, while the reset is score-driven and independent: a high
+	// score still resets the name, just without learning the word.
+	pi := &fakePi{resp: "SCORE:90\nWORD:swift"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
 	h.nickFlow(nickEvent("g", filteredNickUser, "get me a x"))
 
-	// NOT learnable (the two-arm gate fails) — but the name action is
-	// decoupled from the learning gate: the gimmick name is STILL reset
-	// (to the fixed neutral value), just not learned.
+	// NOT learnable (the word is not a nick token) — but the reset is
+	// score-driven and decoupled from the learning gate: a score >= T
+	// resets the name (to the fixed neutral value), just not learned.
 	if ops.sets != 1 {
-		t.Errorf("sets = %d (args %v), want 1 (a not-learnable verdict still resets the name)", ops.sets, ops.setArgs)
+		t.Errorf("sets = %d (args %v), want 1 (a not-learnable verdict at score >= T still resets the name)", ops.sets, ops.setArgs)
 	}
 	if len(ops.setArgs) != 1 || ops.setArgs[0] != "g|"+filteredNickUser+"|Derpies" {
 		t.Errorf("setArgs = %v, want [g|<user>|Derpies] (the reset SETS the fixed value, not a null clear)", ops.setArgs)
 	}
 	if len(store.added) != 0 {
-		t.Errorf("added = %v, want empty (the invalid verdict word is not learned)", store.added)
+		t.Errorf("added = %v, want empty (the verdict word is not a nick token — not learned)", store.added)
 	}
 }
 
 // TestNickFlowDeadEndVerdictResetsName pins the dead-end arm: the verdict
 // word is valid and a token of the message text would be expected, but the
 // NICK toks (non-ASCII lookalike, not in the confusable fold table) do not
-// hit — so the word is NOT learnable, while the name action still resets.
+// hit — so the word is NOT learnable, while the name action (a score >= T)
+// still resets.
 // (Supersedes the old TestNickFlowVerdictNotInNickname, whose second-half
 // cached-equal-repeat assertion no longer applies: after a reset the cache
 // holds "Derpies", not the nick.)
@@ -341,13 +484,13 @@ func TestNickFlowDeadEndVerdictResetsName(t *testing.T) {
 	// Fixture pre-check in the test setup: the nick's folded token set
 	// contains the as-appears token but NOT the ASCII base — ы is not in
 	// the confusable table and is NFD-inert, so the folded token stays
-	// non-ASCII and toks["swift"] is false (the two-arm gate's token arm
+	// non-ASCII and toks["swift"] is false (the learn gate's token arm
 	// fails; the word IS WordValid).
 	toks := tokensForMatch(nick)
 	if !toks[nick] || toks["swift"] {
 		t.Fatalf("fixture pre-check failed: tokensForMatch(%q) = %v — want the as-appears token present and the ascii token absent", nick, toks)
 	}
-	pi := &fakePi{resp: "GIMMICK:swift"}
+	pi := &fakePi{resp: "SCORE:90\nWORD:swift"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
@@ -368,7 +511,7 @@ func TestNickFlowDeadEndVerdictResetsName(t *testing.T) {
 // verdict word that IS a nick token is learned AND the name is reset.
 func TestNickFlowValidVerdictLearnsAndResets(t *testing.T) {
 	var fixed time.Time
-	pi := &fakePi{resp: "GIMMICK:sw1ft"}
+	pi := &fakePi{resp: "SCORE:90\nWORD:sw1ft"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}} // "sw1ft" not in the store words
 	ops := &fakeOps{}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
@@ -387,7 +530,7 @@ func TestNickFlowValidVerdictLearnsAndResets(t *testing.T) {
 
 func TestNickFlowVerdictLearnsAndResets(t *testing.T) {
 	var fixed time.Time
-	pi := &fakePi{resp: "GIMMICK:zwift"}
+	pi := &fakePi{resp: "SCORE:90\nWORD:zwift"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
@@ -506,7 +649,7 @@ func TestNickFlowCooldownExpires(t *testing.T) {
 
 func TestNickFlowResetFailedMarksWindow(t *testing.T) {
 	var fixed time.Time
-	pi := &fakePi{resp: "GIMMICK:sw1ft"}
+	pi := &fakePi{resp: "SCORE:90\nWORD:sw1ft"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{setErr: errors.New("429")}
 	h := newTestNickDerpies(store, ops, pi, &fixed)
@@ -628,7 +771,7 @@ func TestNickFlowBusySkips(t *testing.T) {
 
 func TestNickFlowLearnSurvivesResetFailure(t *testing.T) {
 	var fixed time.Time
-	pi := &fakePi{resp: "GIMMICK:zwift"}
+	pi := &fakePi{resp: "SCORE:90\nWORD:zwift"}
 	store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
 	ops := &fakeOps{setErr: errors.New("discord 500")}
 	h := newTestNickDerpies(store, ops, pi, &fixed)

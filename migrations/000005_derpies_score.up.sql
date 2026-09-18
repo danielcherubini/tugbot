@@ -1,49 +1,80 @@
--- 000003_derpies_prompt — the derpies filter's LIVE prompt template.
+-- 000005_derpies_score — the derpies score model: the live dials, the
+-- decision log, and the phrase optimizer, plus the prompt flip.
 --
--- Single-row table: body = the prompt template text (the template contract
--- — {content} / {known} markers, optional {{IMAGES}} / {{REF}} / {{EMBED}} /
--- {{GIFS}} — lives in
--- code; an invalid row falls back to the code default, so a bad edit can
--- never leave the filter with a broken prompt). updated_at = last edit.
+-- derpies_config (single row — the operator's live dials): the delete
+-- threshold T the decision matrix reads per message (learn at score >=
+-- 40, delete at score >= T). The CHECK (BETWEEN 41 AND 100) keeps T >
+-- the learn floor (the matrix is defined for T > 40 only); the code
+-- clamps a pre-CHECK read to the default 50.
 --
--- The seed body is the code default template (the SCORE-format score-model
--- prompt: "SCORE:<0-100>" + optional "WORD:<anchor>"), byte-for-byte. It
--- contains TWO single quotes (the apostrophes in `filter's` / `message's`)
--- — the SQL literal doubles them: `filter''s` / `message''s`. No other
--- characters need escaping (no backticks, no backslashes; semicolons inside
--- the literal are
--- safe — the whole file is
--- one simple-protocol query through pgx, the 000002 mechanics). Editing is an
--- operator UPDATE (no deploy, no restart — the next message picks it up);
--- rollback is restoring the previous body text.
-CREATE TABLE public.derpies_prompt (
+-- derpies_decisions (append-only — one row per judged message/edit):
+-- the full decision record (the path, the score + threshold, the learned
+-- word, the learn/delete outcomes, the rejection reason). NULL path =
+-- the arm never reached a path (pre-matrix degradation arms); NULL
+-- score/threshold = the arm never reached the matrix.
+--
+-- derpies_gimmick_phrases (manual-only — the optimizer): curated
+-- multi-word patterns the fast path matches as an EXACT consecutive run
+-- of the folded token sequence (zero pi asks). source is 'manual' —
+-- the LLM never writes here.
+--
+-- The prompt flip (atomic with the DDL): the live derpies_prompt row is
+-- set to the SCORE-format prompt in the same deploy, so the code is
+-- never in a "new prompt + old parser" dead state. The literal is the
+-- code default template byte-for-byte with the two apostrophes
+-- ('filter's' / 'message's') SQL-doubled.
+CREATE TABLE public.derpies_config (
     id integer NOT NULL,
-    body text NOT NULL,
+    delete_threshold integer DEFAULT 50 NOT NULL,
+    -- updated_at is NOT auto-updated (no trigger): an operator UPDATE of
+    -- delete_threshold should also set updated_at = now().
     updated_at timestamp without time zone DEFAULT now() NOT NULL
 );
---
---
-CREATE SEQUENCE public.derpies_prompt_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
---
---
-ALTER SEQUENCE public.derpies_prompt_id_seq OWNED BY public.derpies_prompt.id;
---
---
-ALTER TABLE ONLY public.derpies_prompt ALTER COLUMN id SET DEFAULT nextval('public.derpies_prompt_id_seq'::regclass);
---
---
-ALTER TABLE ONLY public.derpies_prompt
-    ADD CONSTRAINT derpies_prompt_pkey PRIMARY KEY (id);
---
---
-INSERT INTO public.derpies_prompt (body) VALUES
-    ('A Discord message was just posted by a user with a documented history of spamming this server with a ROTATING ROSTER of short, repetitive, annoying gimmicks — and of evading, over and over, the word filters built to catch them. He is notorious for this.
+CREATE SEQUENCE public.derpies_config_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
+ALTER SEQUENCE public.derpies_config_id_seq OWNED BY public.derpies_config.id;
+ALTER TABLE ONLY public.derpies_config ALTER COLUMN id SET DEFAULT nextval('public.derpies_config_id_seq'::regclass);
+ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_threshold_check CHECK (delete_threshold BETWEEN 41 AND 100);
+-- Enforce the singleton: the config is a single row (id = 1). A second
+-- insert is rejected, so the runtime `SELECT ... WHERE id = 1` can never
+-- pick an arbitrary row.
+ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_singleton_check CHECK (id = 1);
+INSERT INTO public.derpies_config (id, delete_threshold) VALUES (1, 50);
+
+-- derpies_decisions (append-only — one row per judged message/edit)
+CREATE TABLE public.derpies_decisions (
+    id bigserial PRIMARY KEY,
+    message_id text NOT NULL,
+    channel_id text NOT NULL,
+    author_id text NOT NULL,
+    content text NOT NULL DEFAULT '',
+    path text CHECK (path IN ('fast', 'slow')),
+    score integer,
+    threshold integer,
+    word text,
+    learned boolean NOT NULL DEFAULT false,
+    deleted boolean NOT NULL DEFAULT false,
+    reject_reason text,
+    created_at timestamp without time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX derpies_decisions_author_created_idx ON public.derpies_decisions (author_id, created_at DESC);
+CREATE INDEX derpies_decisions_created_idx ON public.derpies_decisions (created_at DESC);
+
+-- derpies_gimmick_phrases (manual-only — the optimizer)
+CREATE TABLE public.derpies_gimmick_phrases (
+    id integer NOT NULL,
+    phrase character varying(300) NOT NULL,
+    source character varying(8) DEFAULT 'manual' NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL
+);
+CREATE SEQUENCE public.derpies_gimmick_phrases_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
+ALTER SEQUENCE public.derpies_gimmick_phrases_id_seq OWNED BY public.derpies_gimmick_phrases.id;
+ALTER TABLE ONLY public.derpies_gimmick_phrases ALTER COLUMN id SET DEFAULT nextval('public.derpies_gimmick_phrases_id_seq'::regclass);
+ALTER TABLE ONLY public.derpies_gimmick_phrases ADD CONSTRAINT derpies_gimmick_phrases_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.derpies_gimmick_phrases ADD CONSTRAINT derpies_gimmick_phrases_phrase_key UNIQUE (phrase);
+
+-- The prompt flip (atomic with the DDL).
+UPDATE public.derpies_prompt SET body = 'A Discord message was just posted by a user with a documented history of spamming this server with a ROTATING ROSTER of short, repetitive, annoying gimmicks — and of evading, over and over, the word filters built to catch them. He is notorious for this.
 
 HE WILL TEST THIS FILTER. Every message you judge from him is a probe: he actively measures what gets through, and the respellings in his posts are his evasions, not typos to forgive. Your stance is adversarial, not polite: when a message carries ANY trace of the roster — respelled, bent, squeezed, split, quoted, or dressed up as a question — judge it a GIMMICK. Judge it innocent only when there is NO trace of the roster at all AND a plainly innocent reading is obvious. For this user a false negative (a gimmick getting through) is the worse error. When you are torn between two bands: score toward the HIGHER side. His messages are the filter''s only queue, so err toward catching the roster, never toward letting it through.
 
@@ -97,4 +128,4 @@ where <word> is the anchor word: the as-appears respelled token for a known-gimm
 - For a SPLIT word (letters spread over spaces or symbols between its letters), answer the COLLAPSED form — the letters joined without the spacing: "z w i f t" -> "zwift", "g i v e" -> "give". Never the spaced form; the spaced form is not a valid answer.
 - When the anchor word lives ONLY in an image, answer the most distinctive word of that image as if it were in the message.
 - When the anchor word lives ONLY in the emojis (the message has no other text words), answer the most distinctive word of what the emojis MEAN (e.g. "zwift" for 💸🚵) — not a token of the message.
-- Score 0-39 only when the message carries NO trace of the roster at all and the innocent reading is obvious.');
+- Score 0-39 only when the message carries NO trace of the roster at all and the innocent reading is obvious.', updated_at = now();

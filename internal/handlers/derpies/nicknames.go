@@ -7,7 +7,12 @@
 // skipped (no nick change — including the bot's own reset echo, the cache
 // being written BEFORE the echo arrives), and a successful reset writes
 // the reset value ("Derpies") into the cache before the echo arrives.
-// No recursion, no wasted RPC for echoes.
+// The JUDGED no-reset arms (score < 40, 40 <= score < T, unrecognized
+// verdict) cache the nick itself — a later same-nick event (a role
+// change, a mute, ...) is skipped and never re-judged; a transient
+// pre-matrix failure (list fetch, pi unavailable, ask failed) does NOT
+// cache, so the nick stays retryable. No recursion, no wasted RPC for
+// echoes.
 package derpies
 
 import (
@@ -143,45 +148,113 @@ func (h *Derpies) nickFlow(evt *discordgo.GuildMemberUpdate) {
 		}
 	}
 	content := "New nickname set by the user: " + evt.Nick
-	// The nickname prompt has no embeds: embedTitles "" (nImages 0).
-	prompt := gimmickPrompt(tmpl, content, sortedKeys(list), 0, 0, "", "")
+	// The nickname prompt has no embeds: embedTitles "" (nImages 0) and
+	// no phrases (the phrase sub-block is the message flow's — a nickname
+	// is a short display name; the word fast path covers it).
+	prompt := gimmickPrompt(tmpl, content, sortedKeys(list), 0, 0, "", "", []string{})
 	text, askErr := h.app.Pi.Ask(ctx, prompt)
 	if askErr != nil {
 		slog.Error("derpies nickname ask failed", "module", module, "error", askErr)
 		return
 	}
 
-	// 9. Parse the verdict (the cache write is making decisions explicit:
-	//    terminal / same-nick arms cache the nick so subsequent role-only
-	//    events do not re-judge it; the reset path caches the reset value
-	//    — and its failure arm caches "" — via resetNow).
-	kind, word := parseVerdict(text)
-	switch kind {
-	case "clean":
-		slog.Info("derpies nickname verdict clean", "module", module, "guild", evt.GuildID, "member", evt.User.ID, "nick", evt.Nick)
-		h.saveNick(key, evt.Nick)
-		return
-	case "unknown":
+	// 9. Parse the verdict (the score model — the nickname flow's matrix
+	//    mirrors the message flow; the action is the nick reset, not a
+	//    delete). No valid SCORE line -> the degradation arm: log +
+	//    cache the nick (a terminal arm — a later same-nick event is
+	//    skipped by the change-detection check) + do nothing.
+	score, hasScore, word := parseVerdictScore(text)
+	if !hasScore {
 		slog.Warn("derpies nickname unrecognized verdict — doing nothing", "module", module, "verdict", strings.TrimSpace(text))
 		h.saveNick(key, evt.Nick)
 		return
 	}
 
-	// 10. Learn — the two-arm gate is UNCHANGED and now gates LEARNING
-	//     ONLY (a recognized gimmick name is reset even when the word
-	//     isn't learnable; what may enter the table is not loosened).
-	fw := wordmatch.FoldToASCII(word)
-	if wordmatch.WordValid(fw) && toks[fw] {
-		if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
-			slog.Error("derpies nickname add gimmick failed", "module", module, "word", fw, "error", err)
-		}
-	} else {
-		slog.Warn("derpies nickname verdict word not learnable — name reset only", "module", module, "word", word, "nick", evt.Nick)
+	// The live threshold T (the same store.configThreshold seam as the
+	// message flow): a DB error OR a missing row degrades to the default
+	// — the matrix still runs on it. The store clamps a valid-but-
+	// out-of-range read, so T > learnFloor always holds.
+	t, err := h.store.configThreshold(ctx)
+	if err != nil {
+		t = defaultThreshold
+		slog.Warn("derpies config threshold unavailable — using default (nickname)", "module", module, "error", err)
 	}
 
-	// 11. Reset (ALWAYS, on a GIMMICK verdict) — the name action no
-	//     longer depends on the learning gate.
-	h.resetNow(key, evt, "llm", fw)
+	// 10. Learn (independent of the reset), gated on score >= learnFloor:
+	//     the two-arm gate (ADR 0008) on the FOLDED verdict word — with
+	//     the wordLike anchor fix (the message flow's emoji fix A): a
+	//     nick with NO word-like tokens (an all-emoji nick) skips the
+	//     anchor requirement — a valid word passes and the score decides.
+	//     (Phrase matching is NOT part of the nickname flow in v1 — a
+	//     nickname is a short display name; the word fast path covers it.)
+	fw := ""
+	if score >= learnFloor {
+		fw = foldVerdictWord(word)
+		switch {
+		case fw == "":
+			// An absent or whitespace-only word collapses to nothing:
+			// no valid word to learn.
+			slog.Warn("derpies nickname invalid verdict word — not learning", "module", module, "word", word, "nick", evt.Nick)
+		case allDigitVerdict(fw):
+			slog.Warn("derpies nickname all-digit verdict word — not learning", "module", module, "word", word, "nick", evt.Nick)
+		default:
+			asc := wordmatch.WordValid(fw)
+			if !asc && !unicodeVerdictShape(fw) {
+				// Neither arm: not a plausible word shape at all.
+				slog.Warn("derpies nickname invalid verdict word — not learning", "module", module, "word", word, "nick", evt.Nick)
+			} else {
+				// The anchor gate (the emoji fix A): the anchor requirement
+				// applies only when the NICK carries word-like tokens — a
+				// pure-emoji / bare-number nick has none, so a valid word
+				// passes the shape arm alone and the score decides. A
+				// rejection only stops the LEARN — the reset (step 11) is
+				// an independent score.
+				hasWordLike := false
+				for tok := range toks {
+					if wordLike(tok) {
+						hasWordLike = true
+						break
+					}
+				}
+				if hasWordLike && !toks[fw] {
+					slog.Warn("derpies nickname verdict word not in the nick — not learning", "module", module, "word", word, "nick", evt.Nick)
+				} else if !asc && !hasWordLike {
+					slog.Warn("derpies nickname non-ASCII verdict word not anchored to the nick — not learning", "module", module, "word", word, "nick", evt.Nick)
+				} else {
+					// A hallucinated word can never enter the list: a pass
+					// means the word is a folded token of the nick (or the
+					// nick has no word-like tokens, bounded by the shape arm
+					// alone). Learn the FOLDED word so the next occurrence
+					// is a fast hit.
+					if err := h.store.addGimmick(ctx, fw, SourceLLM); err != nil {
+						slog.Error("derpies nickname add gimmick failed", "module", module, "word", fw, "error", err)
+					}
+				}
+			}
+		}
+	}
+
+	// 11. The nickname matrix (mirrors the message matrix; the action is
+	//     the nick reset, not a delete):
+	//       score < 40:      do nothing (no reset, no learn)
+	//       40 <= score < T: learn the word (gated above); no reset
+	//       score >= T:      learn the word (gated above) + reset the nick
+	//     The reset is score >= T — independent of whether a word was
+	//     learned — via the existing resetNow (which already caches both
+	//     the success and the failure outcome and marks the 60s window).
+	//     The NO-RESET arms (both covered by the else branch: T > 40
+	//     always holds) are JUDGED terminal arms — they cache the nick
+	//     so a later same-nick event (a role change, a mute, ...) is
+	//     skipped by the change-detection check and never re-judged.
+	//     (The pre-matrix failure arms — list fetch failed, pi
+	//     unavailable, ask failed — do NOT cache: a transient failure
+	//     must stay retryable. The 60s lastEdit cooldown is separate —
+	//     marked only by resetNow.)
+	if score >= t {
+		h.resetNow(key, evt, "llm", fw)
+	} else {
+		h.saveNick(key, evt.Nick)
+	}
 }
 
 // resetNow — the single action arm: attempt the reset (a SET of the

@@ -133,6 +133,31 @@ func (f *fakeDiscord) MessageReactionAdd(channelID, messageID, emoji string) err
 	return f.messageReactionAddErr
 }
 
+// fakeDecisionSource is the test implementation of the DecisionSource
+// seam (mirrors the fakeDiscord pattern): configurable rows/err + a
+// captured filter.
+type fakeDecisionSource struct {
+	mu     sync.Mutex
+	rows   []DecisionRow
+	filter DecisionFilter
+	calls  int
+	err    error
+	gotCtx context.Context // the ctx the handler handed ReadDecisions (nil if never called)
+}
+
+func (f *fakeDecisionSource) ReadDecisions(ctx context.Context, f2 DecisionFilter) ([]DecisionRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filter = f2
+	f.calls++
+	f.gotCtx = ctx
+	return f.rows, f.err
+}
+
+// pStr / pInt — pointer helpers for the fixtures' nullable fields.
+func pStr(s string) *string { return &s }
+func pInt(i int) *int       { return &i }
+
 // connectInProcess runs the bridge Server over the SDK's own in-memory
 // transport pair and returns the connected client session (the SDK's own
 // test pattern — there is no NewInMemoryClient constructor).
@@ -140,6 +165,29 @@ func connectInProcess(t *testing.T, srv *Server) *mcpSDK.ClientSession {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	ct, st := mcpSDK.NewInMemoryTransports()
+	ss, err := srv.srv.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatalf("server Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = ss.Close() })
+	c := mcpSDK.NewClient(&mcpSDK.Implementation{Name: "fake-client", Version: "1.0.0"}, nil)
+	cs, err := c.Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatalf("client Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	return cs
+}
+
+// connectInProcessWithCtx runs the bridge Server over the SDK's own in-memory
+// transport pair, but connects BOTH sides under the caller-supplied ctx (the
+// SDK derives the tool handler's context from the connection context, so a
+// value set on this ctx is observable in the handler — see
+// TestReadDecisionsToolPassesRequestContext). It returns the connected client
+// session.
+func connectInProcessWithCtx(t *testing.T, srv *Server, ctx context.Context) *mcpSDK.ClientSession {
+	t.Helper()
 	ct, st := mcpSDK.NewInMemoryTransports()
 	ss, err := srv.srv.Connect(ctx, st, nil)
 	if err != nil {
@@ -230,7 +278,7 @@ func freePort(t *testing.T) int {
 }
 
 func TestNewServerNonNil(t *testing.T) {
-	srv := NewServer(&fakeDiscord{}, 0)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, 0)
 	if srv == nil {
 		t.Fatal("NewServer() = nil, want non-nil")
 	}
@@ -332,7 +380,7 @@ func TestRealDiscordStateGuildsConcurrent(t *testing.T) {
 }
 
 func TestHandlerServesHealthzAndMCP(t *testing.T) {
-	srv := NewServer(&fakeDiscord{}, 0)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, 0)
 	ts := httptest.NewServer(srv.handler())
 	defer ts.Close()
 
@@ -366,7 +414,7 @@ func TestStartBoundPortErrors(t *testing.T) {
 	defer l.Close()
 	port := l.Addr().(*net.TCPAddr).Port
 
-	srv := NewServer(&fakeDiscord{}, port)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, port)
 	// Ordinary context: a port conflict must fail startup on its own, not
 	// via a timeout — Start returns the bind error without any cancel.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -398,7 +446,7 @@ func TestStartShutdownGraceWithInFlightRequest(t *testing.T) {
 	}
 
 	port := freePort(t)
-	srv := NewServer(&fakeDiscord{}, port)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, port)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -484,7 +532,7 @@ func TestStartShutdownGraceWithInFlightRequest(t *testing.T) {
 // Acceptance: both tools appear in an in-process client's ListTools with the
 // exact names.
 func TestListToolsIncludesDiscoveryTools(t *testing.T) {
-	srv := NewServer(&fakeDiscord{}, 0)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	tools, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -516,7 +564,7 @@ func TestListGuildsFromState(t *testing.T) {
 		{ID: "2", Name: "beta"},
 		{ID: "3", Name: "gamma"},
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_guilds", nil)
 	if res.IsError {
@@ -542,7 +590,7 @@ func TestListGuildsFromState(t *testing.T) {
 // state-empty → the REST fallback: a single five-param page, no counts.
 func TestListGuildsFallsBackToUserGuilds(t *testing.T) {
 	f := &fakeDiscord{userGuilds: []*discordgo.UserGuild{{ID: "10", Name: "alpha"}}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_guilds", nil)
 	if res.IsError {
@@ -570,7 +618,7 @@ func TestListGuildsFallbackPageCapNote(t *testing.T) {
 		s[i] = &discordgo.UserGuild{ID: fmt.Sprintf("%d", i+1), Name: fmt.Sprintf("g%d", i+1)}
 	}
 	f := &fakeDiscord{userGuilds: s}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_guilds", nil)
 	if res.IsError {
@@ -591,7 +639,7 @@ func TestListChannelsTextLikeFiltering(t *testing.T) {
 			{Name: "workflow", ID: "c4", Type: discordgo.ChannelTypeGuildCategory},
 		},
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_channels", map[string]any{"guild_id": "1"})
 	if res.IsError {
@@ -610,7 +658,7 @@ func TestListChannelsTextLikeFiltering(t *testing.T) {
 
 func TestListChannelsEmptyGuildID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_channels", map[string]any{})
 	if !res.IsError {
@@ -633,7 +681,7 @@ func TestListChannelsDiscordError(t *testing.T) {
 		Response:     &http.Response{Status: "500 Internal Server Error"},
 		ResponseBody: []byte(`{"message": "internal error"}`),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_channels", map[string]any{"guild_id": "1"})
 	if !res.IsError {
@@ -654,7 +702,7 @@ func TestListGuildsSummary50Cap(t *testing.T) {
 		s[i] = &discordgo.Guild{ID: fmt.Sprintf("gid%d", i+1), Name: fmt.Sprintf("alpha-%d", i+1)}
 	}
 	f := &fakeDiscord{stateGuilds: s}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_guilds", nil)
 	if res.IsError {
@@ -689,7 +737,7 @@ func TestListGuildsDiscordError(t *testing.T) {
 		Response:     &http.Response{Status: "500 Internal Server Error"},
 		ResponseBody: []byte(`{"message": "internal error"}`),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "list_guilds", nil)
 	if !res.IsError {
@@ -719,7 +767,7 @@ func readMessageFixture(id, authorID, username, ts, text string, attachments int
 // Acceptance: the registration test — ListTools carries read_messages with
 // the exact description string.
 func TestListToolsIncludesReadMessages(t *testing.T) {
-	srv := NewServer(&fakeDiscord{}, 0)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	tools, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -745,7 +793,7 @@ func TestReadMessagesHappyPath(t *testing.T) {
 		readMessageFixture("m2", "u1", "alice", ts2, "world", 0),
 		readMessageFixture("m3", "u2", "bob", ts3, "bye", 2),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if res.IsError {
@@ -788,7 +836,7 @@ func TestReadMessagesHappyPath(t *testing.T) {
 // limit 250 → clamped to 100 in the REST call + the note in the text.
 func TestReadMessagesLimitClamp(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42", "limit": 250})
 	if res.IsError {
@@ -807,7 +855,7 @@ func TestReadMessagesLimitClamp(t *testing.T) {
 // Non-numeric before_id/after_id → immediate IsError, zero REST.
 func TestReadMessagesOffsetValidation(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	for _, arg := range []string{"before_id", "after_id"} {
 		res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42", arg: "not-a-number"})
@@ -829,7 +877,7 @@ func TestReadMessagesOffsetValidation(t *testing.T) {
 // Valid offsets → the REST call carries them through unchanged.
 func TestReadMessagesOffsetArgs(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42", "before_id": "123", "after_id": "456"})
 	if res.IsError {
@@ -849,7 +897,7 @@ func TestReadMessagesAuthorIDFilter(t *testing.T) {
 		readMessageFixture("m2", "u1", "alice", "2026-02-02T11:00:00Z", "b", 0),
 		readMessageFixture("m3", "u2", "bob", "2026-02-02T12:00:00Z", "c", 0),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42", "author_id": "u1"})
 	if res.IsError {
@@ -873,7 +921,7 @@ func TestReadMessagesAuthorNameFilter(t *testing.T) {
 		readMessageFixture("m2", "u1", "alice", "2026-02-02T11:00:00Z", "b", 0),
 		readMessageFixture("m3", "u2", "bob", "2026-02-02T12:00:00Z", "c", 0),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 
 	// Exact match: a case-mismatched username matches nothing.
@@ -902,7 +950,7 @@ func TestReadMessagesNilAuthor(t *testing.T) {
 		readMessageFixture("m1", "u1", "alice", "2026-02-02T10:00:00Z", "hi", 0),
 		webhook,
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if res.IsError {
@@ -937,7 +985,7 @@ func TestReadMessagesRateLimited(t *testing.T) {
 			URL:             "https://discord.com/api/v10/channels/42/messages",
 		},
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if !res.IsError {
@@ -964,7 +1012,7 @@ func TestReadMessagesChannelByName(t *testing.T) {
 		},
 		channelMessages: []*discordgo.Message{readMessageFixture("m1", "u1", "alice", "2026-02-02T10:00:00Z", "hi", 0)},
 	}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "general", "guild_id": "1"})
@@ -1017,7 +1065,7 @@ func TestReadMessagesResolveRESTError(t *testing.T) {
 			ResponseBody: []byte(`{"message": "bad gateway"}`),
 		},
 	}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "nonsense", "guild_id": "1"})
 	if !res.IsError {
@@ -1043,7 +1091,7 @@ func TestReadMessagesResolveRESTError(t *testing.T) {
 // exact "tugbot: channel_id required" BEFORE any REST.
 func TestReadMessagesEmptyChannelID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"guild_id": "1"}) // channel_id key omitted
 	if !res.IsError {
@@ -1063,7 +1111,7 @@ func TestReadMessagesEmptyChannelID(t *testing.T) {
 // Empty fixture → "0 messages" and the payload is [] (not nil).
 func TestReadMessagesEmpty(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if res.IsError {
@@ -1091,7 +1139,7 @@ func TestReadMessagesTextRendersContent(t *testing.T) {
 		readMessageFixture("m2", "u1", "alice", "2026-02-02T11:00:00Z", "", 0),
 		readMessageFixture("m3", "u2", "bob", "2026-02-02T12:00:00Z", "bye", 2),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if res.IsError {
@@ -1119,7 +1167,7 @@ func TestReadMessagesTextRendersContent(t *testing.T) {
 // lines, no ".." timestamp range.
 func TestReadMessagesZeroMessagesText(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "read_messages", map[string]any{"channel_id": "42"})
 	if res.IsError {
@@ -1144,9 +1192,10 @@ func mapsEqual(a, b map[string]string) bool {
 
 // --- Task 5: post_message + react ----------------------------
 
-// Acceptance: exactly 5 tools total at end of Task 5.
-func TestListToolsShowsExactlyFiveTools(t *testing.T) {
-	srv := NewServer(&fakeDiscord{}, 0)
+// Acceptance: exactly 6 tools total (read_derpies_decisions joins the
+// five Discord tools via the DecisionSource seam).
+func TestListToolsShowsExactlySixTools(t *testing.T) {
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	tools, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -1156,10 +1205,10 @@ func TestListToolsShowsExactlyFiveTools(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names = append(names, tool.Name)
 	}
-	if len(names) != 5 {
-		t.Fatalf("ListTools = %d tools %v, want exactly 5", len(names), names)
+	if len(names) != 6 {
+		t.Fatalf("ListTools = %d tools %v, want exactly 6", len(names), names)
 	}
-	for _, want := range []string{"list_guilds", "list_channels", "read_messages", "post_message", "react"} {
+	for _, want := range []string{"list_guilds", "list_channels", "read_messages", "post_message", "react", "read_derpies_decisions"} {
 		if !sliceContains(names, want) {
 			t.Errorf("ListTools tools = %v, want it to include %q", names, want)
 		}
@@ -1169,7 +1218,7 @@ func TestListToolsShowsExactlyFiveTools(t *testing.T) {
 // post happy: the fake captured channel + text; output + payload shape.
 func TestPostMessageHappyPath(t *testing.T) {
 	f := &fakeDiscord{sentMessage: &discordgo.Message{ID: "m100"}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42", "text": "hello"})
 	if res.IsError {
@@ -1199,7 +1248,7 @@ func TestPostMessageHappyPath(t *testing.T) {
 // (the field is Reference, NOT MessageReference).
 func TestPostMessageWithReply(t *testing.T) {
 	f := &fakeDiscord{sentMessage: &discordgo.Message{ID: "m101"}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42", "text": "rep", "reply_to_id": "77"})
 	if res.IsError {
@@ -1225,7 +1274,7 @@ func TestPostMessageWithReply(t *testing.T) {
 // >1999 runes: truncated to 1999 + the truncation note.
 func TestPostMessageTruncation(t *testing.T) {
 	f := &fakeDiscord{sentMessage: &discordgo.Message{ID: "m102"}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42", "text": strings.Repeat("a", 2500)})
 	if res.IsError {
@@ -1245,7 +1294,7 @@ func TestPostMessageTruncation(t *testing.T) {
 // empty text → IsError before any REST call.
 func TestPostMessageEmptyText(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42"})
 	if !res.IsError {
@@ -1261,7 +1310,7 @@ func TestPostMessageEmptyText(t *testing.T) {
 // non-numeric reply_to_id → IsError before any REST call.
 func TestPostMessageNonNumericReplyTo(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42", "text": "hi", "reply_to_id": "not-a-number"})
 	if !res.IsError {
@@ -1280,7 +1329,7 @@ func TestPostMessageDiscordError(t *testing.T) {
 		Response:     &http.Response{Status: "403 Forbidden"},
 		ResponseBody: []byte(`{"message": "Missing Permissions"}`),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "42", "text": "hi"})
 	if !res.IsError {
@@ -1304,7 +1353,7 @@ func TestPostMessageResolveRESTError(t *testing.T) {
 			ResponseBody: []byte(`{"message": "bad gateway"}`),
 		},
 	}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"channel_id": "nonsense", "guild_id": "1", "text": "hello"})
 	if !res.IsError {
@@ -1329,7 +1378,7 @@ func TestPostMessageResolveRESTError(t *testing.T) {
 // present so the handler reaches the resolve path).
 func TestPostMessageEmptyChannelID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "post_message", map[string]any{"guild_id": "1", "text": "hello"}) // channel_id key omitted
 	if !res.IsError {
@@ -1349,7 +1398,7 @@ func TestPostMessageEmptyChannelID(t *testing.T) {
 // react happy: the fake captured the exact channel/message/emoji args.
 func TestReactHappyPath(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "message_id": "77", "emoji": "🔥"})
 	if res.IsError {
@@ -1373,7 +1422,7 @@ func TestReactHappyPath(t *testing.T) {
 // name\").
 func TestReactCustomEmojiTokenPassthrough(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "message_id": "77", "emoji": "name:123456789"})
 	if res.IsError {
@@ -1389,7 +1438,7 @@ func TestReactCustomEmojiTokenPassthrough(t *testing.T) {
 // non-numeric message_id → IsError before any REST call.
 func TestReactNonNumericMessageID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "message_id": "not-a-number", "emoji": "🔥"})
 	if !res.IsError {
@@ -1405,7 +1454,7 @@ func TestReactNonNumericMessageID(t *testing.T) {
 // empty emoji → IsError before any REST call.
 func TestReactEmptyEmoji(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "message_id": "77"})
 	if !res.IsError {
@@ -1423,7 +1472,7 @@ func TestReactEmptyEmoji(t *testing.T) {
 // is present so this is the message_id leg, not the channel leg).
 func TestReactEmptyMessageID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "emoji": "x"}) // message_id key omitted
 	if !res.IsError {
@@ -1446,7 +1495,7 @@ func TestReactDiscordError(t *testing.T) {
 		Response:     &http.Response{Status: "404 Not Found"},
 		ResponseBody: []byte(`{"message": "Unknown Message"}`),
 	}}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "42", "message_id": "77", "emoji": "🔥"})
 	if !res.IsError {
@@ -1470,7 +1519,7 @@ func TestReactResolveRESTError(t *testing.T) {
 			ResponseBody: []byte(`{"message": "bad gateway"}`),
 		},
 	}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"channel_id": "nonsense", "guild_id": "1", "message_id": "77", "emoji": "x"})
 	if !res.IsError {
@@ -1495,7 +1544,7 @@ func TestReactResolveRESTError(t *testing.T) {
 // are present so the handler reaches the resolve path).
 func TestReactEmptyChannelID(t *testing.T) {
 	f := &fakeDiscord{}
-	srv := NewServer(f, 0)
+	srv := NewServer(f, &fakeDecisionSource{}, 0)
 	cs := connectInProcess(t, srv)
 	res := callTool(t, cs, "react", map[string]any{"guild_id": "1", "message_id": "77", "emoji": "x"}) // channel_id key omitted
 	if !res.IsError {
@@ -1517,7 +1566,7 @@ func TestReactEmptyChannelID(t *testing.T) {
 // context.Canceled, NOT http.ErrServerClosed.
 func TestStartNilOnCancel(t *testing.T) {
 	port := freePort(t)
-	srv := NewServer(&fakeDiscord{}, port)
+	srv := NewServer(&fakeDiscord{}, &fakeDecisionSource{}, port)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1643,7 +1692,7 @@ func connectOverHTTP(t *testing.T, srv *Server) (*httptest.Server, *mcpSDK.Clien
 // TestWireEndToEnd locks the wire path end-to-end: the fake behind
 // the production NewServer, served by httptest (the same mux Start
 // serves), driven by the SDK client over real HTTP — healthz 200,
-// EXACTLY 5 tools visible, one happy-path call per tool (with the
+// EXACTLY 6 tools visible, one happy-path call per tool (with the
 // fake's post/reaction captures asserted), and one error shape (a bad
 // snowflake must arrive as an IsError tool result, not a protocol
 // error). Passes by construction; its job is to lock the wire path.
@@ -1662,7 +1711,8 @@ func TestWireEndToEnd(t *testing.T) {
 		},
 		sentMessage: &discordgo.Message{ID: "m100"},
 	}
-	srv := NewServer(f, 0)
+	ds := &fakeDecisionSource{rows: []DecisionRow{{ID: 9, MessageID: "d9", ChannelID: "42", AuthorID: "u1", Content: "sw1ft"}}}
+	srv := NewServer(f, ds, 0)
 	ts, cs := connectOverHTTP(t, srv)
 
 	// healthz over real HTTP.
@@ -1675,7 +1725,7 @@ func TestWireEndToEnd(t *testing.T) {
 		t.Fatalf("GET /healthz status = %d, want 200", resp.StatusCode)
 	}
 
-	// Exactly 5 tools visible over the wire.
+	// Exactly 6 tools visible over the wire.
 	tools, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
@@ -1684,10 +1734,10 @@ func TestWireEndToEnd(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names = append(names, tool.Name)
 	}
-	if len(names) != 5 {
-		t.Fatalf("ListTools = %d tools %v, want exactly 5", len(names), names)
+	if len(names) != 6 {
+		t.Fatalf("ListTools = %d tools %v, want exactly 6", len(names), names)
 	}
-	for _, want := range []string{"list_guilds", "list_channels", "read_messages", "post_message", "react"} {
+	for _, want := range []string{"list_guilds", "list_channels", "read_messages", "post_message", "react", "read_derpies_decisions"} {
 		if !sliceContains(names, want) {
 			t.Fatalf("ListTools tools = %v, want it to include %q", names, want)
 		}
@@ -1738,6 +1788,14 @@ func TestWireEndToEnd(t *testing.T) {
 		t.Errorf("react text = %q, want \"reacted 🔥 on 77\"", text)
 	}
 
+	res = callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if res.IsError {
+		t.Fatalf("read_derpies_decisions: IsError, %q", textOf(t, res))
+	}
+	if text := textOf(t, res); !strings.Contains(text, "1 decision") {
+		t.Errorf("read_derpies_decisions text = %q, want \"1 decision\"", text)
+	}
+
 	// The capture side of the write path (post + reaction) over the wire.
 	f.mu.Lock()
 	if len(f.messageSendCalls) != 1 || f.messageSendCalls[0].channelID != "42" || f.messageSendCalls[0].content != "hello" {
@@ -1775,4 +1833,120 @@ func textOf(t *testing.T, res *mcpSDK.CallToolResult) string {
 	}
 	t.Fatalf("no TextContent among %d content items in result %+v", len(res.Content), res)
 	return ""
+}
+
+// --- Task 4: read_derpies_decisions ------------------------------
+
+// Acceptance: the tool parses the args into a DecisionFilter, calls
+// ReadDecisions, returns the rows under a "decisions" key (mirroring
+// read_messages' "messages" convention) + a "N decision(s)" text
+// summary; a ReadDecisions error → a toolErr IsError result.
+func TestReadDerpiesDecisionsTool(t *testing.T) {
+	f := &fakeDecisionSource{
+		rows: []DecisionRow{
+			{ID: 1, MessageID: "m1", ChannelID: "c1", AuthorID: "u1", Content: "sw1ft",
+				Path:      pStr("fast"),
+				CreatedAt: time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
+			{ID: 2, MessageID: "m2", ChannelID: "c1", AuthorID: "u1", Content: "c0g",
+				Path: pStr("slow"), Score: pInt(80), Threshold: pInt(50), Word: pStr("c0g"),
+				Learned: true, Deleted: true, RejectReason: pStr("score >= T"),
+				CreatedAt: time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)},
+		},
+	}
+	srv := NewServer(&fakeDiscord{}, f, 0)
+	cs := connectInProcess(t, srv)
+
+	// (1) All args parse into the DecisionFilter; the rows ride under a
+	//     "decisions" key + a "N decision(s)" text summary.
+	res := callTool(t, cs, "read_derpies_decisions", map[string]any{
+		"author_id": "u1", "channel_id": "c1", "path": "fast", "deleted": true,
+		"score_min": 40, "score_max": 80, "since": "2026-01-01T00:00:00Z", "until": "2026-01-02T00:00:00Z", "limit": 100,
+	})
+	if res.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, res))
+	}
+	f.mu.Lock()
+	q := f.filter
+	f.mu.Unlock()
+	if q.AuthorID != "u1" || q.ChannelID != "c1" || q.Path != "fast" ||
+		q.Deleted == nil || !*q.Deleted ||
+		q.ScoreMin == nil || *q.ScoreMin != 40 ||
+		q.ScoreMax == nil || *q.ScoreMax != 80 ||
+		q.Since == nil || !q.Since.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) ||
+		q.Until == nil || !q.Until.Equal(time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)) ||
+		q.Limit != 100 {
+		t.Errorf("parsed filter = %+v, want the args mapped through", q)
+	}
+	if text := textOf(t, res); !strings.Contains(text, "2 decisions") {
+		t.Errorf("text = %q, want the \"2 decisions\" summary", text)
+	}
+	if res.StructuredContent == nil {
+		t.Fatal("no structured content in result")
+	}
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatalf("unmarshal structured content %s: %v", b, err)
+	}
+	rows, ok := rec["decisions"].([]any)
+	if !ok || len(rows) != 2 {
+		t.Fatalf("payload decisions = %v, want 2 rows under the \"decisions\" key", rec["decisions"])
+	}
+	r0 := rows[0].(map[string]any)
+	if r0["id"] != float64(1) || r0["message_id"] != "m1" || r0["path"] != "fast" || r0["score"] != nil {
+		t.Errorf("row0 = %v, want id 1 / m1 / fast / score null", r0)
+	}
+	r1 := rows[1].(map[string]any)
+	if r1["score"] != float64(80) || r1["word"] != "c0g" || r1["deleted"] != true {
+		t.Errorf("row1 = %v, want score 80 / word c0g / deleted true", r1)
+	}
+
+	// (2) A ReadDecisions error → a toolErr IsError result, no payload.
+	f.mu.Lock()
+	f.err = errors.New("db down")
+	f.mu.Unlock()
+	res = callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if !res.IsError {
+		t.Fatalf("store error: not IsError")
+	}
+	if got := textOf(t, res); got != "tugbot: db down" {
+		t.Errorf("text = %q, want %q", got, "tugbot: db down")
+	}
+	if res.StructuredContent != nil {
+		t.Errorf("StructuredContent = %+v, want nil on error", res.StructuredContent)
+	}
+}
+
+// TestReadDecisionsToolPassesRequestContext — the handler hands ReadDecisions
+// the SDK's request context (a child of the connection context), NOT
+// context.Background(): a slow queryDecisions (500-row scan) must be
+// cancellable on client disconnect/timeout. The marker value is set on the
+// connection ctx, which the SDK propagates to the handler (verified by the
+// probe); a handler that discarded the ctx (the pre-fix
+// context.Background()) would carry no marker and fail here.
+func TestReadDecisionsToolPassesRequestContext(t *testing.T) {
+	type markerKey struct{}
+	f := &fakeDecisionSource{rows: []DecisionRow{{ID: 1, MessageID: "m1"}}}
+	srv := NewServer(&fakeDiscord{}, f, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = context.WithValue(ctx, markerKey{}, "marker")
+	cs := connectInProcessWithCtx(t, srv, ctx)
+
+	res := callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if res.IsError {
+		t.Fatalf("IsError, %q", textOf(t, res))
+	}
+	f.mu.Lock()
+	got := f.gotCtx
+	f.mu.Unlock()
+	if got == nil {
+		t.Fatal("ReadDecisions was not called")
+	}
+	if got.Value(markerKey{}) != "marker" {
+		t.Errorf("ReadDecisions ctx value = %v, want the request-context marker (the handler discarded the ctx)", got.Value(markerKey{}))
+	}
 }

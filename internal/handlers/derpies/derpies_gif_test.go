@@ -805,7 +805,7 @@ func TestFlowGIFDownloadFailureStillDegradesToTextAsk(t *testing.T) {
 	if len(pi.prompts) != 1 {
 		t.Fatalf("prompts = %v, want exactly one", pi.prompts)
 	}
-	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "")
+	want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", nil)
 	if pi.prompts[0] != want {
 		t.Errorf("prompt = %q, want the 0-image 0-gif-frame text prompt %q", pi.prompts[0], want)
 	}
