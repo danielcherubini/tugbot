@@ -119,11 +119,13 @@ type DecisionSource interface {
 }
 
 // Server owns the SDK server object and (while running) the http.Server.
+// The DecisionSource is NOT held here: registerDecisionsTools captures it
+// directly via closure, so the field would be write-only (set in NewServer,
+// never read) and is deliberately omitted.
 type Server struct {
-	discord   DiscordAPI
-	decisions DecisionSource
-	port      int
-	srv       *mcpSDK.Server
+	discord DiscordAPI
+	port    int
+	srv     *mcpSDK.Server
 }
 
 // NewServer constructs the Server (does NOT start, does NOT bind a port).
@@ -139,7 +141,7 @@ func NewServer(d DiscordAPI, decisions DecisionSource, port int) *Server {
 	registerReadTools(srv, d)
 	registerDecisionsTools(srv, decisions)
 	registerWriteTools(srv, d)
-	return &Server{discord: d, decisions: decisions, port: port, srv: srv}
+	return &Server{discord: d, port: port, srv: srv}
 }
 
 // Start runs the http.Server on 0.0.0.0:{port} (mux: "/mcp" → the

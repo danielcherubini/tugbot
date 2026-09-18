@@ -142,13 +142,15 @@ type fakeDecisionSource struct {
 	filter DecisionFilter
 	calls  int
 	err    error
+	gotCtx context.Context // the ctx the handler handed ReadDecisions (nil if never called)
 }
 
-func (f *fakeDecisionSource) ReadDecisions(_ context.Context, f2 DecisionFilter) ([]DecisionRow, error) {
+func (f *fakeDecisionSource) ReadDecisions(ctx context.Context, f2 DecisionFilter) ([]DecisionRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.filter = f2
 	f.calls++
+	f.gotCtx = ctx
 	return f.rows, f.err
 }
 
@@ -163,6 +165,29 @@ func connectInProcess(t *testing.T, srv *Server) *mcpSDK.ClientSession {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	ct, st := mcpSDK.NewInMemoryTransports()
+	ss, err := srv.srv.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatalf("server Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = ss.Close() })
+	c := mcpSDK.NewClient(&mcpSDK.Implementation{Name: "fake-client", Version: "1.0.0"}, nil)
+	cs, err := c.Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatalf("client Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	return cs
+}
+
+// connectInProcessWithCtx runs the bridge Server over the SDK's own in-memory
+// transport pair, but connects BOTH sides under the caller-supplied ctx (the
+// SDK derives the tool handler's context from the connection context, so a
+// value set on this ctx is observable in the handler — see
+// TestReadDecisionsToolPassesRequestContext). It returns the connected client
+// session.
+func connectInProcessWithCtx(t *testing.T, srv *Server, ctx context.Context) *mcpSDK.ClientSession {
+	t.Helper()
 	ct, st := mcpSDK.NewInMemoryTransports()
 	ss, err := srv.srv.Connect(ctx, st, nil)
 	if err != nil {
@@ -1892,5 +1917,36 @@ func TestReadDerpiesDecisionsTool(t *testing.T) {
 	}
 	if res.StructuredContent != nil {
 		t.Errorf("StructuredContent = %+v, want nil on error", res.StructuredContent)
+	}
+}
+
+// TestReadDecisionsToolPassesRequestContext — the handler hands ReadDecisions
+// the SDK's request context (a child of the connection context), NOT
+// context.Background(): a slow queryDecisions (500-row scan) must be
+// cancellable on client disconnect/timeout. The marker value is set on the
+// connection ctx, which the SDK propagates to the handler (verified by the
+// probe); a handler that discarded the ctx (the pre-fix
+// context.Background()) would carry no marker and fail here.
+func TestReadDecisionsToolPassesRequestContext(t *testing.T) {
+	type markerKey struct{}
+	f := &fakeDecisionSource{rows: []DecisionRow{{ID: 1, MessageID: "m1"}}}
+	srv := NewServer(&fakeDiscord{}, f, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = context.WithValue(ctx, markerKey{}, "marker")
+	cs := connectInProcessWithCtx(t, srv, ctx)
+
+	res := callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if res.IsError {
+		t.Fatalf("IsError, %q", textOf(t, res))
+	}
+	f.mu.Lock()
+	got := f.gotCtx
+	f.mu.Unlock()
+	if got == nil {
+		t.Fatal("ReadDecisions was not called")
+	}
+	if got.Value(markerKey{}) != "marker" {
+		t.Errorf("ReadDecisions ctx value = %v, want the request-context marker (the handler discarded the ctx)", got.Value(markerKey{}))
 	}
 }

@@ -713,6 +713,28 @@ func TestQueryDecisionsSQL(t *testing.T) {
 	if len(rows) != 0 {
 		t.Errorf("until-before-all rows = %v, want 0", rows)
 	}
+	// (e) The id tiebreaker: two rows with the SAME created_at order by id
+	//     DESC (newest id first) — the ORDER BY created_at DESC, id DESC
+	//     makes same-timestamp rows deterministic. The created_at is older
+	//     than every prior row so it does not disturb the (a) no-filter
+	//     assertion; the unique author isolates the two rows.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO derpies_decisions (message_id, channel_id, author_id, content, path, score, threshold, learned, deleted, created_at)
+		VALUES ('tie_low', 'c9', 'tie', 'tie', 'slow', 10, 50, false, false, '2024-01-01 00:00:00'),
+		       ('tie_high', 'c9', 'tie', 'tie', 'slow', 10, 50, false, false, '2024-01-01 00:00:00');
+	`); err != nil {
+		t.Fatalf("tiebreaker insert: %v", err)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{AuthorID: "tie"})
+	if err != nil {
+		t.Fatalf("queryDecisions (tiebreaker): %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("tiebreaker rows = %d, want 2", len(rows))
+	}
+	if rows[0].MessageID != "tie_high" || rows[1].MessageID != "tie_low" {
+		t.Errorf("tiebreaker order = %q then %q, want tie_high (higher id) first (created_at DESC, id DESC)", rows[0].MessageID, rows[1].MessageID)
+	}
 }
 
 // TestConfigThresholdMissingRowSentinel — the poolStore level: an empty

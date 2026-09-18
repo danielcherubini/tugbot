@@ -291,8 +291,11 @@ func (p *poolStore) queryDecisions(ctx context.Context, f mcp.DecisionFilter) ([
 	if len(conds) > 0 {
 		query += "\n\t\t WHERE " + strings.Join(conds, " AND ")
 	}
+	// The id tiebreaker (appended to the ORDER BY below) makes same-timestamp
+	// created_at rows deterministic (newest id first) instead of
+	// nondeterministic.
 	args = append(args, limit)
-	query += "\n\t	 ORDER BY created_at DESC LIMIT $" + strconv.Itoa(len(args))
+	query += "\n\t	 ORDER BY created_at DESC, id DESC LIMIT $" + strconv.Itoa(len(args))
 	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -1107,14 +1110,22 @@ func (h *Derpies) flow(m *discordgo.Message) {
 	// 4. Fast path: one list SELECT; exact token match. The token set is
 	//     the UNION of the posted message and, when a referenced message
 	//     was fetched, its content (a reply re-quoting a seeded word hits
-	//     here without retyping).
+	//     here without retyping). The posted content's token set is computed
+	//     ONCE (postedToks) and reused for both the union build and the
+	//     anchor gate's posted-only word-like check (step 9); the union
+	//     (toks) is a copy so augmenting it with the referenced + embed-
+	//     title tokens leaves postedToks posted-only.
 	list, err := h.store.listGimmicks(ctx)
 	if err != nil {
 		slog.Error("derpies gimmick list fetch failed", "module", module, "error", err)
 		dec.RejectReason = strPtr("list fetch failed")
 		return
 	}
-	toks := tokensForMatch(m.Content)
+	postedToks := tokensForMatch(m.Content)
+	toks := make(map[string]bool, len(postedToks))
+	for t := range postedToks {
+		toks[t] = true
+	}
 	if referenced != nil {
 		for t := range tokensForMatch(referenced.Content) {
 			toks[t] = true
@@ -1174,7 +1185,10 @@ func (h *Derpies) flow(m *discordgo.Message) {
 			if len(phr) == 0 {
 				continue // a phrase with no non-empty tokens matches nothing
 			}
-			if phraseWindowMatch(postSeq, phr) || (refSeq != nil && phraseWindowMatch(refSeq, phr)) {
+			// refSeq may be nil (no referenced message); phraseWindowMatch's
+			// len(seq) < len(phrase) guard already returns false for it, so
+			// no nil check is needed here.
+			if phraseWindowMatch(postSeq, phr) || phraseWindowMatch(refSeq, phr) {
 				fast := "fast"
 				dec.Path = &fast
 				dec.Word = &phrase
@@ -1341,7 +1355,7 @@ func (h *Derpies) flow(m *discordgo.Message) {
 				// word needs a word-like anchor, and a word-less post has
 				// none — the frame-only dead-end stays dead (ADR 0007).
 				hasWordLikeTokens := false
-				for tok := range tokensForMatch(m.Content) {
+				for tok := range postedToks {
 					if wordLike(tok) {
 						hasWordLikeTokens = true
 						break

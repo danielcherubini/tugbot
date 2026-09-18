@@ -30,19 +30,21 @@ func registerDecisionsTools(srv *mcpSDK.Server, ds DecisionSource) {
 	mcpSDK.AddTool(srv, &mcpSDK.Tool{
 		Name:        "read_derpies_decisions",
 		Description: "Reads the derpies decision log (one row per judged message/edit) newest first. All filters are optional and AND-combined: author_id, channel_id, path (\"fast\"/\"slow\"), deleted, score_min/score_max, since/until (RFC3339), and limit (default 50, clamped to 500). Returns the rows under a \"decisions\" key with a \"N decision(s)\" text summary; a database error surfaces as an error result.",
-	}, func(_ context.Context, _ *mcpSDK.CallToolRequest, args readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
-		return handleReadDecisions(ds, args)
+	}, func(ctx context.Context, _ *mcpSDK.CallToolRequest, args readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
+		return handleReadDecisions(ctx, ds, args)
 	})
 }
 
 // handleReadDecisions converts the args to a DecisionFilter (the structs
-// are field-identical, so a direct conversion), calls the seam, and
+// are field-identical, so a direct conversion), calls the seam with the
+// SDK's request context (NOT context.Background() — a slow queryDecisions
+// 500-row scan must be cancellable on client disconnect/timeout), and
 // renders the rows (JSON under a "decisions" key — mirroring
 // read_messages' "messages" convention) + a "N decision(s)" text
 // summary. A ReadDecisions error → a toolErr IsError result (a read tool
 // failing is not a silent degradation).
-func handleReadDecisions(ds DecisionSource, a readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
-	rows, err := ds.ReadDecisions(context.Background(), DecisionFilter(a))
+func handleReadDecisions(ctx context.Context, ds DecisionSource, a readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
+	rows, err := ds.ReadDecisions(ctx, DecisionFilter(a))
 	if err != nil {
 		return toolErr("tugbot", err.Error()), nil, nil
 	}
