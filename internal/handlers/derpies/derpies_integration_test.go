@@ -2,6 +2,7 @@ package derpies
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -711,6 +712,76 @@ func TestQueryDecisionsSQL(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("until-before-all rows = %v, want 0", rows)
+	}
+}
+
+// TestConfigThresholdMissingRowSentinel — the poolStore level: an empty
+// derpies_config (no rows) yields the errConfigThresholdMissing sentinel
+// (not a value); a seeded row yields the value, not the sentinel. (The
+// flow treats both identically — TestFlowConfigFallback pins that; this
+// pins the sentinel distinction at the store level.)
+func TestConfigThresholdMissingRowSentinel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: PG not guaranteed available (testing.Short)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	url := os.Getenv("TUGBOT_TEST_DATABASE_URL")
+	if url == "" {
+		url = "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test"
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Skipf("cannot create pool: %v (is the compose PG running?)", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("cannot reach PG: %v (is the compose PG running?)", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// Precondition: the derpies_config shape (the 000005 DDL) with NO
+	// rows — the DROP ... CASCADE first makes the test rerunnable on
+	// the same test DB. Never touch the other derpies tables or
+	// features.
+	if _, err := pool.Exec(ctx, `
+		DROP TABLE IF EXISTS derpies_config CASCADE;
+		CREATE TABLE public.derpies_config (
+		    id integer NOT NULL,
+		    delete_threshold integer DEFAULT 50 NOT NULL,
+		    updated_at timestamp without time zone DEFAULT now() NOT NULL,
+		    CONSTRAINT derpies_config_pkey PRIMARY KEY (id),
+		    CONSTRAINT derpies_config_threshold_check CHECK (delete_threshold BETWEEN 41 AND 100)
+		);
+	`); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DROP TABLE IF EXISTS derpies_config CASCADE`); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	store := &poolStore{pool: pool}
+
+	// 1. An empty derpies_config (no rows): the sentinel error, not a
+	//    value — the caller can distinguish "not seeded yet" from a
+	//    real failure.
+	if _, err := store.configThreshold(ctx); !errors.Is(err, errConfigThresholdMissing) {
+		t.Errorf("configThreshold on an empty table = error %v, want the errConfigThresholdMissing sentinel", err)
+	}
+
+	// 2. A seeded row: the value, NOT the sentinel (the distinction is
+	//    one-way — a present row yields the clamped value).
+	if _, err := pool.Exec(ctx, `INSERT INTO derpies_config (id, delete_threshold) VALUES (1, 50)`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	got, err := store.configThreshold(ctx)
+	if err != nil {
+		t.Errorf("configThreshold on a seeded row = error %v, want nil", err)
+	}
+	if got != 50 {
+		t.Errorf("configThreshold = %d, want 50", got)
 	}
 }
 

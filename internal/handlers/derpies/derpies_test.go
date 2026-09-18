@@ -510,6 +510,51 @@ func TestGimmickPromptCustomTemplate(t *testing.T) {
 	}
 }
 
+func TestGimmickPromptPhrasesSubBlock(t *testing.T) {
+	// The {known} phrases sub-block (the optimizer): emitted ONLY when
+	// phrases exist, appended AFTER the words sub-block; the words
+	// sub-block is unchanged.
+	const phrHeader = "-----< known gimmick phrases (exact multi-word patterns) >-----"
+	const wordsHeader = "-----< known gimmick words (sorted ascending) >-----"
+	content := "holler at zswiftf now"
+
+	// Both words and phrases: the phrases header follows the words
+	// header, with the phrase lines after it.
+	got := gimmickPrompt(defaultPromptTemplate, content, []string{"bike"}, 0, 0, "", "", []string{"buy me a bike", "give me a sw1ft"})
+	wordsIdx := strings.Index(got, wordsHeader)
+	phrIdx := strings.Index(got, phrHeader)
+	if wordsIdx < 0 || phrIdx < 0 {
+		t.Fatalf("prompt must contain both sub-block headers:\n%q", got)
+	}
+	if phrIdx <= wordsIdx {
+		t.Errorf("phrases sub-block must be positioned AFTER the words sub-block (words at %d, phrases at %d)", wordsIdx, phrIdx)
+	}
+	// The phrase lines follow the phrases header.
+	if !strings.Contains(got[phrIdx:], "buy me a bike") || !strings.Contains(got[phrIdx:], "give me a sw1ft") {
+		t.Errorf("phrases sub-block must carry the phrase lines:\n%q", got[phrIdx:])
+	}
+
+	// Empty words + phrases: the phrases sub-block is emitted on its own
+	// (the words header is absent), and the phrase lines are present.
+	gotPhrOnly := gimmickPrompt(defaultPromptTemplate, content, nil, 0, 0, "", "", []string{"buy me a bike"})
+	if strings.Contains(gotPhrOnly, wordsHeader) {
+		t.Errorf("empty words list must omit the words header:\n%q", gotPhrOnly)
+	}
+	if !strings.Contains(gotPhrOnly, phrHeader) || !strings.Contains(gotPhrOnly, "buy me a bike") {
+		t.Errorf("phrases-only form must carry the phrases sub-block:\n%q", gotPhrOnly)
+	}
+
+	// No phrases: the phrases sub-block is omitted and the words
+	// sub-block is unchanged (no trailing header or line of its own).
+	gotNoPhr := gimmickPrompt(defaultPromptTemplate, content, []string{"bike"}, 0, 0, "", "", nil)
+	if strings.Contains(gotNoPhr, phrHeader) {
+		t.Errorf("no-phrases form must omit the phrases sub-block:\n%q", gotNoPhr)
+	}
+	if !strings.Contains(gotNoPhr, wordsHeader) || !strings.Contains(gotNoPhr, "bike") {
+		t.Errorf("no-phrases form must keep the words sub-block:\n%q", gotNoPhr)
+	}
+}
+
 func TestGimmickPromptNoMarkerReTrigger(t *testing.T) {
 	// The substitution must be two-phase: the markers are turned into inert
 	// placeholders on the TEMPLATE before any payload is inserted, so a
@@ -520,7 +565,7 @@ func TestGimmickPromptNoMarkerReTrigger(t *testing.T) {
 	// untrusted message region and the images/ref passes silently deleted
 	// their marker bytes from the very message the LLM judges.
 	known := []string{"bike", "sw1ft"}
-	content := "hey {content} {known} {{IMAGES}} {{REF}} look"
+	content := "hey {content} {known} {{IMAGES}} {{GIFS}} {{EMBED}} {{REF}} look"
 	got := gimmickPrompt(defaultPromptTemplate, content, known, 0, 0, "", "", nil)
 
 	// 1) The legitimate known block appears EXACTLY ONCE — at the template
@@ -554,7 +599,7 @@ func TestGimmickPromptNoMarkerReTrigger(t *testing.T) {
 		t.Fatalf("prompt must contain the fenced message region:\n%s", got)
 	}
 	region := got[start : end+len("UNTRUSTED MESSAGE>>>")]
-	for _, lit := range []string{content, "{content}", "{known}", "{{IMAGES}}", "{{REF}}"} {
+	for _, lit := range []string{content, "{content}", "{known}", "{{IMAGES}}", "{{GIFS}}", "{{EMBED}}", "{{REF}}"} {
 		if !strings.Contains(region, lit) {
 			t.Errorf("message region must keep %q verbatim (re-trigger bug); region:\n%s", lit, region)
 		}
@@ -1424,7 +1469,7 @@ func TestFlowDecisionLogArms(t *testing.T) {
 		assertIntPtr(t, d.Score, -1, "score")
 		assertPtr(t, d.RejectReason, "ask failed", "reject_reason")
 	})
-	t.Run("unrecognized verdict: reject_reason, slow path set", func(t *testing.T) {
+	t.Run("unrecognized verdict: reject_reason, no path", func(t *testing.T) {
 		// A legacy CLEAN / old GIMMICK verdict carries no SCORE line.
 		pi := &fakePi{resp: "CLEAN"}
 		store := &fakeStore{enabled: map[string]bool{FeatureKey: true}}
@@ -1799,6 +1844,95 @@ func TestFlowPhraseFastMatch(t *testing.T) {
 		}
 		if pi.asks != 1 {
 			t.Errorf("pi.asks = %d, want 1 (fell to the slow path)", pi.asks)
+		}
+	})
+	t.Run("a pure-punctuation stored phrase: folded to nothing, skipped (no match, no panic)", func(t *testing.T) {
+		// A stored phrase with no non-empty tokens (e.g. pure
+		// punctuation) folds to an empty sequence: it is skipped, never
+		// matches, and must not panic the window match.
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			phrases: []string{"!!!"},
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("!!! who wants to buy me a bike"))
+
+		if len(ops.deleted) != 0 {
+			t.Errorf("deleted = %v, want none (the phrase folds to no tokens)", ops.deleted)
+		}
+		if pi.asks != 1 {
+			t.Errorf("pi.asks = %d, want 1 (fell to the slow path)", pi.asks)
+		}
+	})
+	t.Run("a phrases fetch failure: degrade to the slow path, never act on a half-loaded list", func(t *testing.T) {
+		// The post WOULD fast-match the phrase if the list loaded —
+		// the fetch failure must degrade to the slow path (log +
+		// continue), never act on a half-loaded phrase list.
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled:    map[string]bool{FeatureKey: true},
+			phrasesErr: errors.New("db down"),
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("who wants to buy me a bike"))
+
+		if len(ops.deleted) != 0 {
+			t.Errorf("deleted = %v, want none (the phrase list never loaded)", ops.deleted)
+		}
+		if pi.asks != 1 {
+			t.Errorf("pi.asks = %d, want 1 (degraded to the slow path)", pi.asks)
+		}
+	})
+}
+
+// TestFlowPromptPhraseBlock — the prompt half of the phrase optimizer: the
+// emitted prompt carries the phrases sub-block when phrases exist, and
+// omits it on a phrases fetch failure (the degrade path never prompts
+// from a half-loaded list).
+func TestFlowPromptPhraseBlock(t *testing.T) {
+	const phrHeader = "-----< known gimmick phrases (exact multi-word patterns) >-----"
+	t.Run("phrases exist: the prompt carries the phrases sub-block", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled: map[string]bool{FeatureKey: true},
+			words:   map[string]bool{"sw1ft": true},
+			phrases: []string{"buy me a bike"},
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		content := "completely clean text"
+		h.flow(derpMsg(content))
+
+		if len(pi.prompts) != 1 {
+			t.Fatalf("prompts = %v, want exactly one", pi.prompts)
+		}
+		want := gimmickPrompt(defaultPromptTemplate, content, sortedKeys(store.words), 0, 0, "", "", store.phrases)
+		if pi.prompts[0] != want {
+			t.Errorf("prompt = %q, want %q", pi.prompts[0], want)
+		}
+		if !strings.Contains(pi.prompts[0], phrHeader) || !strings.Contains(pi.prompts[0], "buy me a bike") {
+			t.Errorf("prompt must carry the phrases sub-block:\n%q", pi.prompts[0])
+		}
+	})
+	t.Run("phrases fetch failed: the prompt omits the phrases sub-block", func(t *testing.T) {
+		pi := &fakePi{resp: "SCORE:10"}
+		store := &fakeStore{
+			enabled:    map[string]bool{FeatureKey: true},
+			words:      map[string]bool{"sw1ft": true},
+			phrasesErr: errors.New("db down"),
+		}
+		ops := &fakeOps{}
+		h := newTestDerpies(store, ops, pi)
+		h.flow(derpMsg("completely clean text"))
+
+		if len(pi.prompts) != 1 {
+			t.Fatalf("prompts = %v, want exactly one (the degrade path still asks)", pi.prompts)
+		}
+		if strings.Contains(pi.prompts[0], phrHeader) {
+			t.Errorf("phrases fetch failure must omit the phrases sub-block:\n%q", pi.prompts[0])
 		}
 	})
 }
