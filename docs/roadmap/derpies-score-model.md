@@ -49,9 +49,13 @@ This spec delivers three coordinated changes (A + B + C) plus the unifying
 
 ## Schema — migration `000005_derpies_score.up.sql`
 
-Three new objects. (The `derpies_gimmicks` and `derpies_prompt` tables are
-unchanged in shape; only the prompt *content* changes — see the prompt
-section.)
+Three new objects **plus a `derpies_prompt` UPDATE**. The prompt flip moves
+into this migration so the prompt, the config/decisions/phrases DDL, and the
+code deploy are **one atomic step** (the deploy runs migrations then restarts
+— see the Rollout section). The `derpies_gimmicks` table is unchanged in
+shape. The `derpies_prompt` table is unchanged in shape; its *content* changes
+in two places: the `000003` seed (for fresh DBs + the sync guard) and the
+live row (via this migration's UPDATE).
 
 ### `derpies_config` (single row — the operator's live dials)
 
@@ -65,13 +69,18 @@ CREATE SEQUENCE public.derpies_config_id_seq AS integer START WITH 1 INCREMENT B
 ALTER SEQUENCE public.derpies_config_id_seq OWNED BY public.derpies_config.id;
 ALTER TABLE ONLY public.derpies_config ALTER COLUMN id SET DEFAULT nextval('public.derpies_config_id_seq'::regclass);
 ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.derpies_config ADD CONSTRAINT derpies_config_threshold_check CHECK (delete_threshold BETWEEN 41 AND 100);
 INSERT INTO public.derpies_config (id, delete_threshold) VALUES (1, 50);
 ```
 
 Single row (`id = 1`), mirroring `derpies_prompt`. `delete_threshold` is T
 (default **50**). Fetched per-message like the prompt and the list; a fetch
 error or a missing row → the code default (50) — the flow never acts on a
-half-loaded config. Live-tunable via SQL/MCP with **no deploy**.
+half-loaded config. Live-tunable via SQL/MCP with **no deploy**. The CHECK
+bounds T to **41–100** (T must exceed the learn floor of 40 for the matrix
+bands to be non-contradictory — a `T ≤ 40` value is rejected at write time),
+and `configThreshold` clamps an out-of-range read to the default + a
+`slog.Warn` (belt-and-suspenders).
 
 ### `derpies_decisions` (append-only — one row per judged message/edit)
 
@@ -95,7 +104,10 @@ CREATE INDEX derpies_decisions_author_created_idx ON public.derpies_decisions (a
 CREATE INDEX derpies_decisions_created_idx ON public.derpies_decisions (created_at DESC);
 ```
 
-- `score` / `threshold` are NULL for `fast`-path rows.
+- `score` / `threshold` are NULL for `fast`-path rows, **and on every arm
+  that never reached the matrix** (`list fetch failed`, `pi unavailable`,
+  `ask failed`, `unrecognized verdict`) — a literal `score=0` is not written
+  for a verdict that never parsed.
 - `reject_reason` ∈ {`list fetch failed`, `pi unavailable`, `ask failed`,
   `unrecognized verdict`, `no valid word`, `verdict word not in message`,
   `all-digit word`, `invalid word`, `delete failed`, NULL}.
@@ -119,25 +131,38 @@ ALTER TABLE ONLY public.derpies_gimmick_phrases ADD CONSTRAINT derpies_gimmick_p
 ALTER TABLE ONLY public.derpies_gimmick_phrases ADD CONSTRAINT derpies_gimmick_phrases_phrase_key UNIQUE (phrase);
 ```
 
-**Phrase contract:** 2–8 tokens, each `wordmatch.WordValid`
-(`^[a-z0-9]{2,32}$`, ASCII for v1), joined by single spaces. Max = 8×32+7 =
-263 → varchar(300). `source` is **manual only** (no LLM learn of phrases —
-the verdict is a single word, so there is no phrase to learn).
+**Phrase contract:** 2–8 tokens, each `^[a-z0-9]{1,32}$` (ASCII for v1),
+joined by single spaces. The per-token minimum is **1** (not the word
+contract's 2) so real phrases like `buy me a bike` (whose `a` is 1 char) are
+storable — a single 1-char token is never a valid *word* (min 2), but it is
+fine as part of a multi-token phrase; the message side (`foldedTokenSequence`)
+already yields 1-char tokens, so only the stored-phrase validation relaxes.
+Max = 8×32+7 = 263 → varchar(300). `source` is **manual only** (no LLM learn
+of phrases — the verdict is a single word, so there is no phrase to learn).
 
 ## Code changes
 
-All in `internal/handlers/derpies` unless noted. The `wordmatch` package is
+All in `internal/handlers/derpies` unless noted; the MCP tool work is in
+`internal/mcp` + `cmd/tugbot` (section 4). The `wordmatch` package is
 **unchanged** (the `WordValid` stored-space contract stays
 `^[a-z0-9]{2,32}$`).
 
 ### 1. The score verdict (ADR 0010)
 
 - **`parseVerdict` → `parseVerdictScore`** (derpies.go). Scans **all** lines
-  (not just the first non-empty): the first line matching `^SCORE:(\d+)$`
-  (case-insensitive) whose value is 0–100 is the score; the first line
-  matching `^WORD:(\S+)$` (case-insensitive) is the word (trimmed,
-  lowercased). Returns `(score int, hasScore bool, word string)`. No valid
-  SCORE line → `hasScore=false` → the flow logs
+  (not just the first non-empty): each line is `TrimSpace`d first (the prompt
+  displays the reply format **indented** — `␣␣SCORE:<0-100>` — and an LLM
+  echoing the indentation must still parse), then the first line matching
+  `^SCORE:\s*(\d+)$` (case-insensitive) whose value is 0–100 is the score (the
+  `\s*` absorbs a space after the colon — `Score: 95` is a very common LLM
+  reply shape); the first line matching `^WORD:\s*(.+)$` (case-insensitive)
+  is the word — the **remainder of the line** (trimmed, lowercased), so a
+  spaced SPLIT answer
+  (`WORD:z w i f t`) is captured and handed to the unchanged
+  `foldVerdictWord` whitespace-collapse in the gate (ADR 0009's belt-and-
+  suspenders is preserved: both the spaced and the collapsed answer form
+  learn the collapsed word). Returns `(score int, hasScore bool, word
+  string)`. No valid SCORE line → `hasScore=false` → the flow logs
   `derpies unrecognized verdict — doing nothing` and returns (the existing
   degradation arm).
 - **The decision matrix** (replaces the current `switch kind` block, step
@@ -151,7 +176,10 @@ All in `internal/handlers/derpies` unless noted. The `wordmatch` package is
   - `T` is read via a new `store.configThreshold(ctx) (int, error)` seam
     (`SELECT delete_threshold FROM derpies_config LIMIT 1`); a fetch error
     or missing row → `defaultThreshold` (50) + a `slog.Warn` (mirrors the
-    prompt fallback).
+    prompt fallback). A read outside the 41–100 bounds (a pre-CHECK row) is
+    clamped to `defaultThreshold` + a `slog.Warn` — the matrix is defined
+    for `T > learnFloor` only; `T ≤ 40` is unrepresentable (the CHECK
+    constraint rejects it at write time).
   - **Learn** = the existing step-9 gate (two-arm + all-digit precondition)
     on the folded verdict word, **gated on `score ≥ 40`** (below the floor,
     no learn). The gate is unchanged in shape; only the score precondition
@@ -169,11 +197,20 @@ All in `internal/handlers/derpies` unless noted. The `wordmatch` package is
       return wordmatch.WordValid(tok) || unicodeVerdictShape(tok)
   }
   ```
-  `hasWordLikeTokens` scans the `toks` map for any `wordLike` key. A mention
-  snowflake (all-digit) / emoji-ref (colon) / pure-emoji token (folds to
-  `""`) is **not** word-like, so a "mention + emoji" message is judged like
-  an image-only post: a valid word passes, the score decides. The
-  non-ASCII arm (b) text-anchor requirement is unchanged.
+  `hasWordLikeTokens` is computed from **`tokensForMatch(m.Content)` only**
+  (the posted message — matching the prompt's "the message has no other text
+  words" scope). The **anchor check** (`!toks[fw]`) still uses the **union**
+  `toks` (posted + referenced + embed titles — the word may legitimately
+  anchor to the quoted content, which the LLM judges). So: an emoji-only
+  *post* (even when it *replies* to a texted message, or carries a link
+  with a word-like embed title — the ADR 0007 Klipy vector) has no word-like
+  tokens in `m.Content` → the anchor requirement is skipped → a semantic
+  `WORD` passes; a post WITH word-like text of its own requires the word to
+  be a token of the union. A mention snowflake (all-digit) / emoji-ref
+  (colon) / pure-emoji token (folds to `""`) is **not** word-like, so a
+  "mention + emoji" message is judged like an image-only post: a valid word
+  passes, the score decides. The non-ASCII arm (b) text-anchor requirement
+  is unchanged.
 
 ### 2. The fast-path phrase match (B)
 
@@ -183,16 +220,22 @@ All in `internal/handlers/derpies` unless noted. The `wordmatch` package is
   dropping tokens that trim to `""`. (No dedup, no collapsed-run handling —
   that stays in `tokensForMatch`, which is unchanged.)
 - **New `store.listPhrases(ctx) ([]string, error)`** seam
-  (`SELECT phrase FROM derpies_gimmick_phrases`). A DB error degrades the
-  flow (log + skip the phrase match, continue to the slow path) — never act
-  on a half-loaded phrase list.
+  (`SELECT phrase FROM derpies_gimmick_phrases ORDER BY phrase` — sorted,
+  so the `{known}` phrases sub-block is byte-stable and prompt tests can
+  assert on it, mirroring `sortedKeys` for the words). A DB error degrades
+  the flow (log + skip the phrase match, continue to the slow path) — never
+  act on a half-loaded phrase list.
 - **The phrase match** (flow step 4.25, after the word fast path, before
   images): for each stored phrase, split on single spaces into its tokens;
-  slide a window of that length over `foldedTokenSequence(m.Content)` (and
-  the referenced content, the same union the word fast path uses); an exact
-  consecutive match → fast hit: delete (zero asks) + a `derpies_decisions`
-  row (`path=fast`, `word=<phrase>`, `deleted=true`). The same
-  delete-failed / success log shape as the word fast path.
+  slide a window of that length over `foldedTokenSequence` of the **posted
+  content and the referenced content SEPARATELY** (never concatenated — a
+  phrase spanning the message/reply boundary must not match), mirroring how
+  the word fast path unions the two. **Embed titles are NOT scanned for
+  phrases** in v1 (a phrase living in an embed title is a follow-up; the
+  word fast path's embed-title union is unchanged). An exact consecutive
+  match → fast hit: delete (zero asks) + a `derpies_decisions` row
+  (`path=fast`, `word=<phrase>`, `deleted=true`). The same delete-failed /
+  success log shape as the word fast path.
 
 ### 3. The decision log (C)
 
@@ -215,29 +258,130 @@ All in `internal/handlers/derpies` unless noted. The `wordmatch` package is
   - 40 ≤ score < T → `score`, `threshold`, `learned` (if a valid word), no
     delete
   - score ≥ T → `score`, `threshold`, `learned` (if a valid word), `deleted`
+  - score ≥ T, delete FAILED → `score`, `threshold`, `learned` (if a valid
+    word), `deleted=false`, `reject_reason=delete failed` (the slow-path
+    variant of the fast-path delete-failure arm — the word stays learned,
+    the delete is logged as failed)
   - word rejected → the specific `reject_reason` (`no valid word` /
     `verdict word not in message` / `all-digit word` / `invalid word`);
     `deleted` still reflects `score ≥ T`
 - **Scope boundary:** the **nickname flow** (nicknames.go) is NOT logged to
-  `derpies_decisions` in v1 (a nickname is not a message). It uses the same
-  score model (a nickname scoring ≥ T resets), but its decisions stay in the
-  slog log.
+  `derpies_decisions` in v1 (a nickname is not a message) — its decisions
+  stay in the slog log. It DOES use the score model (section 6).
+
+### 6. The nickname flow (required — shares the verdict parse + prompt)
+
+`nicknames.go` calls `parseVerdict` (which section 1 **replaces**) and shares
+`defaultPromptTemplate`, the live `derpies_prompt` row, and `gimmickPrompt`.
+Leaving it untouched would both break compilation and silently kill the
+nickname-reset filter (once the live prompt is SCORE-format, every nickname
+verdict parses as "unrecognized" → no resets ever). So the nickname flow is
+updated in lockstep:
+
+- **Parse:** `nickFlow` calls `parseVerdictScore` (not the removed
+  `parseVerdict`).
+- **T:** the same `store.configThreshold` seam + fallback (50).
+- **The nickname matrix** (mirrors the message matrix; the action is the
+  nick reset, not a delete):
+  ```
+  score < 40:            do nothing (no reset, no learn)
+  40 ≤ score < T:        learn the word (if valid+anchored to the nick); no reset
+  score ≥ T:             learn the word (if valid+anchored) + reset the nick
+  ```
+  - **Fast path** (word-only, unchanged): a known **word** in the nick →
+    reset, zero asks. Phrase matching is **not** added to the nickname flow
+    in v1 — a nickname is a short display name and the word fast path covers
+    it (a phrase-in-nick is a follow-up). `nickFlow` passes `[]string{}`
+    (empty phrases) to the new `gimmickPrompt` signature, so the nickname
+    prompt's `{known}` block carries words only.
+  - **Learn gate:** the existing ADR 0008 arm (`wordValid` +
+    folded-token-in-nick), gated on `score ≥ 40`. The `wordLike` anchor fix
+    (section 1) applies: a nick with **no word-like tokens** (an all-emoji
+    nick) skips the anchor requirement → a valid word passes, the score
+    decides.
+  - **Reset** = `score ≥ T` (independent of whether a word was learned).
+  - **Cache write (load-bearing — mirrors today's discipline):** the
+    `lastNick` change-detection cache is written on every **judged** terminal
+    arm, so a later `GUILD_MEMBER_UPDATE` for the same nick (a role change,
+    a mute, etc.) is skipped by `cur == evt.Nick` and never re-judged. The
+    `score < 40` and `40 ≤ score < T` arms call `saveNick(key, evt.Nick)`
+    (the clean/unknown analog); `score ≥ T` goes through `resetNow`, which
+    already caches both the success and the failure outcome. The **pre-matrix
+    failure arms do NOT cache** (`list fetch failed`, `pi unavailable`,
+    `ask failed`) — a transient failure must stay retryable, so the nick is
+    re-judged on the next event. (The 60s `lastEdit` cooldown is separate —
+    it is marked only by `resetNow`.)
+- **Coalescing** (unchanged): at most one reset attempt per 60-second window
+  (success or failure marks the window); the bot's own reset is never
+  re-judged (the `cur == evt.Nick` echo skip).
+- **Tests:** the existing `nicknames_test.go` fake-pi seam — add the matrix
+  cases (score < 40 → no reset; 40 ≤ score < T → learn, no reset; score ≥ T
+  → reset; an all-emoji nick + a semantic `WORD` → reset; an all-emoji nick
+  + a `WORD` not anchored and score < 40 → no reset) **plus the cache case:
+  two `GUILD_MEMBER_UPDATE` events with the same nick, the first scoring
+  < 40 → the second (a role-only change) must produce zero pi asks** (the
+  `saveNick` on the no-reset arm is what makes the second event skip).
 
 ### 4. The MCP tool (C)
 
-- **New `Derpies.ReadDecisions(ctx, f *DecisionFilter) ([]DecisionRow, error)`**
-  public surface (the `Invoke`-style seam the Feature-tools glossary
-  describes). `DecisionFilter`: `AuthorID`, `ChannelID`, `Path`, `Deleted
-  *bool`, `ScoreMin`, `ScoreMax *int`, `Since`, `Until *time.Time`, `Limit`
-  (default 50, max 500). Ordered `created_at DESC`.
-- **New MCP tool `read_derpies_decisions`** in `internal/mcp` wrapping
-  `ReadDecisions` (alongside the existing feature tools).
+`internal/mcp` today has exactly ONE seam (`DiscordAPI`, wrapping
+discordgo session methods) and **no** DB/pool access — so this tool is new
+architectural surface, specified concretely:
+
+- **New seam interface in `internal/mcp`** (mcp.go):
+  ```go
+  type DecisionSource interface {
+      ReadDecisions(ctx context.Context, f DecisionFilter) ([]DecisionRow, error)
+  }
+  ```
+  `DecisionFilter` and `DecisionRow` are defined in `internal/mcp` (the
+  tool's I/O contract). `DecisionFilter`: `AuthorID`, `ChannelID`, `Path`,
+  `Deleted *bool`, `ScoreMin *int`, `ScoreMax *int`, `Since`, `Until
+  *time.Time`, `Limit` (default 50, max 500 — clamped, not an error).
+  `DecisionRow` mirrors the `derpies_decisions` columns. (The handler's
+  `ReadDecisions` method — below — takes these `internal/mcp` types, so
+  `internal/handlers/derpies` imports `internal/mcp` for the types; there is
+  no cycle — `internal/mcp` does not import the handler.)
+- **`NewServer` signature change**: `NewServer(d DiscordAPI, decisions
+  DecisionSource, port int) *Server`. Existing callers (`cmd/tugbot`, the
+  `mcp_test.go` fakes) are updated to pass the decision source — tests pass
+  a fake `DecisionSource` (or a nil-tolerant no-op where the tool is not
+  under test).
+- **`Derpies.ReadDecisions(ctx context.Context, f mcp.DecisionFilter)
+  ([]mcp.DecisionRow, error)`** — the handler's public surface (the
+  `Invoke`-style seam the Feature-tools glossary describes), built on the
+  `recordDecision` store seam's inverse: a parameterized `SELECT` with the
+  filter clauses composed (all optional, AND-combined), `ORDER BY
+  created_at DESC`, `LIMIT min(limit, 500)`. A DB error propagates (the MCP
+  tool surfaces it as a tool error — a read tool failing is not a silent
+  degradation).
+- **Production wiring (`cmd/tugbot`)**: the `*Derpies` handler (which
+  implements `ReadDecisions`) is passed to `NewServer` as the
+  `DecisionSource`.
+- **New MCP tool `read_derpies_decisions`** (registered in `tools_read.go`
+  — or a new `tools_decisions.go`; `tools.go` is the shared-helpers file,
+  not where tools register): parses the tool arguments into a
+  `DecisionFilter`, calls `s.decisions.ReadDecisions`, returns the rows as
+  JSON. The `registerReadTools(srv, d)` signature gains the `DecisionSource`
+  (or a new `registerDecisionsTools`). Note: ADR 0004's LAN-trust posture
+  applies — the tool is read-only and the embedded server is LAN-bound.
+  **Call-site notes:** `cmd/tugbot` has **two** `NewServer` call sites —
+  the production one (pass the `*Derpies` handler) and the selftest one
+  (currently `_ = newHandlers(a)`, which discards the handlers — it must
+  keep the handler, or pass a no-op `DecisionSource`, to compile); and the
+  production construction's tool-list `slog` line (which hardcodes
+  `"… read_messages, post_message, react"`) gains the new tool name.
+- **Test fake**: a fake `DecisionSource` in `mcp_test.go` (mirrors the
+  existing `DiscordAPI` fake pattern).
 
 ### 5. The store interface
 
-The `store` interface (derpies.go) gains three methods: `configThreshold`,
-`listPhrases`, `recordDecision`. The `poolStore` implements them; the test
-fakes implement them (mirroring the existing seam pattern).
+The `store` interface (derpies.go) gains four methods: `configThreshold`,
+`listPhrases`, `recordDecision` (the write), and `queryDecisions` (the
+parameterized `SELECT` behind `ReadDecisions` — the filter clauses composed
+from the `mcp.DecisionFilter`, `ORDER BY created_at DESC`, `LIMIT`). The
+`poolStore` implements them; the test fakes implement them (mirroring the
+existing seam pattern).
 
 ## The prompt (code default + migration seed + live row, in sync)
 
@@ -263,7 +407,9 @@ phrases — appended after the words:
 
 (Only the phrases sub-block is emitted when phrases exist; the words
 sub-block is unchanged. The template's `{known}` marker is unchanged — the
-code assembles the combined block.)
+code assembles the combined block. The words list is always seeded and
+non-empty in practice, so the "words empty but phrases present" dangling-
+header case is a documented non-case.)
 
 The new `defaultPromptTemplate`:
 
@@ -311,9 +457,10 @@ Judgement rules (these override politeness):
 - If you have to imagine an innocent reading to score it 0-39, you are probably wrong — he is very good at making solicitations look like questions.
 - When you are torn between two bands: score toward the HIGHER side.
 
-Reply with EXACTLY two lines:
+Reply with one or two lines — the SCORE line always, the WORD line only when
+the message carries a real trace (score >= 40):
   SCORE:<0-100>
-  WORD:<anchor>        (only when the message carries a real trace, score >= 40)
+  WORD:<anchor>
 where <word> is the anchor word: the as-appears respelled token for a known-gimmick trace, or the single most distinctive word of the fresh gimmick. The rules for <word>:
 - It MUST be a token of the message text AS IT APPEARS (case and edge punctuation aside; ignore unicode bent — you SHOULD judge "žwift" to be "zwift") — EXCEPT when the gimmick lives ONLY in the emojis (the message has no other text words): then answer the most distinctive word of what the emojis MEAN (e.g. "zwift" for 💸🚵).
 - When the anchor is in a NON-LATIN script, answer the message's OWN foreign-script token as it appears (e.g. زويفت, دراجة, 骑行, دوچرخه) — NEVER the English-known-word translation unless that English word literally appears in the message. "zwift" for a message containing only زويفت is the INVALID answer; "زويفت" is correct.
@@ -333,7 +480,16 @@ methods).
 - **`parseVerdictScore`** (unit): `SCORE:95` + `WORD:zwift` → (95, true,
   "zwift"); `SCORE:95` alone → (95, true, ""); `CLEAN` / `GIMMICK:zwift`
   (old format) → (0, false, "") → "unrecognized"; `SCORE:150` (out of
-  range) → (0, false, ""); `SCORE:55\nWORD:زويفت` → (55, true, "زويفت").
+  range) → (0, false, ""); `SCORE:55\nWORD:زويفت` → (55, true, "زويفت");
+  **indented** `  SCORE:95\n  WORD:zwift` (the prompt's reply format is
+  indented — `TrimSpace` per line) → (95, true, "zwift"); **space after the
+  colon** `Score: 95` (a very common LLM shape — the `\s*` absorbs it) →
+  (95, true, ""); **prose around
+  the lines** (`Sure!\nSCORE:80\nWORD:swift\nHope that helps`) → (80, true,
+  "swift") (the scan-all-lines behavior); **spaced SPLIT word**
+  `SCORE:70\nWORD:z w i f t` → (70, true, "z w i f t") — the remainder is
+  captured and the gate's `foldVerdictWord` collapses it to `zwift` (ADR
+  0009 preserved).
 - **`wordLike`** (unit): `zwift` → true; `272889785318768641` (all-digit) →
   false; `derpies:1021692390177775657` (colon) → false; `""` → false;
   `خفيف` (non-ASCII shape) → true; `a` (1 rune) → false.
@@ -341,7 +497,9 @@ methods).
   delete/learn; 40 ≤ score < T → learn, no delete; score ≥ T → learn +
   delete; score ≥ T with no word → delete, no learn; word rejected (all-digit
   / invalid / not anchored) → the specific `reject_reason`, delete still
-  reflects `score ≥ T`.
+  reflects `score ≥ T`; **`T ≤ 40` is unrepresentable** (the CHECK rejects
+  it at write time; a pre-CHECK out-of-range read is clamped to the default
+  + a `slog.Warn`).
 - **The anchor gate (A)** (integration, the observed case): a "mention +
   emoji" message (`<@…> 💸 <:derpies:…> 🚵`) with a `SCORE:95 WORD:zwift`
   verdict → `hasWordLikeTokens=false` → the word passes → delete + learn.
@@ -367,17 +525,40 @@ methods).
 
 ## Rollout
 
-1. **Migration** `000005_derpies_score.up.sql` (the three objects) — applied
-   on the next `make migrate` / deploy.
-2. **Code** (this spec) — the derpies package + the `internal/mcp` tool +
-   the `000003` seed update.
-3. **Live prompt** — `UPDATE derpies_prompt SET body = <new text>,
-   updated_at = now();` (live immediately, no deploy — the flow fetches the
-   row per message).
-4. **Deploy** the code: `ssh root@tugbot update-tugbot` (pulls main, runs
-   migrations, builds, restarts). Confirm the head commit matches the pushed
-   commit and the service is `active (running)`.
+The prompt flip lives **inside migration 000005** (not a manual pre-deploy
+UPDATE): the deploy runs migrations then restarts, so the prompt, the
+config/decisions/phrases DDL, and the new code all flip in **one atomic
+step**. (A manual pre-deploy `UPDATE derpies_prompt` would create a
+guaranteed slow-path-dead window: old code + new SCORE-format prompt →
+every verdict "unrecognized" → zero slow-path deletes/learns until the
+deploy completes — and silent if the deploy stalls. The reverse order is
+equally dead: new code + old binary prompt → `hasScore=false`.)
+
+1. **Migration** `000005_derpies_score.up.sql` — the three objects +
+   `UPDATE derpies_prompt SET body = <new score prompt>, updated_at =
+   now();`. Applied by the deploy (or `make migrate`).
+2. **`000003` seed update** — the `derpies_prompt` seed in
+   `migrations/000003_derpies_prompt.up.sql` is set to the new score prompt
+   (byte-for-byte with the Go constant, modulo the `''` doubling) — for
+   fresh DBs + the `TestMigration000003AppliesAndSeeds` sync guard. (000003
+   is already applied in production; editing it does not re-run there — the
+   production flip comes from 000005's UPDATE. On a fresh DB, 000003 seeds
+   the score prompt and 000005's UPDATE re-sets it to the same text — a
+   no-op.)
+3. **Code** (this spec) — the derpies package + the `internal/mcp` tool +
+   the `cmd/tugbot` wiring.
+4. **Deploy**: `ssh root@tugbot update-tugbot` (pulls main, runs migrations
+   — including 000005's prompt UPDATE — builds, restarts). Confirm the head
+   commit matches the pushed commit and the service is `active (running)`.
+   After the restart the prompt is SCORE-format and the code parses SCORE —
+   atomic.
 5. **Verify** (below).
+
+Residual risk: a deploy that fails *after* the migration applies but *before
+the restart* leaves the prompt SCORE-format while the old code still runs —
+the slow path is dead until a re-deploy. Manual rollback: `UPDATE
+derpies_prompt SET body = <previous binary prompt>, updated_at = now();`
+(the previous body is in git history / the pre-deploy DB).
 
 ## Verification
 
@@ -389,7 +570,7 @@ methods).
   DESC LIMIT 10;` returns rows; the `read_derpies_decisions` MCP tool returns
   the same.
 - **The selftest:** `go run ./cmd/tugbot --selftest` logs "Discord session
-  and all thirteen handlers constructed", exit 0.
+  and all thirteen handlers and the MCP server constructed", exit 0.
 - **The full gate** (per AGENTS.md): `go build ./... && go vet ./... &&
   gofmt -l . && make lint && go test ./...`, then the DB-touching gate
   (`make db-up` + `TUGBOT_TEST_DATABASE_URL=… go test -p 1 -count=1 ./...`).
