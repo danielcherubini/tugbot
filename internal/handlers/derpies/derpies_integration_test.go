@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danielcherubini/tugbot/internal/dbmigrate"
+	"github.com/danielcherubini/tugbot/internal/mcp"
 )
 
 // TestMigration000002AppliesAndSeeds — runs the REAL migration file (not
@@ -503,3 +504,218 @@ func TestMigration000005AppliesAndSeeds(t *testing.T) {
 		t.Errorf("derpies_prompt.body != defaultPromptTemplate constant (the 000005 UPDATE text is out of sync with the code default)")
 	}
 }
+
+// TestQueryDecisionsSQL — the parameterized SELECT behind ReadDecisions,
+// for real: rows are inserted through recordDecision (exercising the
+// NULL-pointer binds — a path=NULL pre-path row, a score=NULL fast row,
+// a reject_reason=NULL row) + a bulk past row set so the LIMIT clamp is
+// real, then queryDecisions is called with each filter clause and the
+// WHERE-building, ORDER BY created_at DESC, and the LIMIT default (50)
+// + clamp (500) are asserted. A typo in the composed SQL ships green
+// otherwise.
+func TestQueryDecisionsSQL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: PG not guaranteed available (testing.Short)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	url := os.Getenv("TUGBOT_TEST_DATABASE_URL")
+	if url == "" {
+		url = "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test"
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Skipf("cannot create pool: %v (is the compose PG running?)", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("cannot reach PG: %v (is the compose PG running?)", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// Precondition: the derpies_decisions shape (the 000005 DDL) — the
+	// DROP ... CASCADE first makes the test rerunnable on the same test
+	// DB. Never touch the other derpies tables or features.
+	if _, err := pool.Exec(ctx, `
+		DROP TABLE IF EXISTS derpies_decisions CASCADE;
+		CREATE TABLE public.derpies_decisions (
+		    id bigserial PRIMARY KEY,
+		    message_id text NOT NULL,
+		    channel_id text NOT NULL,
+		    author_id text NOT NULL,
+		    content text NOT NULL DEFAULT '',
+		    path text CHECK (path IN ('fast', 'slow')),
+		    score integer,
+		    threshold integer,
+		    word text,
+		    learned boolean NOT NULL DEFAULT false,
+		    deleted boolean NOT NULL DEFAULT false,
+		    reject_reason text,
+		    created_at timestamp without time zone DEFAULT now() NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DROP TABLE IF EXISTS derpies_decisions CASCADE`); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	store := &poolStore{pool: pool}
+
+	// 1. Three rows through recordDecision (the NULL-pointer binds):
+	//    a path=NULL pre-path row (reject_reason set), a score=NULL fast
+	//    row (reject_reason NULL), a reject_reason=NULL slow row.
+	if err := store.recordDecision(ctx, &decisionRecord{
+		MessageID: "dm1", ChannelID: "c1", AuthorID: "u1", Content: "hi",
+		RejectReason: strPtr("list fetch failed"),
+	}); err != nil {
+		t.Fatalf("recordDecision (pre-path row): %v", err)
+	}
+	if err := store.recordDecision(ctx, &decisionRecord{
+		MessageID: "dm2", ChannelID: "c1", AuthorID: "u1", Content: "sw1ft",
+		Path: strPtr("fast"),
+	}); err != nil {
+		t.Fatalf("recordDecision (fast row): %v", err)
+	}
+	if err := store.recordDecision(ctx, &decisionRecord{
+		MessageID: "dm3", ChannelID: "c2", AuthorID: "u2", Content: "c0g",
+		Path: strPtr("slow"), Score: intPtr(80), Threshold: intPtr(50),
+		Word: strPtr("c0g"), Learned: true, Deleted: true,
+	}); err != nil {
+		t.Fatalf("recordDecision (slow row): %v", err)
+	}
+	// Distinct, ordered created_at (the default now() would tie within
+	// the test): newest first — dm3, dm2, dm1.
+	if _, err := pool.Exec(ctx, `
+		UPDATE derpies_decisions SET created_at = '2026-01-03 00:00:00' WHERE message_id = 'dm3';
+		UPDATE derpies_decisions SET created_at = '2026-01-02 00:00:00' WHERE message_id = 'dm2';
+		UPDATE derpies_decisions SET created_at = '2026-01-01 00:00:00' WHERE message_id = 'dm1';
+	`); err != nil {
+		t.Fatalf("set created_at: %v", err)
+	}
+	// 2. A bulk past row set (505 rows, all slow / score 10 / author u3)
+	//    so the LIMIT clamp is real (508 total > 500).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO derpies_decisions (message_id, channel_id, author_id, content, path, score, threshold, learned, deleted, created_at)
+		SELECT 'bulk' || i, 'c3', 'u3', 'bulk', 'slow', 10, 50, false, false,
+		       '2025-01-01 00:00:00'::timestamp + (i || ' seconds')::interval
+		FROM generate_series(1, 505) AS i;
+	`); err != nil {
+		t.Fatalf("bulk insert: %v", err)
+	}
+
+	// 3. Asserts.
+	// (a) No filter: the LIMIT default 50 (508 rows exist) + ORDER BY
+	//     created_at DESC (dm3 first) + the NULL-pointer binds round-
+	//     trip (the pre-path row's path is NULL, the fast row's score is
+	//     NULL, the slow row's reject_reason is NULL).
+	rows, err := store.queryDecisions(ctx, mcp.DecisionFilter{})
+	if err != nil {
+		t.Fatalf("queryDecisions (no filter): %v", err)
+	}
+	if len(rows) != 50 {
+		t.Errorf("rows = %d, want the default-limit 50", len(rows))
+	}
+	if rows[0].MessageID != "dm3" {
+		t.Errorf("first row = %q, want dm3 (ORDER BY created_at DESC)", rows[0].MessageID)
+	}
+	for _, r := range rows {
+		switch r.MessageID {
+		case "dm1":
+			if r.Path != nil || r.RejectReason == nil || *r.RejectReason != "list fetch failed" {
+				t.Errorf("dm1 = %+v, want path NULL + reject_reason 'list fetch failed'", r)
+			}
+		case "dm2":
+			if r.Path == nil || *r.Path != "fast" || r.Score != nil || r.RejectReason != nil {
+				t.Errorf("dm2 = %+v, want path 'fast' + score NULL + reject_reason NULL", r)
+			}
+		case "dm3":
+			if r.Path == nil || *r.Path != "slow" || r.Score == nil || *r.Score != 80 ||
+				r.RejectReason != nil || !r.Learned || !r.Deleted {
+				t.Errorf("dm3 = %+v, want path 'slow' + score 80 + reject_reason NULL + learned + deleted", r)
+			}
+		}
+	}
+	// (b) The LIMIT clamp: 1000 → 500 (508 rows exist).
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{Limit: 1000})
+	if err != nil {
+		t.Fatalf("queryDecisions (limit 1000): %v", err)
+	}
+	if len(rows) != 500 {
+		t.Errorf("rows = %d, want the clamped 500", len(rows))
+	}
+	// (c) Each WHERE clause.
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{AuthorID: "u2"})
+	if err != nil {
+		t.Fatalf("queryDecisions (author): %v", err)
+	}
+	if len(rows) != 1 || rows[0].MessageID != "dm3" {
+		t.Errorf("author filter rows = %v, want exactly dm3", rows)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{ChannelID: "c2"})
+	if err != nil {
+		t.Fatalf("queryDecisions (channel): %v", err)
+	}
+	if len(rows) != 1 || rows[0].MessageID != "dm3" {
+		t.Errorf("channel filter rows = %v, want exactly dm3", rows)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{Path: "fast"})
+	if err != nil {
+		t.Fatalf("queryDecisions (path fast): %v", err)
+	}
+	if len(rows) != 1 || rows[0].MessageID != "dm2" {
+		t.Errorf("path fast rows = %v, want exactly dm2 (the NULL-path pre-path row is excluded)", rows)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{Path: "slow", Limit: 1000})
+	if err != nil {
+		t.Fatalf("queryDecisions (path slow): %v", err)
+	}
+	if len(rows) != 500 {
+		t.Errorf("path slow rows = %d, want the clamped 500 (1 slow record row + 505 bulk rows)", len(rows))
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{Deleted: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("queryDecisions (deleted true): %v", err)
+	}
+	if len(rows) != 1 || rows[0].MessageID != "dm3" {
+		t.Errorf("deleted=true rows = %v, want exactly dm3", rows)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{ScoreMin: intPtr(50), ScoreMax: intPtr(90)})
+	if err != nil {
+		t.Fatalf("queryDecisions (score range): %v", err)
+	}
+	if len(rows) != 1 || rows[0].MessageID != "dm3" {
+		t.Errorf("score range rows = %v, want exactly dm3 (score 80; the NULL-score fast row is excluded)", rows)
+	}
+	// (d) Since/Until (bound UTC — created_at is timestamp without time
+	//     zone): the window [01-02, 01-03] captures dm3 + dm2, newest
+	//     first; an until strictly before all rows captures nothing (the
+	//     until comparison is inclusive: <=).
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{
+		Since: timePtr(time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)),
+		Until: timePtr(time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)),
+	})
+	if err != nil {
+		t.Fatalf("queryDecisions (since/until): %v", err)
+	}
+	if len(rows) != 2 || rows[0].MessageID != "dm3" || rows[1].MessageID != "dm2" {
+		t.Errorf("since/until rows = %v, want dm3 then dm2", rows)
+	}
+	rows, err = store.queryDecisions(ctx, mcp.DecisionFilter{
+		Until: timePtr(time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)),
+	})
+	if err != nil {
+		t.Fatalf("queryDecisions (until before all): %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("until-before-all rows = %v, want 0", rows)
+	}
+}
+
+// intPtr / boolPtr / timePtr — pointer helpers for the test's nullable
+// filter fields (strPtr lives in the package proper).
+func intPtr(i int) *int              { return &i }
+func boolPtr(b bool) *bool           { return &b }
+func timePtr(t time.Time) *time.Time { return &t }

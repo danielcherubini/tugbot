@@ -299,13 +299,14 @@ func runSelftest() int {
 	d.Identify.Intents = botIntents()
 
 	a := app.NewApp(cfg, pool, d)
-	_ = newHandlers(a)
+	h := newHandlers(a)
 	// The MCP server is CONSTRUCTED (its tools' construction step);
 	// Start is NOT called here — production wiring is the MCP bridge
 	// wiring task. NewRealDiscord wraps the real session in the
 	// DiscordAPI seam (pointer form; production = always on, port from
-	// config).
-	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), cfg.MCPPort)
+	// config); h.derpies satisfies the DecisionSource seam (the
+	// read_derpies_decisions tool's read).
+	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), h.derpies, cfg.MCPPort)
 	if mcpSrv == nil {
 		slog.Error("Failed to construct MCP server", "module", "main")
 		return 1
@@ -399,8 +400,8 @@ func run() {
 	// session, never a second gateway connection). Constructed here
 	// after the handler wiring and before the background loops +
 	// d.Open().
-	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), cfg.MCPPort)
-	slog.Info(fmt.Sprintf("MCP server constructed (tools: list_guilds, list_channels, read_messages, post_message, react; http://0.0.0.0:%d/mcp)", cfg.MCPPort), "module", "main")
+	mcpSrv := mcp.NewServer(mcp.NewRealDiscord(d), h.derpies, cfg.MCPPort)
+	slog.Info(fmt.Sprintf("MCP server constructed (tools: list_guilds, list_channels, read_messages, read_derpies_decisions, post_message, react; http://0.0.0.0:%d/mcp)", cfg.MCPPort), "module", "main")
 
 	// OnMessageCreate → teh, twitter, bsky, instagram, mention in that
 	// order (Rust mod.rs dispatch order — the commented-out TikTok arm

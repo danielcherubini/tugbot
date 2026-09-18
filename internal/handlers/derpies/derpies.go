@@ -1006,6 +1006,33 @@ func phraseWindowMatch(seq, phrase []string) bool {
 // take a pointer per rejection reason).
 func strPtr(s string) *string { return &s }
 
+// ReadDecisions — the mcp.DecisionSource implementation (the
+// read_derpies_decisions tool's read): the Limit default/clamp is
+// applied here (limit <= 0 → 50, limit > 500 → 500 — clamped, not an
+// error), Since/Until are normalized to UTC before binding (the
+// created_at column is timestamp without time zone; pgx encodes a
+// *time.Time with its offset, so a non-UTC value would compare against
+// the session's timezone interpretation), and a DB error propagates
+// (the MCP tool surfaces it as a tool error — a read tool failing is
+// not a silent degradation).
+func (h *Derpies) ReadDecisions(ctx context.Context, f mcp.DecisionFilter) ([]mcp.DecisionRow, error) {
+	if f.Limit <= 0 {
+		f.Limit = 50
+	}
+	if f.Limit > 500 {
+		f.Limit = 500
+	}
+	if f.Since != nil {
+		s := f.Since.UTC()
+		f.Since = &s
+	}
+	if f.Until != nil {
+		u := f.Until.UTC()
+		f.Until = &u
+	}
+	return h.store.queryDecisions(ctx, f)
+}
+
 // recordDecision — the decision log's best-effort write (C): a failure
 // logs (module derpies) and does not abort — the delete/learn already
 // happened.
