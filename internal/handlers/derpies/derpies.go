@@ -26,18 +26,22 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danielcherubini/tugbot/internal/app"
 	"github.com/danielcherubini/tugbot/internal/features"
 	core "github.com/danielcherubini/tugbot/internal/handlers/gulag"
+	"github.com/danielcherubini/tugbot/internal/mcp"
 	"github.com/danielcherubini/tugbot/internal/wordmatch"
 )
 
@@ -45,6 +49,13 @@ const (
 	FeatureKey = "derpies"
 	SourceSeed = "seed"
 	SourceLLM  = "llm"
+
+	// learnFloor — the decision-matrix floor: the matrix is defined for
+	// T > learnFloor only (learn at score >= 40, delete at score >= T).
+	learnFloor = 40
+	// defaultThreshold — the T a clamp (or a missing/errored config row)
+	// falls back to; the derpies_config seed row's value.
+	defaultThreshold = 50
 
 	module = "derpies" // slog module tag
 )
@@ -116,6 +127,23 @@ type store interface {
 	// error -> error — the flow's fallback engages (code default), so
 	// the filter never runs with a broken prompt.
 	promptText(ctx context.Context) (string, error)
+	// configThreshold — the live delete threshold T (derpies_config,
+	// one row). A DB error OR a missing row -> (0, err) (the caller's
+	// fallback is Task 2); a valid row -> (clampThreshold(value), nil)
+	// — the clamp is applied here, so a pre-CHECK read of T ≤ 40 or
+	// > 100 yields the default.
+	configThreshold(ctx context.Context) (int, error)
+	// listPhrases — the stored multi-word phrases (derpies_gimmick_phrases),
+	// sorted ascending (the {known} phrases sub-block is byte-stable,
+	// mirroring sortedKeys for the words). A DB error propagates.
+	listPhrases(ctx context.Context) ([]string, error)
+	// recordDecision — append one decision row (derpies_decisions,
+	// append-only); the pointer fields pass through as NULL when nil.
+	recordDecision(ctx context.Context, d *decisionRecord) error
+	// queryDecisions — the parameterized SELECT behind ReadDecisions
+	// (Task 4): optional filter clauses (all AND-combined), ORDER BY
+	// created_at DESC, LIMIT min(limit, 500).
+	queryDecisions(ctx context.Context, f mcp.DecisionFilter) ([]mcp.DecisionRow, error)
 }
 
 type discordOps interface {
@@ -170,6 +198,115 @@ func (p *poolStore) promptText(ctx context.Context) (string, error) {
 	var body string
 	err := p.pool.QueryRow(ctx, `SELECT body FROM derpies_prompt LIMIT 1`).Scan(&body)
 	return body, err
+}
+
+// errConfigThresholdMissing — the sentinel for a derpies_config with no
+// row (a DB error is returned as-is; a missing row gets this sentinel so
+// the caller can distinguish "not seeded yet" from a real failure).
+var errConfigThresholdMissing = errors.New("derpies_config row missing")
+
+func (p *poolStore) configThreshold(ctx context.Context) (int, error) {
+	var v int
+	err := p.pool.QueryRow(ctx, `SELECT delete_threshold FROM derpies_config LIMIT 1`).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, errConfigThresholdMissing
+		}
+		return 0, err
+	}
+	return clampThreshold(v), nil
+}
+
+func (p *poolStore) listPhrases(ctx context.Context) ([]string, error) {
+	rows, err := p.pool.Query(ctx, `SELECT phrase FROM derpies_gimmick_phrases ORDER BY phrase`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ph string
+		if err := rows.Scan(&ph); err != nil {
+			return nil, err
+		}
+		out = append(out, ph)
+	}
+	return out, rows.Err()
+}
+
+func (p *poolStore) recordDecision(ctx context.Context, d *decisionRecord) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO derpies_decisions (message_id, channel_id, author_id, content, path, score, threshold, word, learned, deleted, reject_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		d.MessageID, d.ChannelID, d.AuthorID, d.Content, d.Path, d.Score, d.Threshold, d.Word, d.Learned, d.Deleted, d.RejectReason)
+	return err
+}
+
+func (p *poolStore) queryDecisions(ctx context.Context, f mcp.DecisionFilter) ([]mcp.DecisionRow, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50 // the default
+	}
+	if limit > 500 {
+		limit = 500 // the max — clamped, not an error
+	}
+	var (
+		conds []string
+		args  []any
+	)
+	addEq := func(col string, v any) {
+		args = append(args, v)
+		conds = append(conds, col+" = $"+strconv.Itoa(len(args)))
+	}
+	addCmp := func(col string, op string, v any) {
+		args = append(args, v)
+		conds = append(conds, col+" "+op+" $"+strconv.Itoa(len(args)))
+	}
+	if f.AuthorID != "" {
+		addEq("author_id", f.AuthorID)
+	}
+	if f.ChannelID != "" {
+		addEq("channel_id", f.ChannelID)
+	}
+	if f.Path != "" {
+		addEq("path", f.Path)
+	}
+	if f.Deleted != nil {
+		addEq("deleted", *f.Deleted)
+	}
+	if f.ScoreMin != nil {
+		addCmp("score", ">=", *f.ScoreMin)
+	}
+	if f.ScoreMax != nil {
+		addCmp("score", "<=", *f.ScoreMax)
+	}
+	if f.Since != nil {
+		addCmp("created_at", ">=", *f.Since)
+	}
+	if f.Until != nil {
+		addCmp("created_at", "<=", *f.Until)
+	}
+	query := `SELECT id, message_id, channel_id, author_id, content, path, score, threshold, word, learned, deleted, reject_reason, created_at
+		 FROM derpies_decisions`
+	if len(conds) > 0 {
+		query += "\n\t\t WHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit)
+	query += "\n\t	 ORDER BY created_at DESC LIMIT $" + strconv.Itoa(len(args))
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []mcp.DecisionRow
+	for rows.Next() {
+		var r mcp.DecisionRow
+		if err := rows.Scan(&r.ID, &r.MessageID, &r.ChannelID, &r.AuthorID, &r.Content, &r.Path, &r.Score, &r.Threshold, &r.Word, &r.Learned, &r.Deleted, &r.RejectReason, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // realOps is the production Discord REST surface (the flow's single
@@ -285,6 +422,9 @@ func tokensForMatch(content string) map[string]bool {
 // prefix "gimmick:" (case-insensitive) -> ("gimmick", remainder trimmed and
 // lowercased); anything else, including "GIMMICK" WITHOUT the colon, ->
 // ("unknown", "").
+//
+// (The binary parser — the message + nickname flows move to
+// parseVerdictScore in Tasks 2–3; it is removed in Task 3.)
 func parseVerdict(text string) (kind, word string) {
 	for _, line := range strings.Split(text, "\n") {
 		l := strings.TrimSpace(line)
@@ -301,6 +441,109 @@ func parseVerdict(text string) (kind, word string) {
 		return "unknown", ""
 	}
 	return "unknown", ""
+}
+
+// parseVerdictScore: the score-model verdict parser. Scans ALL lines (not
+// just the first non-empty): each line is TrimSpace'd first (the prompt
+// displays the reply format indented — "  SCORE:<0-100>" — and an LLM
+// echoing the indentation must still parse), then:
+//   - the first line matching ^SCORE:\s*(\d+)$ (case-insensitive) whose
+//     captured value is 0..100 is the score (\s* absorbs a space after the
+//     colon — "Score: 95" is a very common LLM shape). A SCORE line out of
+//     range (SCORE:150) is NOT a valid score line — it is skipped, and a
+//     later in-range SCORE line can still be the score.
+//   - the first line matching ^WORD:\s*(.+)$ (case-insensitive) is the
+//     word — the remainder of the line (trimmed, lowercased), so a spaced
+//     SPLIT answer (WORD:z w i f t) is captured verbatim and handed to the
+//     unchanged foldVerdictWord whitespace-collapse in the gate (ADR 0009's
+//     belt-and-suspenders: both the spaced and the collapsed answer form
+//     learn the collapsed word).
+//
+// No valid SCORE line -> hasScore=false (the caller treats it as
+// "unrecognized").
+var (
+	scoreLineRe = regexp.MustCompile(`(?i)^SCORE:\s*(\d+)$`)
+	wordLineRe  = regexp.MustCompile(`(?i)^WORD:\s*(.+)$`)
+)
+
+func parseVerdictScore(text string) (score int, hasScore bool, word string) {
+	for _, line := range strings.Split(text, "\n") {
+		l := strings.TrimSpace(line)
+		if !hasScore {
+			if m := scoreLineRe.FindStringSubmatch(l); m != nil {
+				v, err := strconv.Atoi(m[1])
+				if err == nil && v >= 0 && v <= 100 {
+					score, hasScore = v, true
+				}
+			}
+		}
+		if word == "" {
+			if m := wordLineRe.FindStringSubmatch(l); m != nil {
+				word = strings.ToLower(strings.TrimSpace(m[1]))
+			}
+		}
+	}
+	return
+}
+
+// wordLike (the anchor-gate token classifier, the emoji fix A): is tok a
+// word-shape token — the ASCII arm (wordValid) or the non-ASCII arm
+// (unicodeVerdictShape), with the shared precondition (a pure digit string
+// is never a word) and the empty guard? A non-word token (an emoji, a
+// bare number, a punctuation blob) does not count as an anchor.
+func wordLike(tok string) bool {
+	if tok == "" || allDigitVerdict(tok) {
+		return false
+	}
+	return wordmatch.WordValid(tok) || unicodeVerdictShape(tok)
+}
+
+// foldedTokenSequence: the ordered, edge-trimmed, folded token sequence
+// (for the phrase match): strings.Fields, each token wordmatch.FoldToASCII
+// + strings.TrimFunc(edgePunct), preserving order and duplicates, dropping
+// tokens that trim to "". (No dedup, no collapsed-run handling — that
+// stays in tokensForMatch, unchanged.)
+func foldedTokenSequence(content string) []string {
+	out := make([]string, 0)
+	for _, tok := range strings.Fields(content) {
+		key := strings.TrimFunc(wordmatch.FoldToASCII(tok), edgePunct)
+		if key != "" {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// decisionRecord — the in-memory decision row (mirrors the derpies_decisions
+// columns; the nullable fields are pointers so a zero value writes SQL
+// NULL). Path is a *string to match the DDL's "path text CHECK (path IN
+// ('fast','slow'))" — a NULL path passes the CHECK (PostgreSQL evaluates
+// CHECK on NULL as satisfied), so the pre-path arms (which never assign
+// Path) persist as "path IS NULL" instead of being rejected by a NOT
+// NULL/empty-string CHECK.
+type decisionRecord struct {
+	MessageID    string
+	ChannelID    string
+	AuthorID     string
+	Content      string
+	Path         *string // "fast" | "slow" | NULL (NULL for every arm that never reached a path)
+	Score        *int    // NULL for fast rows + every arm that never reached the matrix
+	Threshold    *int    // NULL, same as Score
+	Word         *string
+	Learned      bool
+	Deleted      bool
+	RejectReason *string // NULL when no rejection
+}
+
+// clampThreshold: pure — if v < 41 || v > 100 { return defaultThreshold }
+// return v. The matrix is defined for T > learnFloor only; a T ≤ 40 value
+// is unrepresentable — the CHECK rejects it at write time, this clamps a
+// pre-CHECK read.
+func clampThreshold(v int) int {
+	if v < learnFloor+1 || v > 100 {
+		return defaultThreshold
+	}
+	return v
 }
 
 // unicodeVerdictShape (ADR 0008): the FOLDED non-ASCII verdict word's

@@ -197,6 +197,40 @@ func (s *Server) handler() http.Handler {
 	return mux
 }
 
+// DecisionFilter is the read_derpies_decisions query filter (the
+// parameterized SELECT behind the derpies store's queryDecisions). All
+// fields are optional and AND-combined; empty/nil fields are skipped.
+// Limit is clamped (default 50, max 500), not an error.
+type DecisionFilter struct {
+	AuthorID  string
+	ChannelID string
+	Path      string     // "fast" | "slow" | "" (unfiltered)
+	Deleted   *bool      // nil = unfiltered; matches the stored flag exactly
+	ScoreMin  *int       // score >= *ScoreMin
+	ScoreMax  *int       // score <= *ScoreMax
+	Since     *time.Time // created_at >= *Since
+	Until     *time.Time // created_at <= *Until
+	Limit     int        // default 50, max 500 — clamped, not an error
+}
+
+// DecisionRow mirrors the derpies_decisions columns (the nullable fields
+// are pointers so a NULL column scans as a nil pointer).
+type DecisionRow struct {
+	ID           int64
+	MessageID    string
+	ChannelID    string
+	AuthorID     string
+	Content      string
+	Path         *string // "fast" | "slow" | NULL
+	Score        *int    // NULL for fast rows + arms that never reached the matrix
+	Threshold    *int    // NULL, same as Score
+	Word         *string
+	Learned      bool
+	Deleted      bool
+	RejectReason *string // NULL when no rejection
+	CreatedAt    time.Time
+}
+
 // toolErr is the IsError tool-result convention: "<bots>: <msg>".
 func toolErr(bots, msg string) *mcpSDK.CallToolResult {
 	return &mcpSDK.CallToolResult{

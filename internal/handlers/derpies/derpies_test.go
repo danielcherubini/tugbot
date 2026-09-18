@@ -15,6 +15,7 @@ import (
 
 	"github.com/danielcherubini/tugbot/internal/app"
 	"github.com/danielcherubini/tugbot/internal/config"
+	"github.com/danielcherubini/tugbot/internal/mcp"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,23 @@ type fakeStore struct {
 	listCalls int
 	prompt    string // promptText returns this (+ promptErr)
 	promptErr error
+	// configThreshold returns (clampThreshold(threshold), thresholdErr) —
+	// the zero value yields the default 50 (a zero-threshold fake must not
+	// make every scored verdict delete).
+	threshold    int
+	thresholdErr error
+	// listPhrases returns phrases (+ phrasesErr).
+	phrases    []string
+	phrasesErr error
+	// recordDecision returns recordErr if set; otherwise appends a COPY of
+	// the record to decisions (later mutations must not alias).
+	recordErr error
+	decisions []*decisionRecord
+	// queryDecisions records the filter in queried and returns
+	// (queryRows, queryErr).
+	queried   mcp.DecisionFilter
+	queryRows []mcp.DecisionRow
+	queryErr  error
 }
 
 func (s *fakeStore) featureEnabled(_ context.Context, key string) bool {
@@ -48,6 +66,28 @@ func (s *fakeStore) addGimmick(_ context.Context, word, source string) error {
 
 func (s *fakeStore) promptText(_ context.Context) (string, error) {
 	return s.prompt, s.promptErr
+}
+
+func (s *fakeStore) configThreshold(_ context.Context) (int, error) {
+	return clampThreshold(s.threshold), s.thresholdErr
+}
+
+func (s *fakeStore) listPhrases(_ context.Context) ([]string, error) {
+	return s.phrases, s.phrasesErr
+}
+
+func (s *fakeStore) recordDecision(_ context.Context, d *decisionRecord) error {
+	if s.recordErr != nil {
+		return s.recordErr
+	}
+	cp := *d // a copy: later mutations of the caller's record do not alias the stored one
+	s.decisions = append(s.decisions, &cp)
+	return nil
+}
+
+func (s *fakeStore) queryDecisions(_ context.Context, f mcp.DecisionFilter) ([]mcp.DecisionRow, error) {
+	s.queried = f
+	return s.queryRows, s.queryErr
 }
 
 // fakeOps implements the discordOps seam.
@@ -222,6 +262,138 @@ func TestParseVerdict(t *testing.T) {
 		if kind != tt.wantKind || word != tt.wantWord {
 			t.Errorf("parseVerdict(%q) = (%q, %q), want (%q, %q)", tt.in, kind, word, tt.wantKind, tt.wantWord)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseVerdictScore
+// ---------------------------------------------------------------------------
+
+func TestParseVerdictScore(t *testing.T) {
+	tests := []struct {
+		in        string
+		wantScore int
+		wantHas   bool
+		wantWord  string
+	}{
+		{"SCORE:95\nWORD:zwift", 95, true, "zwift"},
+		{"SCORE:95", 95, true, ""},
+		{"CLEAN", 0, false, ""},                                             // the old verdict: no score line
+		{"GIMMICK:zwift", 0, false, ""},                                     // the old verdict: no score line
+		{"SCORE:150", 0, false, ""},                                         // out of range: not a valid score line
+		{"SCORE:55\nWORD:زويفت", 55, true, "زويفت"},                         // non-ASCII word: lowercased (a no-op here)
+		{"  SCORE:95\n  WORD:zwift", 95, true, "zwift"},                     // the prompt displays the format indented: an LLM echoing the indentation must still parse
+		{"Score: 95", 95, true, ""},                                         // a space after the colon: the most common LLM shape
+		{"Sure!\nSCORE:80\nWORD:swift\nHope that helps", 80, true, "swift"}, // prose around the lines
+		{"SCORE:70\nWORD:z w i f t", 70, true, "z w i f t"},                 // a spaced SPLIT answer is captured verbatim (the gate's foldVerdictWord collapses it)
+		{"SCORE:150\nSCORE:50", 50, true, ""},                               // an out-of-range line is skipped; the next in-range line is the score
+		{"", 0, false, ""},
+	}
+	for _, tt := range tests {
+		score, hasScore, word := parseVerdictScore(tt.in)
+		if score != tt.wantScore || hasScore != tt.wantHas || word != tt.wantWord {
+			t.Errorf("parseVerdictScore(%q) = (%d, %v, %q), want (%d, %v, %q)", tt.in, score, hasScore, word, tt.wantScore, tt.wantHas, tt.wantWord)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// wordLike (the anchor-gate token classifier)
+// ---------------------------------------------------------------------------
+
+func TestWordLike(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"zwift", true},
+		{"272889785318768641", false},          // a pure digit string is never word-like
+		{"derpies:1021692390177775657", false}, // punctuation + digits: not a word shape
+		{"", false},
+		{"خفيف", true}, // non-ASCII letters-only shape (unicodeVerdictShape)
+		{"a", false},   // 1 rune: below the 2-rune floor on both arms
+	}
+	for _, tt := range tests {
+		if got := wordLike(tt.in); got != tt.want {
+			t.Errorf("wordLike(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// foldedTokenSequence (the ordered, edge-trimmed, folded token sequence)
+// ---------------------------------------------------------------------------
+
+func TestFoldedTokenSequence(t *testing.T) {
+	got := foldedTokenSequence("who wants to buy me a bike.")
+	want := []string{"who", "wants", "to", "buy", "me", "a", "bike"}
+	if len(got) != len(want) {
+		t.Fatalf("foldedTokenSequence = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("foldedTokenSequence[%d] = %q, want %q (order must be preserved)", i, got[i], want[i])
+		}
+	}
+
+	// NO collapsed-run handling (that stays in tokensForMatch): a split word
+	// keeps its single-rune tokens in order.
+	got2 := foldedTokenSequence("buy me a b i k e")
+	want2 := []string{"buy", "me", "a", "b", "i", "k", "e"}
+	if len(got2) != len(want2) {
+		t.Fatalf("foldedTokenSequence = %v, want %v (no collapse)", got2, want2)
+	}
+	for i := range want2 {
+		if got2[i] != want2[i] {
+			t.Errorf("foldedTokenSequence[%d] = %q, want %q", i, got2[i], want2[i])
+		}
+	}
+
+	// A pure-punctuation token trims to "" and is dropped.
+	got3 := foldedTokenSequence("a ؟ b")
+	want3 := []string{"a", "b"}
+	if len(got3) != len(want3) {
+		t.Fatalf("foldedTokenSequence = %v, want %v (pure-punct dropped)", got3, want3)
+	}
+	for i := range want3 {
+		if got3[i] != want3[i] {
+			t.Errorf("foldedTokenSequence[%d] = %q, want %q", i, got3[i], want3[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// clampThreshold
+// ---------------------------------------------------------------------------
+
+func TestClampThreshold(t *testing.T) {
+	tests := []struct {
+		in   int
+		want int
+	}{
+		{30, 50},   // below the floor (T > learnFloor only): the default
+		{41, 41},   // the lowest representable T: passes
+		{50, 50},   // the default
+		{100, 100}, // the top: passes
+		{101, 50},  // over the top: the default
+	}
+	for _, tt := range tests {
+		if got := clampThreshold(tt.in); got != tt.want {
+			t.Errorf("clampThreshold(%d) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+// The zero-value fake's configThreshold must yield the default 50 — a
+// zero-threshold fake must not make every scored verdict delete.
+func TestFakeStoreConfigThresholdZeroValue(t *testing.T) {
+	s := &fakeStore{}
+	got, err := s.configThreshold(context.Background())
+	if err != nil {
+		t.Fatalf("configThreshold on a zero-value fake = error %v, want nil", err)
+	}
+	if got != 50 {
+		t.Errorf("configThreshold on a zero-value fake = %d, want 50 (the default)", got)
 	}
 }
 
