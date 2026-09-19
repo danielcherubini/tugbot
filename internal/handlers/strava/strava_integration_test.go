@@ -1011,3 +1011,89 @@ func TestStravaBackdatedOverlap(t *testing.T) {
 		t.Errorf("pass 2: cursor = %v, want unchanged (%v) — nothing new dispositioned", got, startX)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 14. refresh SUCCESS persists the ROTATED pair (the single most
+//     credential-fatal line: persisting the OLD refresh token / a swapped
+//     column / a wrong row passes every other test and surfaces two rotations
+//     later as invalid_grant → needs_reauth with no operator-visible cause)
+// ---------------------------------------------------------------------------
+
+// TestStravaRefreshRotatedPersistence pins the refresh-success path: a token
+// expiring inside the 1h refresh lead (now+30m) makes the pass refresh,
+// and the success must persist (new access_token, the ROTATED refresh_token,
+// new token_expires_at) in the athlete row. Assertions hit the EXACT columns
+// (a swapped-column or old-token persistence must not survive). The second
+// pass — the token now ≈ now+6h, safely outside the 1h lead — must make NO
+// spurious branch refresh and must not double-post.
+func TestStravaRefreshRotatedPersistence(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete(t, pool, 9001, WINDOW, 30*time.Minute) // inside the 1h refresh lead — refresh MUST fire
+	// the rotation-seed pair (the stub's success is scripted to (tok2, rtok2, now+6h)).
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE strava_athletes SET access_token='tok1', refresh_token='rtok1', token_expires_at=$1 WHERE id=$2`,
+		now.Add(30*time.Minute), aid); err != nil {
+		t.Fatalf("seed tokens: %v", err)
+	}
+	stub := &stubStrava{
+		refreshFn: func() error { return nil }, // success → the ROTATED pair (tok2, rtok2, now+6h)
+		listFn: func(_ time.Time) ([]Summary, error) {
+			return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
+		},
+		detailFn: func(_ int64) (Activity, error) { return readyAct(1, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 9001)
+	ctx := context.Background()
+
+	// ---- pass 1: the refresh fires and its success persists the ROTATED pair ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if stub.refreshCalls != 1 {
+		t.Fatalf("pass 1: refresh calls = %d, want exactly 1 (a now+30m expiry is inside the 1h refresh lead)", stub.refreshCalls)
+	}
+	var access, refresh string
+	var expiresAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT access_token, refresh_token, token_expires_at FROM strava_athletes WHERE id=$1`, aid).Scan(&access, &refresh, &expiresAt); err != nil {
+		t.Fatalf("read token row: %v", err)
+	}
+	if access != "tok2" {
+		t.Errorf("pass 1: access_token = %q, want 'tok2' (the NEW access token — the exact column)", access)
+	}
+	if refresh != "rtok2" {
+		t.Errorf("pass 1: refresh_token = %q, want the ROTATED 'rtok2' exactly ('rtok1' = old-token persistence; 'tok2' = a swapped column)", refresh)
+	}
+	want := time.Now().UTC().Add(6 * time.Hour) // the stub's returned expiry
+	d := expiresAt.Sub(want)
+	if d < 0 {
+		d = -d
+	}
+	if d > 5*time.Minute {
+		t.Errorf("pass 1: token_expires_at = %v, want ≈ now+6h (%v)", expiresAt, want)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("pass 1: captured %d posts, want exactly 1 (the pass completes end-to-end)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startA) {
+		t.Errorf("pass 1: cursor = %v, want advanced ONCE to %v", got, startA)
+	}
+
+	// ---- pass 2: the token is now fresh (≈ now+6h > now+1h): no spurious re-refresh, no double-post ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if stub.refreshCalls != 1 {
+		t.Errorf("pass 2: refresh calls = %d, want still 1 (no spurious re-refresh while the token is fresh)", stub.refreshCalls)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("pass 2: captured %d total posts, want still 1 (A is deduped — never double-posted)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startA) {
+		t.Errorf("pass 2: cursor = %v, want %v (advanced exactly once in pass 1; the pass-2 re-list is free)", got, startA)
+	}
+}
