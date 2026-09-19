@@ -43,6 +43,23 @@ type Config struct {
 	// map like the other lists. Default: empty.
 	DerpiesUserIDs map[int64]struct{}
 
+	// StravaClientID / StravaClientSecret are the registered Strava app's
+	// credentials (STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET). Optional: the
+	// strava handler no-ops when absent (feature-flag gated too).
+	StravaClientID     string
+	StravaClientSecret string
+
+	// StravaSharedThreadID (STRAVA_SHARED_THREAD_ID) is the fallback post
+	// target: 0 = unset (per-athlete threads only). Malformed → 0 (the
+	// single-ID parseID convention, silently).
+	StravaSharedThreadID int64
+
+	// StravaPollMinutes (STRAVA_POLL_MINUTES): the poll cadence in minutes.
+	// Default 15. Below 15 → floored to 15 (slog.Warn). A set-but-non-numeric
+	// value fails LOUD (LoadError — the parseMCPPort precedent; a malformed
+	// value fails the whole config load, by design).
+	StravaPollMinutes int
+
 	// MCPPort is the MCP bridge's Streamable-HTTP listen port, read from
 	// TUGBOT_MCP_PORT. Always-on (no enabled flag). Default: 8642. Unlike
 	// the ID-list vars (whose malformed parts are skipped), a mistyped port
@@ -102,6 +119,14 @@ func LoadConfig() (*Config, error) {
 		return nil, perr
 	}
 
+	// STRAVA_POLL_MINUTES — the poll cadence in minutes. Unset → 15;
+	// below 15 → 15 (slog.Warn); set-but-non-numeric → LoadError (fail
+	// loud — a malformed value fails the WHOLE config load, by design).
+	stravaPoll, perr := parseStravaPoll(os.Getenv("STRAVA_POLL_MINUTES"))
+	if perr != nil {
+		return nil, perr
+	}
+
 	// ADMIN_USER_ID — bypasses mention cooldowns. Default: 0 (disabled).
 	// Rust: .ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 	adminUserID := parseID(os.Getenv("ADMIN_USER_ID"))
@@ -133,6 +158,10 @@ func LoadConfig() (*Config, error) {
 		CooldownExemptUserIDs: exempt,
 		SlowUserIDs:           slow,
 		DerpiesUserIDs:        derpies,
+		StravaClientID:        os.Getenv("STRAVA_CLIENT_ID"),
+		StravaClientSecret:    os.Getenv("STRAVA_CLIENT_SECRET"),
+		StravaSharedThreadID:  parseID(os.Getenv("STRAVA_SHARED_THREAD_ID")),
+		StravaPollMinutes:     stravaPoll,
 		MCPPort:               mcpPort,
 		SkillsDir:             parseSkillsDir(os.Getenv("TUGBOT_SKILLS_DIR")),
 		LogLevel:              parseLogLevel(os.Getenv("RUST_LOG")),
@@ -157,6 +186,24 @@ func parseMCPPort(v string) (int, error) {
 		return 0, &LoadError{problems: []string{"TUGBOT_MCP_PORT is not a valid port: " + v}}
 	}
 	return p, nil
+}
+
+// parseStravaPoll — like parseMCPPort: unset → 15; below 15 → 15 (slog.Warn);
+// set-but-non-numeric → LoadError (fail loud: a malformed value fails the WHOLE
+// config load, by design — documented blast radius).
+func parseStravaPoll(v string) (int, error) {
+	if v == "" {
+		return 15, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, &LoadError{problems: []string{"STRAVA_POLL_MINUTES is not a valid minute count: " + v}}
+	}
+	if n < 15 {
+		slog.Warn("STRAVA_POLL_MINUTES below 15 — using 15", "module", "config")
+		return 15, nil
+	}
+	return n, nil
 }
 
 // parseID mirrors Rust's `.ok().and_then(|s| s.parse().ok()).unwrap_or(0)`:
