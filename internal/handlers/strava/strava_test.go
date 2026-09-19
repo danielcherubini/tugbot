@@ -1,6 +1,7 @@
 package strava
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -122,6 +123,10 @@ func TestFormatNoun(t *testing.T) {
 		{"143 km round half up", act(142500, "MountainBikeRide"), "143 km MountainBikeRide"},
 		{"99.8 km Ride (under-100 branch)", act(99800, "Ride"), "99.8 km Ride"},
 		{"exactly 100.0 km flips branch", act(100000, "Ride"), "100 km Ride"},
+		// non-finite / negative → 0.0 (NaN, +Inf, negative all map to 0 metres).
+		{"NaN → 0.0 km", act(math.NaN(), "Run"), "0.0 km Run"},
+		{"+Inf → 0.0 km", act(math.Inf(1), "Ride"), "0.0 km Ride"},
+		{"negative → 0.0 km (NOT -42.0)", act(-42000, "Run"), "0.0 km Run"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -144,5 +149,26 @@ func TestBuildPost(t *testing.T) {
 	wantT := `Matt finished "Tuesday tempo" (42.3 km Run)` + "\nhttps://www.strava.com/activities/123"
 	if gotT != wantT {
 		t.Errorf("buildPost(title) = %q, want %q", gotT, wantT)
+	}
+}
+
+// TestMakePostTitleSanitize pins the two-line post-format pin: a Strava title
+// (or label) containing a newline is newlined to spaces BEFORE composition, so
+// the post stays EXACTLY two lines.
+func TestMakePostTitleSanitize(t *testing.T) {
+	s := &Strava{}
+
+	// Title with an embedded newline → "Tue Tempo"; post is exactly two lines.
+	got := s.makePost("Matt", Activity{Distance: 42300, SportType: "Run", Title: "Tue\nTempo"}, 0, 123)
+	want := `Matt finished "Tue Tempo" (42.3 km Run)` + "\nhttps://www.strava.com/activities/123"
+	if got.message != want {
+		t.Errorf("makePost(title) = %q, want exactly two lines %q", got.message, want)
+	}
+
+	// Label with an embedded newline (defensive) → also newlined, still two legs.
+	gotL := s.makePost("Mat\nn", Activity{Distance: 42300, SportType: "Run", Title: ""}, 0, 123)
+	wantL := "Mat n finished 42.3 km Run" + "\nhttps://www.strava.com/activities/123"
+	if gotL.message != wantL {
+		t.Errorf("makePost(label) = %q, want exactly two lines %q", gotL.message, wantL)
 	}
 }

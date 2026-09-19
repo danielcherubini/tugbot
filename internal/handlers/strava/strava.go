@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -303,7 +305,8 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 				if errors.As(err, &eua) {
 					return s.abortReauth(ctx, a)
 				}
-				if errors.As(err, &ErrRateLimited{}) {
+				var erl ErrRateLimited
+				if errors.As(err, &erl) {
 					slog.Info("strava detail (rate limited) → pending", "module", "strava", "id", sum.ID, "error", err)
 				} else {
 					slog.Warn("strava detail transient → pending", "module", "strava", "id", sum.ID, "error", err)
@@ -464,10 +467,15 @@ func (e *errListRateLimited) Error() string { return "strava list rate limited (
 // makePost resolves the target (already) and builds the post message; the
 // title branch composes noun = `"title" (distNoun)`.
 func (s *Strava) makePost(label string, a Activity, threadID, activityID int64) postItem {
+	// Newline-sanitize the title (and, defensively, the label) BEFORE
+	// composition so the two-line post-format pin holds no matter what
+	// Strava returns.
+	label = strings.ReplaceAll(label, "\n", " ")
+	title := strings.ReplaceAll(a.Title, "\n", " ")
 	distNoun := formatNoun(a)
 	noun := distNoun
-	if a.Title != "" {
-		noun = `"` + a.Title + `" (` + distNoun + `)`
+	if title != "" {
+		noun = `"` + title + `" (` + distNoun + `)`
 	}
 	return postItem{
 		threadID: threadID,
@@ -617,8 +625,14 @@ func nextCursor(pending, dispositioned []time.Time) (time.Time, bool) {
 
 // formatNoun returns `<distance> <SportType>`: meters → km. >= 100 km rounds
 // HALF UP to an integer via int64(m/1000+0.5) (e.g. "142 km"); < 100 km is one
-// decimal via %.1f (e.g. "42.3 km"). The branch flips at exactly 100.0 km.
+// decimal via %.1f (e.g. "42.3 km"). The branch flips at exactly 100.0 km. A
+// non-finite (NaN, +/-Inf) or negative distance is treated as 0 — one check
+// covers all three since NaN fails `>= 0` — so the post never carries
+// garbage digits into a user-facing message.
 func formatNoun(a Activity) string {
+	if !(a.Distance >= 0) || math.IsInf(a.Distance, 0) {
+		a.Distance = 0
+	}
 	var dist string
 	if a.Distance >= 100000 {
 		dist = strconv.FormatInt(int64(a.Distance/1000+0.5), 10) + " km"
