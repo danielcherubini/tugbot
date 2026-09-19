@@ -240,6 +240,17 @@ func TestListActivitiesPagination(t *testing.T) {
 			t.Fatalf("want ErrTransient, got %v", err)
 		}
 	})
+
+	t.Run("404 maps to ErrTransient (an app/role problem, not a per-activity outcome)", func(t *testing.T) {
+		srv := statusServer(t, http.StatusNotFound, nil)
+		defer srv.Close()
+		c := &stravaClient{base: srv.URL}
+		_, err := c.ListActivities(context.Background(), "tok", base)
+		var tr ErrTransient
+		if !errors.As(err, &tr) {
+			t.Fatalf("want ErrTransient (a list-endpoint 404 is NEVER the per-activity ErrGone), got %v", err)
+		}
+	})
 }
 
 func TestGetActivitySignals(t *testing.T) {
@@ -322,6 +333,20 @@ func TestGetActivitySignals(t *testing.T) {
 		}
 		if a.ResourceState == -1 {
 			t.Errorf("ResourceState = -1, want != -1 (ready class)")
+		}
+	})
+
+	t.Run("404 maps to ErrGone (the detail endpoint only — a listed id that 404s is gone)", func(t *testing.T) {
+		srv := statusServer(t, http.StatusNotFound, nil)
+		defer srv.Close()
+		c := &stravaClient{base: srv.URL}
+		_, err := c.GetActivity(context.Background(), "tok", 7)
+		var g ErrGone
+		if !errors.As(err, &g) {
+			t.Fatalf("want ErrGone, got %v", err)
+		}
+		if g.Error() != "strava activity gone (404)" {
+			t.Errorf("Error() = %q, want \"strava activity gone (404)\"", g.Error())
 		}
 	})
 

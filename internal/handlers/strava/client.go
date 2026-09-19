@@ -54,7 +54,8 @@ type Activity struct {
 // Error classes (each with a distinct Error() text).
 type ErrUnauthorized struct{ Why string }       // 401, or refresh 400 invalid_grant
 type ErrRateLimited struct{ RetryAfter string } // 429 + X-RateLimit headers
-type ErrTransient struct{ Cause error }         // 5xx / network / unexpected 4xx
+type ErrTransient struct{ Cause error }         // 5xx / network / unexpected 4xx (a DETAIL 404 is NOT here — that is ErrGone)
+type ErrGone struct{}                           // 404 on the DETAIL endpoint: the listed id is gone (deleted / access revoked)
 
 func (e ErrUnauthorized) Error() string { return "strava: unauthorized: " + e.Why }
 
@@ -66,6 +67,8 @@ func (e ErrRateLimited) Error() string {
 }
 
 func (e ErrTransient) Error() string { return "strava: transient: " + e.Cause.Error() }
+
+func (ErrGone) Error() string { return "strava activity gone (404)" }
 
 // StravaAPI is the seam the handler resolves through (tests stub it).
 type StravaAPI interface {
@@ -141,7 +144,16 @@ func (c *stravaClient) ListActivities(ctx context.Context, token string, after t
 
 func (c *stravaClient) GetActivity(ctx context.Context, token string, id int64) (Activity, error) {
 	var raw activityWire
-	if err := c.getJSON(ctx, fmt.Sprintf("%s/v3/activities/%d", c.base, id), token, &raw); err != nil {
+	status, err := c.getJSON(ctx, fmt.Sprintf("%s/v3/activities/%d", c.base, id), token, &raw)
+	if err != nil {
+		// A 404 on the DETAIL endpoint for an id the list just returned is a
+		// DETERMINISTIC per-activity outcome (the activity is gone — deleted or
+		// access revoked) — that is ErrGone, NOT the generic ErrTransient 4xx
+		// class (a LIST-endpoint 404 stays ErrTransient: an app/role problem,
+		// not a per-activity outcome). 401/429 mapping is unchanged.
+		if status == http.StatusNotFound {
+			return Activity{}, ErrGone{}
+		}
 		return Activity{}, err
 	}
 	a := Activity{
@@ -196,7 +208,7 @@ func (c *stravaClient) athleteID(ctx context.Context, token string) (int, error)
 	var ath struct {
 		ID int `json:"id"`
 	}
-	if err := c.getJSON(ctx, c.base+athletePath, token, &ath); err != nil {
+	if _, err := c.getJSON(ctx, c.base+athletePath, token, &ath); err != nil {
 		return 0, err
 	}
 	return ath.ID, nil
@@ -204,34 +216,37 @@ func (c *stravaClient) athleteID(ctx context.Context, token string) (int, error)
 
 // getJSON runs a Bearer-authed GET and decodes the 200 body into out; any
 // non-200 status is mapped through classifyStatus, and transport errors
-// (dial/TLS/timeout) are returned as ErrTransient.
-func (c *stravaClient) getJSON(ctx context.Context, endpoint, token string, out any) error {
+// (dial/TLS/timeout) are returned as ErrTransient. The response status is
+// returned alongside (0 for a 200 or a transport error) so a caller can apply
+// an endpoint-specific mapping on top — the DETAIL endpoint re-maps a 404 to
+// ErrGone; the LIST endpoint's 404 stays the classifyStatus default (ErrTransient).
+func (c *stravaClient) getJSON(ctx context.Context, endpoint, token string, out any) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return ErrTransient{Cause: err}
+		return 0, ErrTransient{Cause: err}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := stravaHTTP.Do(req)
 	if err != nil {
-		return ErrTransient{Cause: err}
+		return 0, ErrTransient{Cause: err}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return ErrTransient{Cause: err}
+		return 0, ErrTransient{Cause: err}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return classifyStatus(resp.StatusCode, resp.Header, body)
+		return resp.StatusCode, classifyStatus(resp.StatusCode, resp.Header, body)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return ErrTransient{Cause: fmt.Errorf("decode response: %w", err)}
+		return 0, ErrTransient{Cause: fmt.Errorf("decode response: %w", err)}
 	}
-	return nil
+	return 0, nil
 }
 
 func (c *stravaClient) getList(ctx context.Context, endpoint, token string) ([]Summary, error) {
 	var raw []summaryWire
-	if err := c.getJSON(ctx, endpoint, token, &raw); err != nil {
+	if _, err := c.getJSON(ctx, endpoint, token, &raw); err != nil {
 		return nil, err
 	}
 	out := make([]Summary, len(raw))

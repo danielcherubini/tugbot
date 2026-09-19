@@ -1097,3 +1097,68 @@ func TestStravaRefreshRotatedPersistence(t *testing.T) {
 		t.Errorf("pass 2: cursor = %v, want %v (advanced exactly once in pass 1; the pass-2 re-list is free)", got, startA)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 15. a 404 on a listed activity (gone: deleted / access revoked) →
+//     dispositioned 'skipped' on first sight — deterministic, never re-fetched
+// ---------------------------------------------------------------------------
+
+// TestStravaDetailGoneSkipsDeterministic pins the gone-404 disposition: pass 1
+// — a family activity G whose detail fetch 404s is dispositioned 'skipped'
+// IMMEDIATELY (not pending), ZERO posts, detail called EXACTLY ONCE (no 5-cycle
+// re-fetch budget burned), and the cursor advanced as a normal disposition.
+// Pass 2 — G re-listed (the 1h-overlapped window), detailFn still ErrGone: the
+// row stays 'skipped' and detail is NOT re-invoked (detailCalls stays 1), the
+// cursor is untouched. A 404 for an id the list just returned is a DETERMINISTIC
+// outcome — the same category as off-family.
+func TestStravaDetailGoneSkipsDeterministic(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startG := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete(t, pool, 9001, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		listFn: func(_ time.Time) ([]Summary, error) {
+			return []Summary{{ID: 1, SportType: "Run", StartDate: startG}}, nil
+		},
+		detailFn: func(_ int64) (Activity, error) { return Activity{}, ErrGone{} },
+	}
+	s, caps := newTestStrava(t, pool, stub, 9001)
+	ctx := context.Background()
+
+	// ---- pass 1: the detail 404 disposes 'skipped' on first sight ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if status, retries := seenRow(t, pool, aid, 1); status != statusSkipped || retries != 0 {
+		t.Fatalf("pass 1: G row = %q retries %d, want skipped/0 (disposed on first sight — never a pending row)", status, retries)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Fatalf("pass 1: captured %d posts, want zero", n)
+	}
+	if n := stub.detailCalls; n != 1 {
+		t.Fatalf("pass 1: detail calls = %d, want exactly 1 (no re-fetch cycle for a deterministic 404)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
+		t.Errorf("pass 1: cursor = %v, want advanced to %v as a normal disposition", got, startG)
+	}
+
+	// ---- pass 2: G is re-listed (the −1h overlap window); detailFn still ERRs
+	// GONE: the row stays skipped, detail is NOT re-invoked, cursor untouched ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if status, _ := seenRow(t, pool, aid, 1); status != statusSkipped {
+		t.Errorf("pass 2: G row = %q, want still skipped", status)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("pass 2: captured %d posts, want zero", n)
+	}
+	if n := stub.detailCalls; n != 1 {
+		t.Errorf("pass 2: detail calls = %d, want still 1 (a seen 'skipped' row is never re-fetched)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
+		t.Errorf("pass 2: cursor = %v, want unchanged (%v) — nothing newly dispositioned", got, startG)
+	}
+}

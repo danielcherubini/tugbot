@@ -305,6 +305,16 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 				if errors.As(err, &eua) {
 					return s.abortReauth(ctx, a)
 				}
+				var egone ErrGone
+				if errors.As(err, &egone) {
+					// A 404 for an id the list just returned is a DETERMINISTIC
+					// outcome (deleted / access revoked) — the same category as
+					// no-target: dispose 'skipped' on first sight, no pending row,
+					// never re-fetched; one counted line in the per-cycle log.
+					slog.Warn("strava listed activity is gone (404) → skipped on first sight", "module", "strava", "label", a.label, "id", sum.ID)
+					inserts = append(inserts, seenInsert{sum.ID, sum.StartDate, statusSkipped})
+					continue
+				}
 				var erl ErrRateLimited
 				if errors.As(err, &erl) {
 					slog.Info("strava detail (rate limited) → pending", "module", "strava", "id", sum.ID, "error", err)
@@ -340,6 +350,15 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 			var eua ErrUnauthorized
 			if errors.As(err, &eua) {
 				return s.abortReauth(ctx, a)
+			}
+			var egone ErrGone
+			if errors.As(err, &egone) {
+				// Terminal state (like the off-family detail resolution): dispose
+				// 'skipped' in the SAME UPDATE — do NOT increment retries; the
+				// 5-cycle budget stays for genuinely stuck/transient fetches.
+				slog.Warn("strava pending activity is gone (404) → skipped", "module", "strava", "label", a.label, "id", c.activityID)
+				updates = append(updates, seenUpdate{c.activityID, statusSkipped, nil})
+				continue
 			}
 			var erl ErrRateLimited
 			if errors.As(err, &erl) {
