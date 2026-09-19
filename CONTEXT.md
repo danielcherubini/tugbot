@@ -67,3 +67,7 @@ _Avoid_: feature MCP, command tools
 **Instagram rewrite**:
 The Instagram handler's mechanic — the 1:1 port of `instagram.rs` (feature-gated, suppresses the matched message's embeds, posts a new message with only the matched URL, `www.` prefix preserved) **except the target domain**: the Go bot rewrites it to `oginstagram.com`, deliberately diverging from Rust's `kkinstagram.com` (the port's first deliberate Go-vs-Rust divergence).
 _Avoid_: kkinstagram rewrite, rewriter
+
+**Athlete**:
+A monitored Strava user who authorized the tugbot Strava app through the one-time OAuth consent (localhost redirect, no public endpoint). Lives as a row in `strava_athletes` (label, Strava id, rotating tokens, `last_polled_at` cursor, nullable per-athlete thread, `needs_reauth`). Growing the set is purely operational (dashboard self-upgrade to 10 athletes + one SQL insert per person) — never a code change.
+_Avoid_: user (when about the Strava side), player, authorized user

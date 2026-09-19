@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -29,6 +31,10 @@ func validEnv() map[string]string {
 		"TUGBOT_SKILLS_DIR":        "",
 		"RUST_LOG":                 "",
 		"TUGBOT_MCP_PORT":          "",
+		"STRAVA_CLIENT_ID":         "",
+		"STRAVA_CLIENT_SECRET":     "",
+		"STRAVA_SHARED_THREAD_ID":  "",
+		"STRAVA_POLL_MINUTES":      "",
 	}
 }
 
@@ -335,6 +341,88 @@ func TestLoadConfigMalformedMCPPort(t *testing.T) {
 	setEnv(t, vars)
 	if _, err := LoadConfig(); err == nil {
 		t.Error("LoadConfig() with TUGBOT_MCP_PORT=abc: error = nil, want LoadError")
+	}
+}
+
+func TestLoadConfigStravaDefaults(t *testing.T) {
+	// All four strava vars unset: the handler no-ops; LoadConfig must
+	// still succeed (selftest-safe — no required-status change).
+	vars := validEnv()
+	setEnv(t, vars)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.StravaClientID != "" {
+		t.Errorf("StravaClientID = %q, want empty", cfg.StravaClientID)
+	}
+	if cfg.StravaClientSecret != "" {
+		t.Errorf("StravaClientSecret = %q, want empty", cfg.StravaClientSecret)
+	}
+	if cfg.StravaSharedThreadID != 0 {
+		t.Errorf("StravaSharedThreadID = %d, want 0", cfg.StravaSharedThreadID)
+	}
+	if cfg.StravaPollMinutes != 15 {
+		t.Errorf("StravaPollMinutes = %d, want 15 (unset default)", cfg.StravaPollMinutes)
+	}
+}
+
+func TestLoadConfigStravaSet(t *testing.T) {
+	vars := validEnv()
+	vars["STRAVA_CLIENT_ID"] = "abc"
+	vars["STRAVA_CLIENT_SECRET"] = "xyz"
+	vars["STRAVA_SHARED_THREAD_ID"] = "100"
+	vars["STRAVA_POLL_MINUTES"] = "30"
+	setEnv(t, vars)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.StravaClientID != "abc" {
+		t.Errorf("StravaClientID = %q, want %q", cfg.StravaClientID, "abc")
+	}
+	if cfg.StravaClientSecret != "xyz" {
+		t.Errorf("StravaClientSecret = %q, want %q", cfg.StravaClientSecret, "xyz")
+	}
+	if cfg.StravaSharedThreadID != 100 {
+		t.Errorf("StravaSharedThreadID = %d, want 100", cfg.StravaSharedThreadID)
+	}
+	if cfg.StravaPollMinutes != 30 {
+		t.Errorf("StravaPollMinutes = %d, want 30", cfg.StravaPollMinutes)
+	}
+}
+
+func TestLoadConfigMalformedStravaPoll(t *testing.T) {
+	// A set-but-non-numeric poll interval fails LOUD (the parseMCPPort
+	// precedent): a malformed value fails the WHOLE config load.
+	vars := validEnv()
+	vars["STRAVA_POLL_MINUTES"] = "abc"
+	setEnv(t, vars)
+	_, err := LoadConfig()
+	if err == nil {
+		t.Fatal("LoadConfig() with STRAVA_POLL_MINUTES=abc: error = nil, want LoadError")
+	}
+	var le *LoadError
+	if !errors.As(err, &le) {
+		t.Fatalf("LoadConfig() error type = %T, want *LoadError", err)
+	}
+	if !strings.Contains(err.Error(), "STRAVA_POLL_MINUTES") {
+		t.Errorf("LoadConfig() error = %q, want it to mention STRAVA_POLL_MINUTES", err.Error())
+	}
+}
+
+func TestLoadConfigStravaPollBelowFloor(t *testing.T) {
+	// A human typo like 5 is a usable intent: floored to 15 (slog.Warn),
+	// not a hard error.
+	vars := validEnv()
+	vars["STRAVA_POLL_MINUTES"] = "5"
+	setEnv(t, vars)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.StravaPollMinutes != 15 {
+		t.Errorf("StravaPollMinutes = %d, want 15 (floored from 5)", cfg.StravaPollMinutes)
 	}
 }
 
