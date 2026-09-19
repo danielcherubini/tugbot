@@ -274,8 +274,13 @@ func classifyStatus(status int, hdr http.Header, body []byte) error {
 			ra = hdr.Get("Retry-After")
 		}
 		if ra == "" {
+			// Go canonicalizes STORED header keys: an incoming `X-RateLimit-*`
+			// header is stored as `X-Ratelimit-*` (textproto lowercases all but
+			// the first letter of each dash-separated word), so test the 12-char
+			// canonical prefix case-insensitively — a literal HasPrefix(k,
+			// "X-RateLimit-") can never match the stored key form.
 			for k, vs := range hdr {
-				if strings.HasPrefix(k, "X-RateLimit-") && len(vs) > 0 {
+				if len(k) > 12 && strings.EqualFold(k[:12], "X-Ratelimit-") && len(vs) > 0 {
 					ra = vs[0]
 					break
 				}

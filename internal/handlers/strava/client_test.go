@@ -46,14 +46,14 @@ func TestListActivitiesPagination(t *testing.T) {
 	t.Run("merged 106 across descending pages, id-deduplicated, fixed after", func(t *testing.T) {
 		var calls int
 		var afterVals, pageVals []string
-		// Page 1 = 100 rows (ids 106..7, newest first); page 2 = 100 rows
-		// (one OVERLAPPING id from page 1 — 106 — followed by ids 104..1
-		// completing the descent; id 1, the OLDEST activity, exists ONLY on
-		// page 2, so the result must be 106 UNIQUE ids); page 3 (and any
-		// further page the walk should never reach) = a FULL page
-		// re-returning the same 7 ids — zero NEW ids, so the zero-new-id
-		// guard must terminate the walk (no infinite loop on degenerate
-		// repeated pages).
+		// Page 1 = 100 rows (ids 106..7, newest first); page 2 = a full page
+		// (one OVERLAPPING id from page 1 — 106 — followed by ids 104..2
+		// completing the descent, then 1; ids 6..1 are page-2-only, so the
+		// result must be 106 UNIQUE ids); page 3 (and any further page the
+		// walk should never reach) = a FULL 100-row page in which EVERY id
+		// was already seen on page 1 — len(rows) < 100 can NOT terminate
+		// the walk, so ONLY the zero NEW ids guard (fresh == 0) can (no
+		// infinite loop on degenerate repeated full pages).
 		pageRows := func(id int64) shape {
 			return shape{ID: id, SportType: sportFor(id), StartDate: base.Add(time.Duration(id) * time.Second)}
 		}
@@ -66,13 +66,13 @@ func TestListActivitiesPagination(t *testing.T) {
 				}
 			case 2:
 				out = append(out, pageRows(106)) // overlapping id from page 1
-				for i := 0; i < 99; i++ {
+				for i := 0; i < 103; i++ {
 					out = append(out, pageRows(int64(104-i))) // 104..2
 				}
 				out = append(out, pageRows(1)) // 1 — the oldest row, page 2 only
 			default:
-				for i := 0; i < 7; i++ {
-					out = append(out, pageRows(int64(7-i))) // 7..1, all seen → zero new ids
+				for i := 0; i < 100; i++ {
+					out = append(out, pageRows(int64(106-i))) // FULL 100-row page; every id already seen (fresh == 0 is the ONLY stop)
 				}
 			}
 			return out
@@ -122,6 +122,9 @@ func TestListActivitiesPagination(t *testing.T) {
 		// Exactly three pages: the full page 1, page 2 (of which one id
 		// overlaps page 1), and the zero-new-id page 3 that must terminate
 		// the walk.
+		// Page 3 is a FULL 100-row page of already-seen ids — a SHORT page
+		// (len(rows) < 100) would also terminate the walk, so this shape
+		// independently exercises the fresh == 0 guard.
 		if calls != 3 {
 			t.Errorf("activities endpoint called %d times, want 3", calls)
 		}
@@ -216,6 +219,28 @@ func TestListActivitiesPagination(t *testing.T) {
 		}
 		if rl.RetryAfter != "123" {
 			t.Errorf("RetryAfter = %q, want \"123\" (X-RateLimit must win)", rl.RetryAfter)
+		}
+	})
+
+	t.Run("429 any-other-X-RateLimit-* header is extracted as fallback RetryAfter", func(t *testing.T) {
+		// A 429 whose ONLY header is X-RateLimit-Remaining: statusServer
+		// copies it via Header().Set, so http.Header STORES it canonically as
+		// "X-Ratelimit-Remaining" (Go lowercases all but the first letter of
+		// each dash-separated word). Tiers 1 (X-RateLimit-Retry-After) and 2
+		// (plain Retry-After) are both empty, so the third tier must match
+		// the canonical stored form and surface the value.
+		srv := statusServer(t, http.StatusTooManyRequests, http.Header{
+			"X-RateLimit-Remaining": []string{"42"},
+		})
+		defer srv.Close()
+		c := &stravaClient{base: srv.URL}
+		_, err := c.ListActivities(context.Background(), "tok", base)
+		var rl ErrRateLimited
+		if !errors.As(err, &rl) {
+			t.Fatalf("want ErrRateLimited, got %v", err)
+		}
+		if rl.RetryAfter != "42" {
+			t.Errorf("RetryAfter = %q, want \"42\" (the other X-RateLimit-* fallback tier)", rl.RetryAfter)
 		}
 	})
 

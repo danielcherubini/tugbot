@@ -511,7 +511,8 @@ func (s *Strava) loadAthletes(ctx context.Context) ([]athleteRow, error) {
 		`SELECT id, label, access_token, refresh_token, token_expires_at,
 		       last_polled_at, COALESCE(target_thread_id, 0)
 		 FROM strava_athletes
-		 WHERE NOT needs_reauth`)
+		 WHERE NOT needs_reauth
+		 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
