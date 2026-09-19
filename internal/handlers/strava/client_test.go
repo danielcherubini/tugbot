@@ -42,39 +42,66 @@ func TestListActivitiesPagination(t *testing.T) {
 		}
 		return ""
 	}
-	page := func(offset, n int) []shape {
-		var out []shape
-		for i := 0; i < n; i++ {
-			id := int64(offset + i + 1)
-			out = append(out, shape{
-				ID:        id,
-				SportType: sportFor(id),
-				StartDate: base.Add(time.Duration(id) * time.Second),
-			})
-		}
-		return out
-	}
 
-	t.Run("merged 106 across a full page then a short page", func(t *testing.T) {
+	t.Run("merged 106 across descending pages, id-deduplicated, fixed after", func(t *testing.T) {
 		var calls int
-		var afterVals []string
+		var afterVals, pageVals []string
+		// Page 1 = 100 rows (ids 106..7, newest first); page 2 = 100 rows
+		// (one OVERLAPPING id from page 1 — 106 — followed by ids 104..1
+		// completing the descent; id 1, the OLDEST activity, exists ONLY on
+		// page 2, so the result must be 106 UNIQUE ids); page 3 (and any
+		// further page the walk should never reach) = a FULL page
+		// re-returning the same 7 ids — zero NEW ids, so the zero-new-id
+		// guard must terminate the walk (no infinite loop on degenerate
+		// repeated pages).
+		pageRows := func(id int64) shape {
+			return shape{ID: id, SportType: sportFor(id), StartDate: base.Add(time.Duration(id) * time.Second)}
+		}
+		rowsFor := func(page int) []shape {
+			var out []shape
+			switch page {
+			case 1:
+				for i := 0; i < 100; i++ {
+					out = append(out, pageRows(int64(106-i))) // 106..7, newest first
+				}
+			case 2:
+				out = append(out, pageRows(106)) // overlapping id from page 1
+				for i := 0; i < 99; i++ {
+					out = append(out, pageRows(int64(104-i))) // 104..2
+				}
+				out = append(out, pageRows(1)) // 1 — the oldest row, page 2 only
+			default:
+				for i := 0; i < 7; i++ {
+					out = append(out, pageRows(int64(7-i))) // 7..1, all seen → zero new ids
+				}
+			}
+			return out
+		}
+
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/v3/athlete":
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 			case "/v3/athletes/1/activities":
 				calls++
-				if a := r.URL.Query().Get("after"); a != "" {
+				q := r.URL.Query()
+				if a := q.Get("after"); a != "" {
 					afterVals = append(afterVals, a)
 				}
-				var list []shape
-				if calls == 1 {
-					list = page(0, 100)
-				} else {
-					if calls != 2 {
-						t.Errorf("activities called %d times, expected 2", calls)
+				page := 1
+				if p := q.Get("page"); p != "" {
+					if n, err := strconv.Atoi(p); err == nil {
+						page = n
 					}
-					list = page(100, 6)
+					pageVals = append(pageVals, p)
+				}
+				// Safety cap: a buggy client paginating the SAME page forever
+				// gets 200 calls, not an infinite loop.
+				var list []shape
+				if calls > 200 {
+					list = []shape{}
+				} else {
+					list = rowsFor(page)
 				}
 				if err := json.NewEncoder(w).Encode(list); err != nil {
 					t.Errorf("encode page: %v", err)
@@ -91,13 +118,44 @@ func TestListActivitiesPagination(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListActivities: %v", err)
 		}
-		if calls != 2 {
-			t.Errorf("activities endpoint called %d times, want 2", calls)
+
+		// Exactly three pages: the full page 1, page 2 (of which one id
+		// overlaps page 1), and the zero-new-id page 3 that must terminate
+		// the walk.
+		if calls != 3 {
+			t.Errorf("activities endpoint called %d times, want 3", calls)
 		}
+		if len(pageVals) != 3 || pageVals[0] != "1" || pageVals[1] != "2" || pageVals[2] != "3" {
+			t.Errorf("page params = %v, want [1 2 3]", pageVals)
+		}
+		// The FIXED-after invariant: the after anchor is IDENTICAL on every
+		// page in particular on page 1 and page 2 — it must NOT be moved
+		// (Strava's list is newest-first, so a last-row cursor walks the
+		// wrong direction).
+		wantAfter := strconv.FormatInt(base.Unix(), 10)
+		if len(afterVals) != 3 {
+			t.Fatalf("got %d 'after' params, want 3: %v", len(afterVals), afterVals)
+		}
+		for i, a := range afterVals {
+			if a != wantAfter {
+				t.Errorf("page %d after = %s, want %s (fixed anchor)", i+1, a, wantAfter)
+			}
+		}
+		if afterVals[0] != afterVals[1] {
+			t.Errorf("after moved between page 1 (%s) and page 2 (%s)", afterVals[0], afterVals[1])
+		}
+
+		// All 106 UNIQUE ids arrive in one call, deduplicated across pages.
 		if len(got) != 106 {
 			t.Fatalf("got %d summaries, want 106", len(got))
 		}
+		seenIDs := make(map[int64]bool, len(got))
 		for i, s := range got {
+			if seenIDs[s.ID] {
+				t.Errorf("got[%d].ID = %d is duplicated in the result", i, s.ID)
+			}
+			seenIDs[s.ID] = true
+			// The client returns (StartDate, ID)-sorted order.
 			id := int64(i + 1)
 			if s.ID != id {
 				t.Errorf("got[%d].ID = %d, want %d", i, s.ID, id)
@@ -109,17 +167,6 @@ func TestListActivitiesPagination(t *testing.T) {
 			if !s.StartDate.Equal(want) {
 				t.Errorf("got[%d].StartDate = %v, want %v", i, s.StartDate, want)
 			}
-		}
-		// The cursor math: page 1 is anchored on the argument, page 2 on the
-		// last page-1 start_date.
-		if len(afterVals) != 2 {
-			t.Fatalf("got %d 'after' params, want 2: %v", len(afterVals), afterVals)
-		}
-		if got, want := afterVals[0], strconv.FormatInt(base.Unix(), 10); got != want {
-			t.Errorf("page 1 after = %s, want %s", got, want)
-		}
-		if got, want := afterVals[1], strconv.FormatInt(base.Add(time.Second*100).Unix(), 10); got != want {
-			t.Errorf("page 2 after = %s, want %s (last page-1 start_date)", got, want)
 		}
 	})
 

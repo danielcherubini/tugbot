@@ -9,13 +9,18 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // The list endpoint returns at most 100 rows per page; a smaller page ends
-// the loop.
+// the loop. Pages are walked with the API's `page` parameter while `after`
+// stays FIXED (the endpoint is NEWEST-FIRST, so a last-row start_date
+// cursor walks the wrong direction and silently drops the oldest rows).
+// A page of zero NEW ids also ends the loop (degenerate same-timestamp
+// duplicates otherwise loop forever).
 const listPageSize = 100
 
 const (
@@ -64,7 +69,8 @@ func (e ErrTransient) Error() string { return "strava: transient: " + e.Cause.Er
 
 // StravaAPI is the seam the handler resolves through (tests stub it).
 type StravaAPI interface {
-	// ListActivities pages internally: loop while a full 100-row page returns.
+	// ListActivities pages internally: fixed `after` anchor, `page` parameter
+	// walk, id-deduplication, (StartDate, ID)-sorted output.
 	ListActivities(ctx context.Context, token string, after time.Time) ([]Summary, error)
 	GetActivity(ctx context.Context, token string, id int64) (Activity, error)
 	// RefreshToken performs POST /oauth/token (grant_type=refresh_token form:
@@ -87,24 +93,44 @@ func (c *stravaClient) ListActivities(ctx context.Context, token string, after t
 	if err != nil {
 		return nil, err
 	}
-	var out []Summary
-	cursor := after
-	for {
-		endpoint := fmt.Sprintf("%s/v3/athletes/%d/activities?per_page=%d", c.base, athleteID, listPageSize)
-		if !cursor.IsZero() {
-			endpoint += "&after=" + strconv.FormatInt(cursor.Unix(), 10)
+	// The `after` anchor is IDENTICAL on every page (fixed); only the `page`
+	// parameter advances. Rows are id-deduplicated across pages, and the walk
+	// stops on a short page OR a page of zero NEW ids — the zero-new guard
+	// makes degenerate same-timestamp pages terminate.
+	seen := make(map[int64]Summary)
+	for pageNum := 1; ; pageNum++ {
+		endpoint := fmt.Sprintf("%s/v3/athletes/%d/activities?per_page=%d&page=%d", c.base, athleteID, listPageSize, pageNum)
+		if !after.IsZero() {
+			endpoint += "&after=" + strconv.FormatInt(after.Unix(), 10)
 		}
-		page, err := c.getList(ctx, endpoint, token)
+		rows, err := c.getList(ctx, endpoint, token)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, page...)
-		// Loop while a FULL page (exactly 100 rows) returned.
-		if len(page) < listPageSize {
+		fresh := 0
+		for _, s := range rows {
+			if _, dup := seen[s.ID]; !dup {
+				seen[s.ID] = s
+				fresh++
+			}
+		}
+		if len(rows) < listPageSize || fresh == 0 {
 			break
 		}
-		cursor = page[len(page)-1].StartDate
 	}
+	// Deterministic output ORDER: sorted by (StartDate, ID) — independent of
+	// the API's newest-first row order; the caller's watermark math uses
+	// min/max so any deterministic order works.
+	out := make([]Summary, 0, len(seen))
+	for _, s := range seen {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].StartDate.Equal(out[j].StartDate) {
+			return out[i].StartDate.Before(out[j].StartDate)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 
