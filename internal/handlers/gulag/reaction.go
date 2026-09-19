@@ -35,8 +35,13 @@ const reactionMaxPages = 50
 
 // reactionUserFetcherFunc is the REST seam for reacting user fetches:
 // the signature mirrors discordgo.Session.MessageReactions (what Rust's
-// get_reaction_users wraps). The production default is the session call;
-// tests inject a fake to pin the manual pagination math.
+// get_reaction_users wraps). The emojiID argument carries the
+// get-reaction-users endpoint's emoji contract — the GUILD EMOJI
+// IDENTIFIER `name:ID` for custom emoji (discordgo `Emoji.APIName`,
+// static or animated) and the glyph for unicode — NOT the message
+// markup `<:name:ID>` form (see fetchAllVoters). The production default
+// is the session call; tests inject a fake to pin the manual pagination
+// math.
 type reactionUserFetcherFunc func(ctx context.Context, channelID, messageID, emojiID string, limit int, beforeID, afterID string) ([]*discordgo.User, error)
 
 // ReactionAdd is the OnReactionAdd entry point (Rust reaction_add). Both
@@ -183,6 +188,18 @@ func (g *Gulag) reactionHandler(ctx context.Context, add *discordgo.MessageReact
 // fetchAllVoters ports fetch_all_voters (gulag_reaction.rs:24-59):
 // manual 100-per-call pagination, 50-page cap, immediate (no inter-page
 // delay), ALL bots filtered, MAX_PAGES warning.
+//
+// The emoji argument is the get-reaction-users endpoint's contract —
+// discordgo's `Emoji.APIName`: the GUILD EMOJI IDENTIFIER `name:ID` for
+// custom emoji (static or animated) and the glyph itself for unicode.
+// Rust's `get_reaction_users(emoji: &Emoji)` wraps the same contract
+// through `Emoji::url_encode()`; passing the MESSAGE MARKUP form
+// (`Emoji.MessageFormat`, `<:name:ID>` / `<a:name:ID>`) instead sends a
+// trailing `>` into the emoji id — Discord rejects every call with
+// 50035 `Value "…>" is not snowflake` (proven live across the whole
+// 2026-09-19 session: every GULAG reaction 400'd, zero vote syncs ran,
+// the reaction→vote→gulag path was dead despite reaction events and the
+// trigger check firing).
 func (g *Gulag) fetchAllVoters(ctx context.Context, channelID, messageID string, reactionType *discordgo.Emoji) ([]int64, error) {
 	fetch := g.reactionUserFetcher
 	if fetch == nil {
@@ -190,10 +207,14 @@ func (g *Gulag) fetchAllVoters(ctx context.Context, channelID, messageID string,
 			return g.d.MessageReactions(channelID, messageID, emojiID, limit, beforeID, afterID)
 		}
 	}
+	emoji := ""
+	if reactionType != nil {
+		emoji = reactionType.APIName()
+	}
 	all := make([]*discordgo.User, 0)
 	var after string
 	for pageNum := 0; pageNum < reactionMaxPages; pageNum++ {
-		page, err := fetch(ctx, channelID, messageID, reactionEmojiString(reactionType), reactionPageSize, "", after)
+		page, err := fetch(ctx, channelID, messageID, emoji, reactionPageSize, "", after)
 		if err != nil {
 			return nil, err
 		}

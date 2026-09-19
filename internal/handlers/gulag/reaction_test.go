@@ -33,10 +33,15 @@ func makeUsers(t *testing.T, n int, botsEvery int) []*discordgo.User {
 type pageSource struct {
 	users []*discordgo.User
 	calls int
+	// capturedEmoji records the emoji argument of every fetch call — it
+	// pins the get-reaction-users emoji-parameter parity (the APIName /
+	// name:ID contract, not the message markup form).
+	capturedEmoji []string
 }
 
-func (ps *pageSource) fetch(ctx context.Context, _, _, _ string, limit int, beforeID, afterID string) ([]*discordgo.User, error) {
+func (ps *pageSource) fetch(ctx context.Context, _, _, emoji string, limit int, beforeID, afterID string) ([]*discordgo.User, error) {
 	ps.calls++
+	ps.capturedEmoji = append(ps.capturedEmoji, emoji)
 	start := 0
 	if afterID != "" {
 		found := false
@@ -180,6 +185,23 @@ func TestReactionGulagMatchIsCaseSensitive(t *testing.T) {
 	}
 }
 
+// TestReactionHandler_NilEmojiNeverFetches pins the nil-emoji guard:
+// a nil reaction emoji (the gateway can deliver one) must degrade to an
+// empty fetch — it must never panic reaching into the emoji. The
+// handler's trigger check misses a nil emoji (its serialization is ""),
+// so the legitimate path is ReactionAdd with a non-gulag emoji;
+// fetchAllVoters is exercised with a nil here directly.
+func TestReactionHandler_NilEmojiNeverFetches(t *testing.T) {
+	src := &pageSource{users: makeUsers(t, 10, 0)}
+	g := &Gulag{reactionUserFetcher: src.fetch}
+	if _, err := g.fetchAllVoters(context.Background(), "123", "456", nil); err != nil {
+		t.Fatalf("fetchAllVoters(nil): %v", err)
+	}
+	if src.emojiArg() != "" {
+		t.Fatalf("nil emoji passed arg %q, want the empty string", src.emojiArg())
+	}
+}
+
 // TestReactionHandler_NonGulagEmojiDoesNothing pins the first gate: an
 // emoji that does not contain `gulag` returns before any pool / fetch /
 // Discord call (nil session and pool are safe on this path).
@@ -189,6 +211,64 @@ func TestReactionHandler_NonGulagEmojiDoesNothing(t *testing.T) {
 	g.ReactionAdd(&discordgo.MessageReaction{Emoji: discordgo.Emoji{Name: "fire"}})
 	if src.calls != 0 {
 		t.Fatalf("non-gulag emoji performed %d react user fetches, want 0", src.calls)
+	}
+}
+
+// emojiArg returns the first captured emoji argument (the one every
+// fetch in the test receives, extension).
+func (ps *pageSource) emojiArg() string {
+	if len(ps.capturedEmoji) == 0 {
+		return ""
+	}
+	return ps.capturedEmoji[0]
+}
+
+// TestFetchAllVoters_CustomEmojiAPIName pins the get-reaction-users
+// emoji-parameter contract: for a custom emoji the endpoint takes the
+// GUILD EMOJI IDENTIFIER `name:ID` (discordgo's `Emoji.APIName` — the
+// "correctly formatted API name for use in the MessageReactions
+// endpoints"), NOT the message markup `<:name:ID>` (`Emoji.MessageFormat`).
+// Proven live post-cutover (2026-09-19 journal): the markup form leaked
+// the trailing `>` into the emoji id, Discord rejected every call with
+// 50035 `Value "843909650931515445>" is not snowflake` (list ERROR
+// `failed to fetch reaction users`), the sync never ran, and the whole
+// reaction→vote→gulag path was dead.
+func TestFetchAllVoters_CustomEmojiAPIName(t *testing.T) {
+	src := &pageSource{users: makeUsers(t, 10, 0)}
+	g := &Gulag{reactionUserFetcher: src.fetch}
+	if _, err := g.fetchAllVoters(context.Background(), "123", "456", &discordgo.Emoji{ID: "843909650931515445", Name: "gulag"}); err != nil {
+		t.Fatalf("fetchAllVoters: %v", err)
+	}
+	if got := src.emojiArg(); got != "gulag:843909650931515445" {
+		t.Fatalf("emoji arg = %q, want %q (name:ID — the MessageReactions contract, not the <name:ID> markup form)", got, "gulag:843909650931515445")
+	}
+}
+
+// TestFetchAllVoters_AnimatedCustomEmojiAPIName pins the animated arm:
+// Discord's emoji parameter is `name:ID` for BOTH static and animated
+// custom emoji (the `<a:name:ID>` markup form is chat markup only —
+// the same 50035 would hit it).
+func TestFetchAllVoters_AnimatedCustomEmojiAPIName(t *testing.T) {
+	src := &pageSource{users: makeUsers(t, 10, 0)}
+	g := &Gulag{reactionUserFetcher: src.fetch}
+	if _, err := g.fetchAllVoters(context.Background(), "123", "456", &discordgo.Emoji{ID: "843909650931515445", Name: "gulag", Animated: true}); err != nil {
+		t.Fatalf("fetchAllVoters: %v", err)
+	}
+	if got := src.emojiArg(); got != "gulag:843909650931515445" {
+		t.Fatalf("animated emoji arg = %q, want %q (name:ID without the <a: markup)", got, "gulag:843909650931515445")
+	}
+}
+
+// TestFetchAllVoters_UnicodeEmojiSendsGlyph pins the unicode arm: the
+// emoji parameter is the glyph itself (a unicode emoji has no id).
+func TestFetchAllVoters_UnicodeEmojiSendsGlyph(t *testing.T) {
+	src := &pageSource{users: makeUsers(t, 10, 0)}
+	g := &Gulag{reactionUserFetcher: src.fetch}
+	if _, err := g.fetchAllVoters(context.Background(), "123", "456", &discordgo.Emoji{Name: "\U0001f525"}); err != nil {
+		t.Fatalf("fetchAllVoters: %v", err)
+	}
+	if got := src.emojiArg(); got != "\U0001f525" {
+		t.Fatalf("unicode emoji arg = %q, want the glyph itself", got)
 	}
 }
 
