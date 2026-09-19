@@ -96,7 +96,7 @@ DELETE FROM schema_migrations WHERE version = '000007_derpies_slowmode_path';
 **Files:**
 - Modify: `internal/handlers/derpies/derpies.go` (constants, struct fields, `gateSlowmode`, `flowGated` + `flow` wrapper, `MessageCreate`, comment, `newTestDerpies` is next)
 - Modify: `internal/handlers/derpies/edits.go` (`editFlow` call site + its stale "origin-agnostic" comment)
-- Modify: `internal/handlers/derpies/derpies_test.go` (`newTestDerpies`: add `clock: time.Now`)
+- Modify: `internal/handlers/derpies/derpies_test.go` (`newTestDerpies`: add `clock: time.Now` — **and the `time` import**: the file currently imports context/errors/strings/testing + discordgo/app/config/mcp, no `time`)
 - Test: `internal/handlers/derpies/derpies_slowmode_test.go` (new file)
 
 **What to implement (in `derpies.go` unless noted):**
@@ -233,7 +233,7 @@ Replaced by (every line carries the `//` prefix):
 // still yield N serialized pi asks (the pi RPC queue is shared with the mention handler).
 ```
 
-7. `newTestDerpies` (in `derpies_test.go`) — the returned literal gains one field (alongside `clock`'s siblings; the field sits next to `store`/`ops` in the `Derpies` struct):
+7. `newTestDerpies` (in `derpies_test.go` — **add the `time` import to this file** — it does not currently import `time`): the returned literal gains one field (alongside `store`/`ops` in the `Derpies` struct):
 ```go
 	return &Derpies{
 		app: &app.App{ ... },
@@ -243,6 +243,36 @@ Replaced by (every line carries the `//` prefix):
 	}
 ```
 Gate tests still pin `h.clock` themselves (the override wins); this line makes the existing suite safe.
+
+8. **Stale-comment fixes (text-only, no behavior)** — the `flow` doc comment (currently the 4 lines immediately above `func (h *Derpies) flow(`):
+```
+// flow — the full message flow (gates → fast path → images → slow path →
+// learn/delete). The create and edit paths run the identical flow —
+// origin-agnostic; each post or edit costs at most one list SELECT + one
+// pi ask.
+```
+— moves with the rename to `flowGated` and is replaced by:
+```
+// flowGated — the full message flow (gates → [single-slowmode gate,
+// when slowmodeOn] → fast path → images → slow path → learn/delete).
+// Each post costs at most one list SELECT + one pi ask. The
+// MessageCreate entry (flow below) runs it with slowmodeOn=true; the
+// edit flow (edits.go) runs it with slowmodeOn=false — the gate is
+// the only flow element that differs between the two entries (approved
+// v1 rule: edits are out of gate scope).
+```
+And in `edits.go`, the package-level doc's last 2 lines of that 8-line block:
+```
+// deletion all carry over unchanged (an edit is origin-agnostic: at most
+// one list SELECT + one pi ask, same as a create).
+```
+→
+```
+// deletion all carry over unchanged (at most one list SELECT + one pi
+// ask, same as a create) — with the single-slowmode gate EXCLUDED
+// (approved v1 rule: the gate watches MessageCreate only; an edit is
+// judged normally and is not counted).
+```
 
 **Tests (in `derpies_slowmode_test.go`, package `derpies`)** — construction pattern:
 ```go
@@ -270,7 +300,7 @@ func gateMsg(id, ch, content string) *discordgo.Message {
 - `TestGateIgnoresEdits` (S6.4-add, the edit-scope pin, per the done-when): pinned clock; 2 single-token creates ("a1", "a2") via `h.flow(...)`; then a single-token edit via `editEvent` (the helper from `derpies_edits_test.go`, `editUser`-gated, channel c1, content "has") through `h.editFlow(evt)` → the edit is judged normally (`pi.asks` +1) and NOT gate-deleted (`len(ops.deleted) == 0` — the edit's fast/slow path runs; the edit does not count); then a 3rd single-token **create** ("a3") via `h.flow(...)` → gate-deleted (`len(ops.deleted) == 1`, `ops.deleted[0]` = a3).
 
 **Steps:**
-- [ ] Write `newTestDerpies` clock fix + `TestGateDeletesThirdSingleToken` (RED: no `gateSlowmode`/`flowGated` → compile error. The expected failure)
+- [ ] Write the `newTestDerpies` clock fix + `TestGateDeletesThirdSingleToken` (RED: the test **compiles** and **fails at the `len(ops.deleted)` assertion** — no gate exists yet, so post 3 runs the full flow and nothing is deleted; that assertion failure is the expected RED; it is NOT a compile failure — if you get a compile error instead, the `time` import (item 7) is missing)
 - [ ] Under `make db-up` + env, run `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./internal/handlers/derpies/ -run 'TestGate'` → expect the compile failure
 - [ ] Implement constants + struct fields + `gateSlowmode` + the `flowGated`/`flow` split + the `edits.go` call site + the flow hook + the `MessageCreate` comment
 - [ ] Re-run → `TestGateDeletesThirdSingleToken` passes
@@ -309,11 +339,11 @@ func gateMsg(id, ch, content string) *discordgo.Message {
 2. `TestGateDeleteFailure` (S6.5): `ops.delErr = errors.New("429")`; 3 single-token posts; the 3rd's delete fails → no panic, `len(ops.deleted) == 0` (the fake records only successes), **but** `store.decisions` still has a `path='slowmode'` row with `Deleted == true` (best-effort recorded). Then **`ops.delErr = nil`** (the blanket fake otherwise keeps failing — the "4th post gate-deleted" is only meaningful after clearing it), post #4 → `len(ops.deleted) == 1`. If a test in this group fails, fix the plan's test construction (fakes/clock sequence) first; suspect the implementation only then.
 3. `TestGatePerChannelIsolation` (S6.6): 2 posts in c1 + 2 posts in c2 (`gateMsg`'s ch parameter) → the 3rd in c1 is gate-deleted; the 3rd in c2 passes (`len(ops.deleted) == 1`, the sole delete's ID is c1's 3rd).
 4. `TestGateEmptyOnRestart` (S6.9): 2 single-token posts on `h`; a fresh `h1 := newTestDerpies(<fresh fakes>)` (new `fakeStore`/`fakeOps`/`fakePi` + pinned clock) receives 2 identical posts → no delete (fresh window is empty).
-5. MCP pass-through (S6.8) in `internal/mcp/mcp_test.go` — mirror `TestReadDecisionsToolTextRendersRows` mechanically; a single `DecisionRow` with `Path: pStr("slowmode")`, `Score`/`Threshold`/`Word` left nil (a `pInt` helper exists; nil pointers = the gate row's shape), `Learned: false`, `Deleted: true` → assert the text line renders `slowmode` in the path slot with `-/-` score/threshold and `-` word (the renderer's NULL optionals), and the structured payload carries `"path": "slowmode"`. No production changes.
+5. MCP pass-through (S6.8) in `internal/mcp/mcp_test.go`: **the test is named `TestReadDecisionsToolRendersSlowmodeRow`** (it must match the run filter in the verification step; a different name would make the filtered run vacuously green). Mirror `TestReadDecisionsToolTextRendersRows` mechanically; a single `DecisionRow` with `Path: pStr("slowmode")`, `Score`/`Threshold`/`Word` left nil (a `pInt` helper exists; nil pointers = the gate row's shape), `Learned: false`, `Deleted: true` → assert the text line renders `slowmode` in the path slot with `-/-` score/threshold and `-` word (the renderer's NULL optionals), and the structured payload carries `"path": "slowmode"`. No production changes.
 6. Docs (house pattern — every prior derpies feature shipped with these):
    - `CHANGE.md`: new `## 2026-09-19` section, `### derpies: single-slowmode gate — 3rd+ single-token post per channel in 30 s deleted pre-judgement (ADR 0011)`, with the house bullets (Observed: the one-word post-burst, 114→209 decision rows in ~30 min on 2026-09-19, each word = a full pi ask; Changed: gate = 2 single-token creates per 30 s per author+channel, 3rd+ deleted before the fast path (zero asks), audit row `path='slowmode'` (NULL score/threshold/word), long posts/edits/unfiltered behavior unchanged, in-memory counter that resets on restart by design; Code: `internal/handlers/derpies` (gate + the `flowGated` entry split) + the `000007` migration; Docs: the `0011` decision + the `CONTEXT.md` entry + this file's limitations rewording + the path-valued string fix).
-   - `docs/features/derpies.md`: limit line 90 heading ("…without rate limiting") + line 98 bulk cell → mark the single-token case as gated (decision 0011; gate only covers ≤2-token posts); line 109 line (rate-limit out-of-scope) → single slow mode (decision 0011) implemented, long-post coalescing remains out of scope.
-   - Path strings (now wrong if left "fast"/"slow"-only): `derpies.go` `decisionRecord.Path` doc → `"fast" | "slow" | "slowmode" | NULL`; `internal/mcp/mcp.go` `DecisionRow.Path` → `"fast" | "slow" | "slowmode" | NULL`, `DecisionFilter.Path` → `"fast" | "slow" | "slowmode" | ""`; `tools_decisions.go` filter arg doc likewise + tool Description `path ("fast"/"slow")` → `path ("fast"/"slow"/"slowmode")`.
+   - `docs/features/derpies.md`: (a) insert a new numbered item 4 into the `## Gates (checked in this order)` list (which currently ends at item 3, the author-ID gate): "4. **Single-slowmode gate (v1, creates only — decision 0011)**: a gated author's 3rd+ **single-token** post per channel inside a rolling 30 s is deleted here (pre-fast-path, zero pi asks, silent); pass-through single-token posts are counted regardless of flow outcome; ≥2-token posts, 0-token posts, and **edits** are not gated."; (b) line 90 heading ("…no rate limiting") + line 98 burst cell → mark the single-token case as gated (decision 0011; the gate covers single-token posts only — long-post burst amplification is unchanged); line 109 line (rate limiting out-of-scope) → single slowmode (decision 0011) implemented, long-post coalescing remains out of scope; (c) **refresh the front-matter `last-verified`/`verified-by` block AFTER the full gate runs** (house pattern — same inline form as the 2026-09-18 line; date = the ship date, the line naming the full gate evidence + `selftest` + "all fourteen handlers" + the decision 0011 entry).
+   - Path strings (now wrong if left "fast"/"slow"-only): `derpies.go` `decisionRecord.Path` field doc → `"fast" | "slow" | "slowmode" | NULL`; **the `decisionRecord` struct-level doc (its line 3 quotes `"path text CHECK (path IN ('fast','slow'))"`) → the 3-value form after 000007** (quote the CHECK as `CHECK (path IN ('fast','slow','slowmode'))`); **the `Derpies` struct doc (the line `// Derpies handles the derpies flow (feature gate → guild guard →` / `// author-ID gate → fast-path token match → pi RPC verdict). It also`) → `// author-ID gate → [single-slowmode gate, creates only — decision 0011,` / `// the 3rd+ single-token post per channel within 30 s] → fast-path` / `// token match → pi RPC verdict). It also`** (add the bracketed gate to the chain, keep the remainder); `internal/mcp/mcp.go` `DecisionRow.Path` → `"fast" | "slow" | "slowmode" | NULL`, `DecisionFilter.Path` → `"fast" | "slow" | "slowmode" | ""`; `tools_decisions.go` filter arg doc likewise + tool Description `path ("fast"/"slow")` → `path ("fast"/"slow"/"slowmode")`.
 7. **Full gate run (house discipline, AGENTS.md order)** — if the compose DB has dirty state from an earlier run, clear it first: `docker compose down -v && make db-up`.
    - [ ] `go build ./... && go vet ./... && gofmt -l .` (silent) && `make lint` (0 issues)
    - [ ] `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` — all green (includes Task 1's migration test + this task's MCP regression — the env-var run)
