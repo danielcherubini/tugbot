@@ -120,6 +120,33 @@ func TestGateSlidingEdge(t *testing.T) {
 	if pi.asks != 3 {
 		t.Errorf("asks = %d, want 3 (the 3rd post passed the gate)", pi.asks)
 	}
+
+	// Phase 2: the boundary at exactly +30.0 s (fresh handler + pinned
+	// clock): two single-token posts at t=base, then the 3rd at exactly
+	// t=base+30 s. The load-bearing comparison is now.Sub(ts) <=
+	// slowmodeWindow — a post 30.0 s old is still IN the window
+	// (inclusive), so kept = 2 = the cap and the 3rd is gate-deleted; a
+	// regression to `<` would prune both t=base posts and let the 3rd
+	// pass.
+	_, ops2, pi2, h2, tt2 := newGateDerpies(nil)
+	base2 := time.Now()
+	*tt2 = base2
+	h2.flow(gateMsg("e1", "c1", "cat"))
+	h2.flow(gateMsg("e2", "c1", "has"))
+	*tt2 = base2.Add(30 * time.Second)
+	h2.flow(gateMsg("e3", "c1", "hit"))
+	if len(ops2.deleted) != 1 {
+		t.Fatalf("phase 2: deleted = %v, want exactly [c1 e3] (the +30.0 s posts are still inside the inclusive window)", ops2.deleted)
+	}
+	if ops2.deleted[0][0] != "c1" || ops2.deleted[0][1] != "e3" {
+		t.Errorf("phase 2: deleted[0] = %v, want [c1 e3]", ops2.deleted[0])
+	}
+	if pi2.asks != 2 {
+		t.Errorf("phase 2: asks = %d, want 2 (only e1 and e2 reached the slow path; e3 was gate-deleted)", pi2.asks)
+	}
+	if got := len(h2.rateWindow[editUser+"|c1"]); got != 2 {
+		t.Errorf("phase 2: c1 window entries = %d, want 2 (the +30.0 s posts are kept by the inclusive comparison; the over-limit e3 appends nothing)", got)
+	}
 }
 
 // TestGateIgnoresLongPosts (S6.3): ≥2-token posts never enter the
@@ -426,12 +453,18 @@ func TestGateDeleteFailure(t *testing.T) {
 }
 
 // TestGatePerChannelIsolation (S6.6): the window is per-(author,
-// CHANNEL) — c1's window is driven to the cap (2 single-token posts)
-// while c2 stays below it (its two posts are ≥2-token and never
-// enter the window). The 3rd in c1 is gate-deleted; the 3rd single
-// token in c2 passes (its channel's window only ever accumulated 2
-// entries — a buggy shared/author-wide counter would have deleted it
-// as the 3rd single token overall). Sole delete: [c1 a3].
+// CHANNEL) — pinned in BOTH directions. Forward: c1's window is driven
+// to the cap (2 single-token posts) while c2 stays below it (its two
+// posts are ≥2-token and never enter the window). The 3rd in c1 is
+// gate-deleted; the 3rd single token in c2 passes (its channel's
+// window only ever accumulated 2 entries — a buggy shared/author-wide
+// counter would have deleted it as the 3rd single token overall).
+// Reverse (phase 2, after the pinned clock gaps >30 s past every
+// existing entry so BOTH windows fully prune): 2 single-token posts in
+// c2 fill c2's window, c2's 3rd single token is gate-deleted, and a
+// single-token post in c1 passes — c1's window pruned empty on the
+// gap while c2's cap is full. Deletions: [c1 a3] and [c2 d3]; e1 is
+// never deleted.
 //
 // Deviation (recorded per the plan's construction-faults rule): the
 // plan's sequence (2 single tokens in c1 + 2 single tokens in c2, same
@@ -443,7 +476,7 @@ func TestGateDeleteFailure(t *testing.T) {
 // the minimal change that still pins the isolation property the test
 // is named for: a cap full in c1 never gates c2, and vice-versa.
 func TestGatePerChannelIsolation(t *testing.T) {
-	_, ops, pi, h, _ := newGateDerpies(nil)
+	_, ops, pi, h, tt := newGateDerpies(nil)
 	h.flow(gateMsg("a1", "c1", "cat"))
 	h.flow(gateMsg("b1", "c2", "very nice")) // 2-token: never enters c2's window
 	h.flow(gateMsg("a2", "c1", "has"))
@@ -468,6 +501,48 @@ func TestGatePerChannelIsolation(t *testing.T) {
 	}
 	if got := len(h.rateWindow[editUser+"|c2"]); got != 1 {
 		t.Errorf("c2 window entries = %d, want 1 (only b3's timestamp — the 2-token b1/b2 are never added)", got)
+	}
+
+	// Phase 2 (REVERSE direction; the pinned clock gaps >30 s past
+	// every existing window entry — all the phase-1 posts share the
+	// helper's zero value, so +31 s prunes c1's 2 entries AND c2's 1
+	// by now.Sub(ts) > slowmodeWindow): 2 single-token posts in c2
+	// (d1, d2) fill c2's window; c2's 3rd single token (d3) is
+	// gate-deleted; a single-token post in c1 (e1) passes — c1's
+	// window pruned empty on the gap (the over-limit a3 appended
+	// nothing) while c2's cap is full. A counter (any of them) shared
+	// across channels would gate d3 or e1.
+	*tt = (*tt).Add(31 * time.Second) // the zero-value pinned clock + 31 s — >30 s past every phase-1 entry
+	h.flow(gateMsg("d1", "c2", "dog"))
+	h.flow(gateMsg("d2", "c2", "hen"))
+	h.flow(gateMsg("d3", "c2", "jet")) // 3rd single token in c2 -> gate-deleted (c2 window at the cap)
+	h.flow(gateMsg("e1", "c1", "pin")) // single token in c1 -> passes (c1 window pruned empty)
+	if len(ops.deleted) != 2 {
+		t.Fatalf("phase 2: deleted = %v, want exactly [c1 a3] and [c2 d3] (c1's reverse post e1 passes)", ops.deleted)
+	}
+	var sawC2D3, sawC1E1 bool
+	for _, d := range ops.deleted {
+		if d[0] == "c2" && d[1] == "d3" {
+			sawC2D3 = true
+		}
+		if d[0] == "c1" && d[1] == "e1" {
+			sawC1E1 = true
+		}
+	}
+	if !sawC2D3 {
+		t.Errorf("phase 2: [c2 d3] is not in deleted (c2's 3rd single token must be gate-deleted)")
+	}
+	if sawC1E1 {
+		t.Errorf("phase 2: [c1 e1] is in deleted — c1's single-token post must pass (its window pruned empty)")
+	}
+	if pi.asks != 8 {
+		t.Errorf("phase 2: asks = %d, want 8 (phase 1's 5 + d1, d2, e1; d3 was gate-deleted)", pi.asks)
+	}
+	if got := len(h.rateWindow[editUser+"|c2"]); got != 2 {
+		t.Errorf("phase 2: c2 window entries = %d, want 2 (d1 and d2 — the over-limit d3 appends nothing)", got)
+	}
+	if got := len(h.rateWindow[editUser+"|c1"]); got != 1 {
+		t.Errorf("phase 2: c1 window entries = %d, want 1 (only e1's timestamp — the gap pruned a1/a2 and d3 appended nothing)", got)
 	}
 }
 
