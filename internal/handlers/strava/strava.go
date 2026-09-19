@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -73,7 +74,8 @@ type Strava struct {
 	poll time.Duration
 
 	// sendFn seam: func(threadID, msg string) error — production posts via
-	// h.app.D.ChannelMessageSend (threads are plain channels in discordgo).
+	// h.app.D.ChannelMessageSendComplex with mention parsing disabled (the
+	// threads are plain discordgo channels).
 	sendFn func(threadID string, msg string) error
 
 	cfgWarned bool // log-once: configured-but-credentialed-missing preflight
@@ -81,14 +83,22 @@ type Strava struct {
 
 // New builds the handler. NO network I/O here (selftest discipline — every
 // handler is constructed offline). The API is lazy (nil until first use);
-// discordgo's ChannelMessageSend is
-// (channelID string, content string, ...RequestOption) (*Message, error), so
-// the seam is wired via a CLOSURE (a direct method-value would not compile
-// to the seam's signature).
+// the seam is wired via a CLOSURE (the house single-thread send shape).
 func New(app *app.App) *Strava {
 	s := &Strava{app: app}
 	s.sendFn = func(threadID, msg string) error {
-		_, err := s.app.D.ChannelMessageSend(threadID, msg)
+		// MessageAllowedMentions' Parse is deliberately NOT omitempty: an
+		// empty Parse slice marshals parse: [] — complete mention suppression
+		// (discordgo's stated purpose: sending untrusted user input; a zero
+		// value would marshal a nil slice to parse: null, so the closure
+		// passes the explicit empty slice). A regular bot message without
+		// allowed_mentions has ALL mention types parsed by default, so an
+		// athlete's activity title could otherwise ping a user (<@id>) or
+		// roll @everyone/@here pending MENTION_EVERYONE.
+		_, err := s.app.D.ChannelMessageSendComplex(threadID, &discordgo.MessageSend{
+			Content:         msg,
+			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+		})
 		return err
 	}
 	return s

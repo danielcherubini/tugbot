@@ -81,9 +81,7 @@ func TestListActivitiesPagination(t *testing.T) {
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
-			case "/v3/athlete":
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-			case "/v3/athletes/1/activities":
+			case "/api/v3/athlete/activities":
 				calls++
 				q := r.URL.Query()
 				if a := q.Get("after"); a != "" {
@@ -286,8 +284,8 @@ func TestGetActivitySignals(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Errorf("method = %s, want GET", r.Method)
 			}
-			if r.URL.Path != "/v3/activities/7" {
-				t.Errorf("path = %s, want /v3/activities/7", r.URL.Path)
+			if r.URL.Path != "/api/v3/activities/7" {
+				t.Errorf("path = %s, want /api/v3/activities/7", r.URL.Path)
 			}
 			_, _ = w.Write([]byte(body))
 		}))

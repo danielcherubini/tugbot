@@ -1,10 +1,36 @@
 package strava
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 )
+
+// TestMentionSuppressionPayload pins the zero-empty-JSON suppression that the
+// production sendFn relies on: MessageAllowedMentions' Parse is deliberately NOT
+// omitempty in discordgo — an EMPTY (non-nil) Parse slice marshals to
+// "parse":[] — complete mention suppression. (A zero-value struct would
+// marshal a nil slice to "parse":null, which is not the documented
+// suppression form; the production closure therefore passes the explicit
+// empty Parse.) A regular bot message WITHOUT allowed_mentions has ALL mention
+// types parsed by default, so without this an activity title could ping a user
+// (<@id>) or roll @everyone/@here pending MENTION_EVERYONE.
+func TestMentionSuppressionPayload(t *testing.T) {
+	b, err := json.Marshal(&discordgo.MessageSend{
+		Content:         "x",
+		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"allowed_mentions":{"parse":[]`) {
+		t.Errorf("marshal = %s, want it to contain %q (explicit-empty-JSON suppression)", b, `"allowed_mentions":{"parse":[]`)
+	}
+}
 
 // TestFeatureKey pins the feature flag key (task 4, spec — the features-table
 // row the loop gates on; registered by migration 000006 at `enabled=false`).

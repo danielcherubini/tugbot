@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -23,10 +22,7 @@ import (
 // duplicates otherwise loop forever).
 const listPageSize = 100
 
-const (
-	athletePath = "/v3/athlete"
-	tokenPath   = "/oauth/token"
-)
+const tokenPath = "/oauth/token"
 
 // Summary is what the list endpoint returns per activity (a subset
 // model — enough to gate the detail fetch on sport_type).
@@ -89,28 +85,26 @@ type stravaClient struct{ base string }
 // goroutine indefinitely.
 var stravaHTTP = &http.Client{Timeout: 30 * time.Second}
 
-// NewStravaAPI is the production constructor (base = https://www.strava.com);
-// tests construct stravaClient directly with an httptest URL. No network I/O
-// at construction — selftest-safe.
+// NewStravaAPI is the production constructor. base = https://www.strava.com:
+// the official OpenAPI reference (developers.strava.com/docs/reference) serves
+// the v3 routes under the /api prefix (full-URL examples like
+// https://www.strava.com/api/v3/athlete/activities) while the OAuth endpoints
+// live at the root WITHOUT /api (https://www.strava.com/oauth/token) — both
+// shapes are the spec's, not a convention we chose. Tests construct
+// stravaClient directly with an httptest URL. No network I/O at construction —
+// selftest-safe.
 func NewStravaAPI() StravaAPI {
 	return &stravaClient{base: "https://www.strava.com"}
 }
 
 func (c *stravaClient) ListActivities(ctx context.Context, token string, after time.Time) ([]Summary, error) {
-	athleteID, err := c.athleteID(ctx, token)
-	if err != nil {
-		return nil, err
-	}
 	// The `after` anchor is IDENTICAL on every page (fixed); only the `page`
 	// parameter advances. Rows are id-deduplicated across pages, and the walk
 	// stops on a short page OR a page of zero NEW ids — the zero-new guard
 	// makes degenerate same-timestamp pages terminate.
 	seen := make(map[int64]Summary)
 	for pageNum := 1; ; pageNum++ {
-		endpoint := fmt.Sprintf("%s/v3/athletes/%d/activities?per_page=%d&page=%d", c.base, athleteID, listPageSize, pageNum)
-		if !after.IsZero() {
-			endpoint += "&after=" + strconv.FormatInt(after.Unix(), 10)
-		}
+		endpoint := fmt.Sprintf("%s/api/v3/athlete/activities?per_page=%d&after=%d&page=%d", c.base, listPageSize, after.Unix(), pageNum)
 		rows, err := c.getList(ctx, endpoint, token)
 		if err != nil {
 			return nil, err
@@ -144,7 +138,7 @@ func (c *stravaClient) ListActivities(ctx context.Context, token string, after t
 
 func (c *stravaClient) GetActivity(ctx context.Context, token string, id int64) (Activity, error) {
 	var raw activityWire
-	status, err := c.getJSON(ctx, fmt.Sprintf("%s/v3/activities/%d", c.base, id), token, &raw)
+	status, err := c.getJSON(ctx, fmt.Sprintf("%s/api/v3/activities/%d", c.base, id), token, &raw)
 	if err != nil {
 		// A 404 on the DETAIL endpoint for an id the list just returned is a
 		// DETERMINISTIC per-activity outcome (the activity is gone — deleted or
@@ -200,18 +194,6 @@ func (c *stravaClient) RefreshToken(ctx context.Context, clientID, clientSecret,
 	}
 	// expires_at is epoch seconds in the API response.
 	return tok.AccessToken, tok.RefreshToken, time.Unix(int64(tok.ExpiresAt), 0).UTC(), nil
-}
-
-// athleteID resolves the authenticated athlete's ID; the client never
-// decodes the access token (server-side endpoint only).
-func (c *stravaClient) athleteID(ctx context.Context, token string) (int, error) {
-	var ath struct {
-		ID int `json:"id"`
-	}
-	if _, err := c.getJSON(ctx, c.base+athletePath, token, &ath); err != nil {
-		return 0, err
-	}
-	return ath.ID, nil
 }
 
 // getJSON runs a Bearer-authed GET and decodes the 200 body into out; any
