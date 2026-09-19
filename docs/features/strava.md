@@ -6,7 +6,7 @@ verified-by: verified 2026-09-19 at the handler-wiring ship (Task 6 — the `str
 
 # Strava activity posting
 
-The strava handler (the fourteenth, `internal/handlers/strava`) polls the Strava v3 API every 15 minutes per configured athlete and posts the family's new activities into the shared Discord thread. It is a background loop only — no message event handlers, no slash command. Failures are log-only per athlete (one athlete's pass failure never skips the others); the only persistent side effect besides posts is the per-athlete seen/cursor state.
+The strava handler (the fourteenth, `internal/handlers/strava`) polls the Strava v3 API every 15 minutes per configured athlete and posts the family's new activities into the shared Discord thread. It is a background loop only — no message event handlers, no slash command. Failures are log-only per athlete (a per-athlete pass failure — a 401 to the reauth pause, a detail 429/5xx to the per-activity `pending` arm — never skips the other athletes; the one exception is a list-endpoint 429, which defers the remaining athletes of that tick to the next one, since Strava's 15-minute rate window is app-wide — the 15-minute ticker is the backoff); the only persistent side effect besides posts is the per-athlete seen/cursor state.
 
 ## Mechanics
 
@@ -67,7 +67,7 @@ A `needs_reauth = true` row is excluded from every pass until the flag is cleare
 
 ## Rate budget
 
-At ≤ 5 athletes the default **1,000 read requests/day** API cap is comfortable: per athlete per 15-minute pass the read side is **two** list-side requests — one `GET /v3/athlete` id resolution plus the list walk (1–2 pages at normal cadence) — one detail fetch per new in-family activity, and a token refresh only when near expiry. The same budget is policed on a **15-minute window** alongside the daily cap: **100/15min** and 1,000/day by default. Approaching **10 athletes** (i.e. more total passes) requires the same self-serve dashboard upgrade that raises the athlete cap — it also raises the read cap to **2,000/day** (and **200/15min**). Token refreshes are expected NOT to count against the read budget; **verify against Strava's current rate-limits documentation at enable time** (the cap is the operator's thing; a 429 surfaces as a transient `pending`, which is the intended degraded arm, not an error state).
+At ≤ 5 athletes the default **1,000 read requests/day** API cap is comfortable: per athlete per 15-minute pass the read side is **two** list-side requests — one `GET /v3/athlete` id resolution plus the list walk (1–2 pages at normal cadence) — one detail fetch per new in-family activity, and a token refresh only when near expiry. The same budget is policed on a **15-minute window** alongside the daily cap: **100/15min** and 1,000/day by default. Approaching **10 athletes** (i.e. more total passes) requires the same self-serve dashboard upgrade that raises the athlete cap — it also raises the read cap to **2,000/day** (and **200/15min**). Token refreshes are expected NOT to count against the read budget; **verify against Strava's current rate-limits documentation at enable time** (the cap is the operator's thing; a **detail-fetch** 429 surfaces as a transient `pending`, which is the intended degraded arm, not an error state, while a **list-fetch** 429 instead aborts the rest of the tick — deferred to the next 15-minute cycle, since Strava's rate window is app-wide).
 
 ## Late-sync trade-off
 
