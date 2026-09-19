@@ -212,7 +212,10 @@ func TestGateCountsFastPathDeletes(t *testing.T) {
 			rowF1 = d
 		}
 	}
-	if rowF1 != nil && (rowF1.Path == nil || *rowF1.Path != "fast") {
+	if rowF1 == nil {
+		t.Fatalf("no decision row for f1 (the fast-path-deleted single token)")
+	}
+	if rowF1.Path == nil || *rowF1.Path != "fast" {
 		t.Errorf("f1 row Path = %v, want 'fast'", rowF1.Path)
 	}
 }
