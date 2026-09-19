@@ -2014,6 +2014,68 @@ func TestReadDecisionsToolTextRendersRows(t *testing.T) {
 	}
 }
 
+// TestReadDecisionsToolRendersSlowmodeRow — the read_derpies_decisions
+// tool passes the single-slowmode gate's decision row through
+// unchanged (decision 0011, migration 000007 extended the path CHECK
+// with 'slowmode' — no tool code change: the renderer's NULL-optional
+// handling is path-value-agnostic). A single row with Path =
+// "slowmode" and nil Score/Threshold/Word (the gate row's exact shape
+// — NULL score/threshold/word, learned=false, deleted=true, NULL
+// reject_reason) renders the "slowmode" token in the path slot with
+// \"-/-\" score/threshold and \"-\" word, and the structured payload
+// carries \"path\": \"slowmode\".
+func TestReadDecisionsToolRendersSlowmodeRow(t *testing.T) {
+	f := &fakeDecisionSource{
+		rows: []DecisionRow{
+			{ID: 7, MessageID: "m7", ChannelID: "c1", AuthorID: "u1", Content: "final",
+				Path:    pStr("slowmode"),
+				Learned: false, Deleted: true,
+				CreatedAt: time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)},
+		},
+	}
+	srv := NewServer(&fakeDiscord{}, f, 0)
+	cs := connectInProcess(t, srv)
+	res := callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if res.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, res))
+	}
+	want := "[7] 2026-09-19T12:00:00Z slowmode -/- - false true -: final\n" +
+		"--- 1 decision (2026-09-19T12:00:00Z .. 2026-09-19T12:00:00Z)"
+	if got := textOf(t, res); got != want {
+		t.Errorf("text =\n%q\nwant\n%q", got, want)
+	}
+	// The structured payload carries the path value through (and the
+	// gate row's NULL optionals stay null in the payload too).
+	if res.StructuredContent == nil {
+		t.Fatal("no structured content in result")
+	}
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatalf("unmarshal structured content %s: %v", b, err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(mustMarshal(t, rec["decisions"]), &rows); err != nil {
+		t.Fatalf("unmarshal decisions: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("payload rows = %d, want 1", len(rows))
+	}
+	if rows[0]["path"] != "slowmode" {
+		t.Errorf("row[\"path\"] = %v, want \"slowmode\" (the gate row's path value passes through)", rows[0]["path"])
+	}
+	if rows[0]["score"] != nil || rows[0]["threshold"] != nil || rows[0]["word"] != nil {
+		t.Errorf("payload optionals = %v / %v / %v, want null / null / null (the gate row's shape)",
+			rows[0]["score"], rows[0]["threshold"], rows[0]["word"])
+	}
+	if rows[0]["learned"] != false || rows[0]["deleted"] != true {
+		t.Errorf("payload learned/deleted = %v / %v, want false / true", rows[0]["learned"], rows[0]["deleted"])
+	}
+}
+
 // TestReadDecisionsToolPassesRequestContext — the handler hands ReadDecisions
 // the SDK's request context (a child of the connection context), NOT
 // context.Background(): a slow queryDecisions (500-row scan) must be

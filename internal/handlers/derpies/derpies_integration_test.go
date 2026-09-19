@@ -827,6 +827,140 @@ func TestConfigThresholdMissingRowSentinel(t *testing.T) {
 	}
 }
 
+// TestMigration000007AppliesAndRollsBack — runs the REAL migration file (not
+// an inline copy) through dbmigrate.Run, rolls back by executing the down
+// file's statements DIRECTLY (the runner has no down convention: it globs
+// *.up.sql only, and the tracker row from the UP run would make a re-run
+// skip the file), then restores the UP state the same direct-execution way
+// so the shared test DB ends in the 3-value state for later DB-gated runs
+// in this package.
+func TestMigration000007AppliesAndRollsBack(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: PG not guaranteed available (testing.Short)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	url := os.Getenv("TUGBOT_TEST_DATABASE_URL")
+	if url == "" {
+		url = "postgres://postgres:postgres@127.0.0.1:5432/tugbot_test"
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Skipf("cannot create pool: %v (is the compose PG running?)", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("cannot reach PG: %v (is the compose PG running?)", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// 1. UP: run the real migration file from a temp dir.
+	dir := t.TempDir()
+	upSQL, err := os.ReadFile("../../../migrations/000007_derpies_slowmode_path.up.sql")
+	if err != nil {
+		t.Fatalf("read migration file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "000007_derpies_slowmode_path.up.sql"), upSQL, 0o644); err != nil {
+		t.Fatalf("write migration to temp dir: %v", err)
+	}
+	downSQL, err := os.ReadFile("../../../migrations/000007_derpies_slowmode_path.down.sql")
+	if err != nil {
+		t.Fatalf("read down file: %v", err)
+	}
+
+	// 2. Precondition (the shared test DB may be in any state, including
+	//    residue from a crashed prior run — the TRUNCATE goes FIRST so a
+	//    stale path='slowmode' row cannot block the 2-value constraint
+	//    re-add). The path column has NO check in the CREATE (a crashed
+	//    prior run could otherwise leave either variant and the re-add
+	//    would fail), so the 2-value check is added explicitly.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS derpies_decisions (
+		    id bigserial PRIMARY KEY,
+		    message_id text NOT NULL,
+		    channel_id text NOT NULL,
+		    author_id text NOT NULL,
+		    content text NOT NULL DEFAULT '',
+		    path text,
+		    score integer,
+		    threshold integer,
+		    word text,
+		    learned boolean NOT NULL DEFAULT false,
+		    deleted boolean NOT NULL DEFAULT false,
+		    reject_reason text,
+		    created_at timestamp without time zone DEFAULT now() NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+		    version text PRIMARY KEY,
+		    applied_at timestamp with time zone DEFAULT now()
+		);
+		TRUNCATE derpies_decisions;
+		ALTER TABLE derpies_decisions DROP CONSTRAINT IF EXISTS derpies_decisions_path_check;
+		ALTER TABLE derpies_decisions ADD CONSTRAINT derpies_decisions_path_check CHECK (path IN ('fast', 'slow'));
+		DELETE FROM schema_migrations WHERE version = '000007_derpies_slowmode_path';
+	`); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+
+	// 3. The real migration file runs clean.
+	if err := dbmigrate.Run(ctx, pool, dir); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	pathGate := func(id, path string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO derpies_decisions (message_id, channel_id, author_id, path) VALUES ($1, 'c', 'u', $2)`,
+			id, path)
+		return err
+	}
+	deleteRow := func(id string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `DELETE FROM derpies_decisions WHERE message_id = $1`, id); err != nil {
+			t.Errorf("cleanup row %s: %v", id, err)
+		}
+	}
+
+	// 4. Assert up: slowmode and fast succeed, an unknown value fails.
+	if err := pathGate("up_slowmode", "slowmode"); err != nil {
+		t.Fatalf("post-up insert path='slowmode' = %v, want success", err)
+	}
+	if err := pathGate("up_fast", "fast"); err != nil {
+		t.Fatalf("post-up insert path='fast' = %v, want success", err)
+	}
+	if err := pathGate("up_nope", "nope"); err == nil {
+		t.Errorf("post-up insert path='nope' succeeded, want the 3-value CHECK to reject it")
+	}
+	deleteRow("up_slowmode")
+	deleteRow("up_fast")
+
+	// 5. DOWN: execute the down file's statements directly (NOT
+	//    dbmigrate.Run — it globs *.up.sql only and the step-3 tracker row
+	//    would make a re-run skip the file).
+	if _, err := pool.Exec(ctx, string(downSQL)); err != nil {
+		t.Fatalf("down file exec: %v", err)
+	}
+	// Assert down: slowmode now fails, fast succeeds.
+	if err := pathGate("dn_slowmode", "slowmode"); err == nil {
+		t.Errorf("post-down insert path='slowmode' succeeded, want the 2-value CHECK to reject it")
+	}
+	if err := pathGate("dn_fast", "fast"); err != nil {
+		t.Fatalf("post-down insert path='fast' = %v, want success", err)
+	}
+	deleteRow("dn_fast")
+
+	// 6. Restore the UP state: direct execution of the up file's two
+	//    statements (NOT dbmigrate.Run — the tracker row from step 3 still
+	//    exists, so dbmigrate.Run would be a no-op and the DB would stay in
+	//    the 2-value state, breaking later DB-gated runs in this package).
+	if _, err := pool.Exec(ctx, string(upSQL)); err != nil {
+		t.Fatalf("restore up exec: %v", err)
+	}
+	if err := pathGate("restored_slowmode", "slowmode"); err != nil {
+		t.Fatalf("restored insert path='slowmode' = %v, want the UP (3-value) state", err)
+	}
+	deleteRow("restored_slowmode")
+}
+
 // intPtr / boolPtr / timePtr — pointer helpers for the test's nullable
 // filter fields (strPtr lives in the package proper).
 func intPtr(i int) *int              { return &i }

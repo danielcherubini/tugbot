@@ -221,7 +221,7 @@ func (s *Server) handler() http.Handler {
 type DecisionFilter struct {
 	AuthorID  string
 	ChannelID string
-	Path      string     // "fast" | "slow" | "" (unfiltered)
+	Path      string     // "fast" | "slow" | "slowmode" | "" (unfiltered)
 	Deleted   *bool      // nil = unfiltered; matches the stored flag exactly
 	ScoreMin  *int       // score >= *ScoreMin
 	ScoreMax  *int       // score <= *ScoreMax
@@ -238,7 +238,7 @@ type DecisionRow struct {
 	ChannelID    string
 	AuthorID     string
 	Content      string
-	Path         *string // "fast" | "slow" | NULL
+	Path         *string // "fast" | "slow" | "slowmode" | NULL
 	Score        *int    // NULL for fast rows + arms that never reached the matrix
 	Threshold    *int    // NULL, same as Score
 	Word         *string

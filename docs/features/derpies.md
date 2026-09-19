@@ -1,7 +1,7 @@
 ---
 status: live
-last-verified: 2026-09-18
-verified-by: re-verified 2026-09-18 after the score-model ship (ADR 0010 — the slow-path verdict is now SCORE:<0-100> + optional WORD, thresholded by a two-band matrix; the emoji-only dead end is fixed; the derpies_decisions log + read_derpies_decisions MCP tool + phrase fast path added): `gofmt -l .` silent; `go build ./...`; `go vet ./...`; `make lint` green; `go test ./... -count=1` all packages ok; the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green (20 packages ok, the migration tests executed under the override); `go run ./cmd/tugbot --selftest` logs "selftest: Discord session and all thirteen handlers and the MCP server constructed" (exit 0)
+last-verified: 2026-09-19
+verified-by: re-verified 2026-09-19 after the single-slowmode gate ship (decision 0011 — a gated author's 3rd+ single-token post per channel in a rolling 30 s is deleted pre-fast-path with zero pi asks, migration 000007 extending the derpies_decisions path CHECK to ('fast','slow','slowmode'); the read_derpies_decisions tool passes 'slowmode' through unchanged): `gofmt -l .` silent; `go build ./...`; `go vet ./...`; `make lint` green; `go test ./... -count=1` all packages ok (DB tests self-skip cleanly); the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green (21 packages ok, the 000002/000007 migration tests + all the DB-gated handler tests executed under the override); `go run ./cmd/tugbot --selftest` logs "selftest: Discord session and all fourteen handlers and the MCP server constructed" (exit 0)
 ---
 
 # Derpies filter
@@ -13,6 +13,7 @@ The derpies filter is a passive handler (the thirteenth, `internal/handlers/derp
 1. Feature flag `derpies` (`features.IsEnabled` silent flavor: off on any error, including a missing row).
 2. Guild guard (DMs are ignored).
 3. Author-ID gate — the checked `core.DiscordID` conversion of the author ID must hit `Config.DerpiesUserIDs` (parsed from `TUGBOT_DERPIES_USER_IDS`, comma-separated, malformed parts skipped — same semantics as `SLOW_USER_IDS`).
+4. **Single-slowmode gate (v1, creates only — decision 0011)**: a gated author's 3rd+ **single-token** post per channel inside a rolling 30 s is deleted here (pre-fast-path, zero pi asks, silent); pass-through single-token posts are counted regardless of flow outcome; ≥2-token posts, 0-token posts, and **edits** are not gated.
 
 ## Fast path
 
@@ -87,7 +88,7 @@ Edit path: `psql … UPDATE derpies_prompt SET body = '…';` — the next messa
 
 Blast radius: a prompt edit changes WHAT gets caught, never what may be learned/deleted without a verdict word — the learning gate (arm (a) `wordValid` on the folded word, arm (b) the text-anchored non-ASCII shape + folded-token-in-(posted-+referenced-+embed-title)-text, plus the all-digit prefix) stays the code-enforced backstop.
 
-## Known limitations (intentional, per spec — delete-only, no rate limiting)
+## Known limitations (intentional, per spec — delete-only)
 
 - **Unicode**: Latin-extended unicode respellings fold (NFD) into ASCII and are caught (fast-path seed hits / LLM-learnable). Non-decompose-able lookalikes in the conservative confusable map (Cyrillic а/б/в/е/і/о/р/т/у/х/ѕ/э, Greek α/β/δ/ε/ι/λ/μ/ν/ο/ρ/ς/σ/τ/υ/φ/χ/ω, fullwidth, Arabic-Indic digits, ı/ə/ɛ/ß, zero-width Cf chars) now fold too (fast-path hits). Letters with NO entry (the rest of a non-Latin script) still evade the fast path but are now LLM-catchable text-anchored (ADR 0008): a non-ASCII verdict word is accepted iff it is a verbatim folded token of the judged text. Remaining structural dead-ends: a message whose only roster text is a token with NO confusable folding AND no LLM-named token (the LLM's best answer is CLEAN and it passes) — and, for non-ASCII words, a frame-anchored word with no text tokens (the image-only arm deliberately not relaxed — ADR 0007). The MESSAGE arm is unchanged here in the token sense; the NICKNAME arm no longer dead-ends the name action — a dead-end-as-appearance name is now still reset to `Derpies` (the word simply isn't learned).
 - **SPLIT (a word spread over spaces — NOW CLOSED, ADR 0009, 2026-09-17)**: `z w i f t` (the observed 2026-09-17 evasion) is now caught — `tokensForMatch` yields the collapsed run `zwift`, so a seeded `zwift` is a zero-ask fast delete and a new split word is LLM-learnable (the gate collapses the verdict's whitespace and anchors it to the collapsed run). **Remaining dead-end — punctuation-wedged single tokens:** a word wedged with INTERIOR punctuation in ONE token (`s.w.i.f.t`, `s/w/i/f/t`, `s(w)i(f)t`) is still NOT caught — `tokensForMatch` trims edge punctuation only, so it stays one token and does not collapse; the LLM judges it GIMMICK but the verdict cannot anchor. Closing it needs interior-punctuation collapse (a larger semantic change, deferred).
@@ -95,7 +96,7 @@ Blast radius: a prompt edit changes WHAT gets caught, never what may be learned/
 - Image downloads are best-effort — a per-URL failure skips that URL (logged); when nothing downloads the ask degrades to text-only. The ask payload itself is bounded by the pi rpc image pipeline (identical-content dedupe, >1MB/>2048px resize+JPEG re-encode, 12MB raw per-ask cap) so a 10-attachment (or 25-boosted) message can never become a 46MB+ prompt.
 - **Repeat-image re-judgment (the 4.6 fast delete was removed)**: an image whose CONTENT was previously LLM-judged is NOT a fast delete — its post goes into a FRESH pi ask (at most one list SELECT + one ask per post or edit), bounded by the pirpc per-ask image guard (byte-identical dedupe, >1MB / >2048px resize to 2048/JPEG q80, 12MB raw cap). There is no zero-ask deletion on any image state: N re-posts = N bounded asks in the shared pi queue.
 - Referenced-message fetch is one hop (mention parity) — chains are not followed; a fetch failure (deleted/rate-limited) degrades to judging the posted message only, so a gimmick that lives ONLY in a deleted quote passes through.
-- **Burst amplification**: no per-author coalescing or cooldown — N near-identical novel posts from a filtered user yield N serialized pi asks (the single pi RPC request channel is shared with the mention handler) plus N list SELECTs. A learned word's repetition is fast-path only; coalescing/rate limiting is out of scope per the spec.
+- **Burst amplification (long posts only — the single-slowmode gate, decision 0011, closed the single-token case)**: no per-author coalescing or cooldown for ≥2-token posts — N near-identical novel long posts from a filtered user yield N serialized pi asks (the single pi RPC request channel is shared with the mention handler) plus N list SELECTs. Single-token posts ARE throttled now (decision 0011): a gated author's 3rd+ single-token post per channel inside a rolling 30 s is deleted pre-judgement with zero pi asks and leaves a `path='slowmode'` audit row (Gates item 4). A learned word's repetition is fast-path only; long-post coalescing/rate limiting remains out of scope per the spec.
 - `make test-db` invalidates the migration tracker on the shared compose DB (see the `NOTE` on the Makefile target) — recreate with `docker compose down -v` or `DROP` the test-left objects before the next `make migrate`/`make setup`.
 
 ## Production acceptance (done-when)
@@ -106,5 +107,5 @@ With `TUGBOT_DERPIES_USER_IDS=163055057254875136` in `.env` and the `derpies` fl
 
 - The Rust `derpies` module's reaction-removal behavior (dead; superseded by this feature's delete-only behavior).
 - Any notification to `#the-gulag`, any bot message, any reaction.
-- Per-user offense counters, rate limiting, or `SlowUserIDs`-style auto-gulag for derpies.
+- Per-user offense counters, long-post rate limiting/coalescing, or `SlowUserIDs`-style auto-gulag for derpies (single-token slowmode for a gated author's one-token posts is now implemented — decision 0011, Gates item 4).
 - **Score-model follow-ups (ADR 0010, v1 out of scope):** non-ASCII phrase tokens (v1 phrases are ASCII-only); `/gimmick` phrase subcommands (v1 curation is SQL-only); logging the nickname flow to `derpies_decisions` (v1: message flow only); a `derpies_decisions` prune/retention tool (v1: append-only, keep everything); a SPLIT word inside a phrase (v1: exact-consecutive match only — a split word inside a phrase falls to the slow path).
