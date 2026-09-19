@@ -557,7 +557,7 @@ func TestStravaDetail429CreatePending(t *testing.T) {
 // TestStravaNeedsReauthPauseResume pins the full reauth lifecycle: pass 1's
 // failed refresh sets needs_reauth (cursor frozen), passes 2–3 make zero API
 // calls (loadAthletes filters the flagged row), and after the re-auth UPDATE
-// pass 4 lists with `after =` the frozen cursor and posts exactly once.
+// pass 4 lists with `after =` the 1h-overlapped frozen cursor and posts exactly once.
 func TestStravaNeedsReauthPauseResume(t *testing.T) {
 	pool := setupStravaTestDB(t)
 	now := time.Now().UTC()
@@ -612,8 +612,9 @@ func TestStravaNeedsReauthPauseResume(t *testing.T) {
 	if got := caps.byThread("9001"); len(got) != 1 {
 		t.Fatalf("pass 4: captured %d posts, want exactly 1", len(caps.byThread("9001")))
 	}
-	if len(stub.listAfters) != 1 || !stub.listAfters[0].Equal(WINDOW) {
-		t.Errorf("pass 4: list afters = %v, want exactly one call with after = the frozen cursor %v", stub.listAfters, WINDOW)
+	if len(stub.listAfters) != 1 || !stub.listAfters[0].Equal(WINDOW.Add(-time.Hour)) {
+		t.Errorf("pass 4: list afters = %v, want exactly one call with after = the 1h-overlapped frozen cursor %v",
+			stub.listAfters, WINDOW.Add(-time.Hour))
 	}
 	if status, _ := seenRow(t, pool, aid, 1); status != statusPosted {
 		t.Errorf("pass 4: A row = %q, want posted", status)
@@ -771,6 +772,7 @@ func TestRunPollLoopExits(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // 11. list 429 → cursor hold; the next clean pass releases it, no double-post
 // ---------------------------------------------------------------------------
 
@@ -873,13 +875,14 @@ func TestStravaList429AbortsIteration(t *testing.T) {
 
 	// ---- pass 2: clean list; both windows proceed, each posts exactly once ----
 	stub.listFn = func(after time.Time) ([]Summary, error) {
-		if after.Equal(W_A) {
+		// a non-NULL cursor backdates the list window by 1h (windowOverlap).
+		if after.Equal(W_A.Add(-time.Hour)) {
 			return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
 		}
-		if after.Equal(W_B) {
+		if after.Equal(W_B.Add(-time.Hour)) {
 			return []Summary{{ID: 2, SportType: "Ride", StartDate: startB}}, nil
 		}
-		t.Errorf("pass 2: unexpected list after = %v (want W_A or W_B)", after)
+		t.Errorf("pass 2: unexpected list after = %v (want W_A−1h or W_B−1h)", after)
 		return nil, nil
 	}
 	stub.detailFn = func(id int64) (Activity, error) {
@@ -926,12 +929,13 @@ func TestStravaList429AbortsIteration(t *testing.T) {
 	}
 
 	// ---- pass 3: the held windows close over already-seen ids: deduped, no
-	// double-post ----
+	// double-post (the 1h-overlapped window re-lists, the seen table absorbs)
+	// ----
 	stub.listFn = func(after time.Time) ([]Summary, error) {
-		if after.Equal(startA) || after.Equal(startB) {
+		if after.Equal(startA.Add(-time.Hour)) || after.Equal(startB.Add(-time.Hour)) {
 			return []Summary{}, nil // everything in the window is already seen
 		}
-		t.Errorf("pass 3: unexpected list after = %v (want startA or startB)", after)
+		t.Errorf("pass 3: unexpected list after = %v (want startA−1h or startB−1h)", after)
 		return nil, nil
 	}
 	if err := s.iteration(ctx); err != nil {
@@ -942,5 +946,68 @@ func TestStravaList429AbortsIteration(t *testing.T) {
 	}
 	if n := seenCount(t, pool, aidA) + seenCount(t, pool, aidB); n != 2 {
 		t.Errorf("pass 3: %d seen rows, want 2 (one per athlete, no new rows)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 13. a backdated late activity surfaces via the 1h list-window overlap;
+//     the seen dedupe makes the re-listing free
+// ---------------------------------------------------------------------------
+
+// TestStravaBackdatedOverlap pins the 1h overlap: the seeded cursor is T and
+// a late-surfacing activity X has start_date T-30m (BELOW the cursor, inside
+// the 1h overlap). Pass 1 lists with after = T-1h (the overlap, not T) and
+// posts X exactly once with the cursor advancing to max(dispositioned
+// all-time) (= X.start) as before. Pass 2 re-lists X: ZERO posts (the seen
+// dedupe), cursor unchanged (nothing new dispositioned).
+func TestStravaBackdatedOverlap(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	cursor := muTime(time.Now().UTC().Add(-2 * time.Hour))
+	startX := muTime(cursor.Add(-30 * time.Minute)) // below the cursor, inside the 1h overlap
+
+	aid := seedAthlete(t, pool, 9001, cursor, 6*time.Hour)
+	stub := &stubStrava{}
+	s, caps := newTestStrava(t, pool, stub, 9001)
+	ctx := context.Background()
+
+	// ---- pass 1: the list window starts 1h BELOW the seeded cursor ----
+	stub.listFn = func(after time.Time) ([]Summary, error) {
+		want := cursor.Add(-time.Hour)
+		if !after.Equal(want) {
+			t.Errorf("pass 1: list after = %v, want the 1h-overlapped %v (not the cursor %v)", after, want, cursor)
+		}
+		return []Summary{{ID: 1, SportType: "Run", StartDate: startX}}, nil
+	}
+	stub.detailFn = func(_ int64) (Activity, error) { return readyAct(1, startX, 42300), nil }
+
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if len(caps.posts) != 1 || len(caps.byThread("9001")) != 1 {
+		t.Fatalf("pass 1: captured %d posts, want exactly 1 (the backdated X, inside the overlap)", len(caps.posts))
+	}
+	if status, _ := seenRow(t, pool, aid, 1); status != statusPosted {
+		t.Errorf("pass 1: X row = %q, want %q", status, statusPosted)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startX) {
+		t.Errorf("pass 1: cursor = %v, want max(dispositioned all-time) = %v (the overlap only widens the LIST window, not the watermark)", got, startX)
+	}
+
+	// ---- pass 2: the same X is re-listed: deduped, ZERO posts, cursor held ----
+	stub.listFn = func(after time.Time) ([]Summary, error) {
+		want := startX.Add(-time.Hour) // (advanced) cursor − 1h
+		if !after.Equal(want) {
+			t.Errorf("pass 2: list after = %v, want the 1h-overlapped %v", after, want)
+		}
+		return []Summary{{ID: 1, SportType: "Run", StartDate: startX}}, nil
+	}
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("pass 2: captured %d total posts, want still 1 (a re-listed 'posted' row is deduped — never re-posted)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startX) {
+		t.Errorf("pass 2: cursor = %v, want unchanged (%v) — nothing new dispositioned", got, startX)
 	}
 }

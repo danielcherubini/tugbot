@@ -42,6 +42,14 @@ const dropAfterRetries = 5
 // firstPollLookback is the lookback for a first-time poll (NULL cursor).
 const firstPollLookback = 24 * time.Hour
 
+// windowOverlap backdates the LIST window start exactly 1h for an athlete with
+// a non-NULL cursor (pass step b) so a backdated/late-surfacing activity
+// (a manual upload's backdate, a second device syncing late, an edited start
+// time) surfaces on a subsequent pass. Re-listed ids are deduped by the seen
+// table (a re-listed 'posted' row never re-posts), and the overlap widens
+// ONLY the list window — the cursor ADVANCE math (step e) is unchanged.
+const windowOverlap = time.Hour
+
 // The seen-activity dispositions.
 const (
 	statusPending = "pending"
@@ -216,9 +224,18 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 	}
 
 	// ---- b. list the window ----
+	// A NON-NULL cursor backdates the list window start by 1h (windowOverlap):
+	// the recent boundary is re-listed so a backdated/late-surfacing activity
+	// (a manual upload's backdate, a second device syncing late, an edited
+	// start time) is not permanently produced by the all-time max cursor. The
+	// re-listing makes it free — re-listed ids are deduped by the
+	// state machine (step c's seen-skip) + seen table. The NULL-cursor first
+	// activation 24h lookback gets no −1h: it is already wider. The overlap
+	// widens only the LIST window; the cursor advance math (step e) is
+	// unchanged.
 	var windowStart time.Time
 	if a.lastPolledAt != nil {
-		windowStart = *a.lastPolledAt
+		windowStart = a.lastPolledAt.Add(-windowOverlap)
 	} else {
 		windowStart = now.Add(-firstPollLookback)
 	}
