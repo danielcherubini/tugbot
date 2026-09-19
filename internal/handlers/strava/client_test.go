@@ -47,9 +47,10 @@ func TestListActivitiesPagination(t *testing.T) {
 		var calls int
 		var afterVals, pageVals []string
 		// Page 1 = 100 rows (ids 106..7, newest first); page 2 = a full page
-		// (one OVERLAPPING id from page 1 — 106 — followed by ids 104..2
-		// completing the descent, then 1; ids 6..1 are page-2-only, so the
-		// result must be 106 UNIQUE ids); page 3 (and any further page the
+		// whose ids 106 and 104..7 ALL overlap page 1 (99 duplicated ids — 106
+		// plus the whole descent 104..7, only 105 is page-1-only) followed by
+		// ids 6..2, then 1; ids 6..1 are page-2-only, yet the id-deduplicated
+		// merge still yields 106 UNIQUE ids; page 3 (and any further page the
 		// walk should never reach) = a FULL 100-row page in which EVERY id
 		// was already seen on page 1 — len(rows) < 100 can NOT terminate
 		// the walk, so ONLY the zero NEW ids guard (fresh == 0) can (no
@@ -65,7 +66,7 @@ func TestListActivitiesPagination(t *testing.T) {
 					out = append(out, pageRows(int64(106-i))) // 106..7, newest first
 				}
 			case 2:
-				out = append(out, pageRows(106)) // overlapping id from page 1
+				out = append(out, pageRows(106)) // one of the 99 ids overlapping page 1
 				for i := 0; i < 103; i++ {
 					out = append(out, pageRows(int64(104-i))) // 104..2
 				}
@@ -119,8 +120,8 @@ func TestListActivitiesPagination(t *testing.T) {
 			t.Fatalf("ListActivities: %v", err)
 		}
 
-		// Exactly three pages: the full page 1, page 2 (of which one id
-		// overlaps page 1), and the zero-new-id page 3 that must terminate
+		// Exactly three pages: the full page 1, page 2 (of which 99 ids
+		// overlap page 1), and the zero-new-id page 3 that must terminate
 		// the walk.
 		// Page 3 is a FULL 100-row page of already-seen ids — a SHORT page
 		// (len(rows) < 100) would also terminate the walk, so this shape
