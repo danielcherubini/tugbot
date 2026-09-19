@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	mcpSDK "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,7 +31,7 @@ type readDecisionsArgs struct {
 func registerDecisionsTools(srv *mcpSDK.Server, ds DecisionSource) {
 	mcpSDK.AddTool(srv, &mcpSDK.Tool{
 		Name:        "read_derpies_decisions",
-		Description: "Reads the derpies decision log (one row per judged message/edit) newest first. All filters are optional and AND-combined: author_id, channel_id, path (\"fast\"/\"slow\"), deleted, score_min/score_max, since/until (RFC3339), and limit (default 50, clamped to 500). Returns the rows under a \"decisions\" key with a \"N decision(s)\" text summary; a database error surfaces as an error result.",
+		Description: "Reads the derpies decision log (one row per judged message/edit) newest first. All filters are optional and AND-combined: author_id, channel_id, path (\"fast\"/\"slow\"), deleted, score_min/score_max, since/until (RFC3339), and limit (default 50, clamped to 500). The text result renders one line per decision — [id] created_at path score/threshold word learned deleted reject_reason: content — followed by a trailing \"--- N decision(s) (first .. last)\" summary; embedded newlines in content collapse to \" ⏎ \". The rows also ride under a \"decisions\" key in the structured payload; a database error surfaces as an error result.",
 	}, func(ctx context.Context, _ *mcpSDK.CallToolRequest, args readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
 		return handleReadDecisions(ctx, ds, args)
 	})
@@ -39,24 +41,88 @@ func registerDecisionsTools(srv *mcpSDK.Server, ds DecisionSource) {
 // are field-identical, so a direct conversion), calls the seam with the
 // SDK's request context (NOT context.Background() — a slow queryDecisions
 // 500-row scan must be cancellable on client disconnect/timeout), and
-// renders the rows (JSON under a "decisions" key — mirroring
-// read_messages' "messages" convention) + a "N decision(s)" text
-// summary. A ReadDecisions error → a toolErr IsError result (a read tool
-// failing is not a silent degradation).
+// renders the rows — one TEXT line per row (so any MCP client that
+// surfaces only the text sees the decision content itself, mirroring
+// read_messages' c64516d fix) + a "N decision(s)" trailing summary
+// (with the first/last created_at); the rows ALSO ride under a
+// "decisions" key (the record payload — newlines stay raw there). A
+// ReadDecisions error → a toolErr IsError result (a read tool failing is
+// not a silent degradation).
 func handleReadDecisions(ctx context.Context, ds DecisionSource, a readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
 	rows, err := ds.ReadDecisions(ctx, DecisionFilter(a))
 	if err != nil {
 		return toolErr("tugbot", err.Error()), nil, nil
 	}
 	out := make([]map[string]any, 0, len(rows))
+	var fb strings.Builder
+	firstTs, lastTs := "", ""
 	for _, r := range rows {
 		out = append(out, decisionRowPayload(r))
+		ts := ""
+		if !r.CreatedAt.IsZero() {
+			ts = r.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		if firstTs == "" {
+			firstTs = ts
+		}
+		lastTs = ts
+		fb.WriteString(renderDecisionLine(r))
+		fb.WriteByte('\n')
 	}
 	noun := "decisions"
 	if len(out) == 1 {
 		noun = "decision"
 	}
-	return textResult(fmt.Sprintf("%d %s", len(out), noun)), map[string]any{"decisions": out}, nil
+	var text string
+	if len(out) == 0 {
+		// Empty page: exactly "0 decisions" (no lines, no timestamp range).
+		text = "0 decisions"
+	} else {
+		text = fb.String() + fmt.Sprintf("--- %d %s (%s .. %s)", len(out), noun, firstTs, lastTs)
+	}
+	return textResult(text), map[string]any{"decisions": out}, nil
+}
+
+// renderDecisionLine renders ONE DecisionRow as a single text line:
+//
+//	[<id>] <created_at RFC3339 UTC> <path|-> <score|->/<threshold|-> <word|-> <learned> <deleted> <reject_reason|->: <content>
+//
+// The NULL optionals (score + threshold NULL for fast / pre-matrix arms;
+// an absent word; an absent reject_reason) render as "-"; the real
+// booleans as lowercase "true"/"false". A zero created_at renders as an
+// empty token (decisionRowPayload shows "", same source). Embedded
+// newlines in content collapse to one " ⏎ " (U+23CE LINE SEPARATOR
+// between two spaces) each, so a multi-line message stays a single line
+// — deterministic, using strings.ReplaceAll (mirroring
+// renderMessageLine).
+func renderDecisionLine(r DecisionRow) string {
+	path := "-"
+	if r.Path != nil {
+		path = *r.Path
+	}
+	score := "-"
+	if r.Score != nil {
+		score = strconv.Itoa(*r.Score)
+	}
+	threshold := "-"
+	if r.Threshold != nil {
+		threshold = strconv.Itoa(*r.Threshold)
+	}
+	word := "-"
+	if r.Word != nil {
+		word = *r.Word
+	}
+	reject := "-"
+	if r.RejectReason != nil {
+		reject = *r.RejectReason
+	}
+	ts := ""
+	if !r.CreatedAt.IsZero() {
+		ts = r.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf("[%d] %s %s %s/%s %s %t %t %s: %s",
+		r.ID, ts, path, score, threshold, word, r.Learned, r.Deleted, reject,
+		strings.ReplaceAll(r.Content, "\n", " ⏎ "))
 }
 
 // decisionRowPayload renders one DecisionRow (the nullable pointer fields

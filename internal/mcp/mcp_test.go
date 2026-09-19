@@ -1920,6 +1920,100 @@ func TestReadDerpiesDecisionsTool(t *testing.T) {
 	}
 }
 
+// TestReadDecisionsToolTextRendersRows — the text result renders ONE LINE
+// PER DECISION (mirroring read_messages' c64516d fix: an MCP client that
+// surfaces only the TEXT result still sees the row data, not just the
+// count). The line format:
+//
+//	[id] <created_at> <path|-> <score|->/<threshold|-> <word|-> <learned> <deleted> <reject_reason|->: <content>
+//
+// NULL optionals (fast / pre-matrix arms' score + threshold, an absent word
+// or reject_reason) render as "-"; boolean literals are lowercase; embedded
+// newlines in content collapse to one " ⏎ " each (deterministic ReplaceAll,
+// mirrored from renderMessageLine). The "N decision(s)" summary rides on as
+// the TRAILING block (with the first/last created_at, read_messages
+// style); an empty page renders as exactly "0 decisions" (no lines, no
+// range). The structured payload is unchanged (newlines preserved there).
+func TestReadDecisionsToolTextRendersRows(t *testing.T) {
+	f := &fakeDecisionSource{
+		rows: []DecisionRow{
+			{ID: 1, MessageID: "m1", ChannelID: "c1", AuthorID: "u1", Content: "line1\nline2",
+				Path:      pStr("fast"),
+				CreatedAt: time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
+			{ID: 2, MessageID: "m2", ChannelID: "c1", AuthorID: "u1", Content: "c0g",
+				Path: pStr("slow"), Score: pInt(80), Threshold: pInt(50), Word: pStr("c0g"),
+				Learned: true, Deleted: true, RejectReason: pStr("score >= T"),
+				CreatedAt: time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)},
+			{ID: 3, MessageID: "m3", ChannelID: "c1", AuthorID: "u1", Content: "",
+				CreatedAt: time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)},
+		},
+	}
+	srv := NewServer(&fakeDiscord{}, f, 0)
+	cs := connectInProcess(t, srv)
+	res := callTool(t, cs, "read_derpies_decisions", map[string]any{})
+	if res.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, res))
+	}
+	want := "[1] 2026-01-01T10:00:00Z fast -/- - false false -: line1 ⏎ line2\n" +
+		"[2] 2026-01-02T10:00:00Z slow 80/50 c0g true true score >= T: c0g\n" +
+		"[3] 2026-01-03T10:00:00Z - -/- - false false -: \n" +
+		"--- 3 decisions (2026-01-01T10:00:00Z .. 2026-01-03T10:00:00Z)"
+	if got := textOf(t, res); got != want {
+		t.Errorf("text =\n%q\nwant\n%q", got, want)
+	}
+	// The structured payload is unchanged: the record row carries the RAW
+	// content (newlines NOT collapsed — only the text rendering flattens).
+	if res.StructuredContent == nil {
+		t.Fatal("no structured content in result")
+	}
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatalf("unmarshal structured content %s: %v", b, err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(mustMarshal(t, rec["decisions"]), &rows); err != nil {
+		t.Fatalf("unmarshal decisions: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("payload rows = %d, want 3", len(rows))
+	}
+	if rows[0]["content"] != "line1\nline2" {
+		t.Errorf("row0[\"content\"] = %v, want the raw \"line1\\nline2\" (newlines preserved in the payload)", rows[0]["content"])
+	}
+	if rows[0]["score"] != nil || rows[1]["score"] != float64(80) {
+		t.Errorf("payload scores = %v / %v, want null / 80 (the pre-matrix arm stays null)", rows[0]["score"], rows[1]["score"])
+	}
+
+	// Empty page: exactly "0 decisions" — no lines, no timestamp range.
+	fe := &fakeDecisionSource{}
+	csE := connectInProcess(t, NewServer(&fakeDiscord{}, fe, 0))
+	resE := callTool(t, csE, "read_derpies_decisions", map[string]any{})
+	if resE.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, resE))
+	}
+	if got := textOf(t, resE); got != "0 decisions" {
+		t.Errorf("empty-page text = %q, want exactly \"0 decisions\"", got)
+	}
+
+	// Singular noun: one row renders "1 decision" in the trailing block (the
+	// fixture's zero created_at renders an empty first/last range — the
+	// row still carries its id/flags/content).
+	fs := &fakeDecisionSource{rows: []DecisionRow{{ID: 9, MessageID: "m9", Content: "x"}}}
+	csS := connectInProcess(t, NewServer(&fakeDiscord{}, fs, 0))
+	resS := callTool(t, csS, "read_derpies_decisions", map[string]any{})
+	if resS.IsError {
+		t.Fatalf("IsError, text %q", textOf(t, resS))
+	}
+	wantS := "[9]  - -/- - false false -: x\n--- 1 decision ( .. )"
+	if got := textOf(t, resS); got != wantS {
+		t.Errorf("text =\n%q\nwant\n%q", got, wantS)
+	}
+}
+
 // TestReadDecisionsToolPassesRequestContext — the handler hands ReadDecisions
 // the SDK's request context (a child of the connection context), NOT
 // context.Background(): a slow queryDecisions (500-row scan) must be
