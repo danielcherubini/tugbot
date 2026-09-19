@@ -1091,8 +1091,10 @@ func (h *Derpies) flow(m *discordgo.Message) { h.flowGated(m, true) }
 // it deleted the post (the caller must return — no fast path, no slow
 // path, no pi ask). Ineligible (0-token or ≥2-token) posts fall through.
 // Overflow (≥ slowmodeMaxPosts recent, window = now.Sub(ts) <=
-// slowmodeWindow, inclusive) deletes via the ops seam (best-effort on
-// failure — logged; the row is still written) and records its OWN
+// slowmodeWindow, inclusive) deletes via the ops seam (on a failed
+// delete the row records deleted=false + reject reason "delete failed",
+// the same house discipline as the fast/slow arms — the log never
+// records a failed delete as successful) and records its OWN
 // path='slowmode' row. A pass-through appends its timestamp. REST + DB
 // writes happen AFTER the lock (the delete can block on a Discord 429;
 // do not hold rateMu across it).
@@ -1121,13 +1123,15 @@ func (h *Derpies) gateSlowmode(ctx context.Context, m *discordgo.Message) bool {
 	}
 	h.rateMu.Unlock()
 	if gated {
+		deleted, reject := true, (*string)(nil)
 		if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
 			slog.Error("derpies gate delete failed", "module", module, "message", m.ID, "error", err)
+			deleted, reject = false, strPtr("delete failed")
 		}
 		h.recordDecision(ctx, m, &decisionRecord{
 			MessageID: m.ID, ChannelID: m.ChannelID, AuthorID: m.Author.ID,
 			Content: m.Content, Path: strPtr("slowmode"),
-			Learned: false, Deleted: true,
+			Learned: false, Deleted: deleted, RejectReason: reject,
 		})
 	}
 	return gated

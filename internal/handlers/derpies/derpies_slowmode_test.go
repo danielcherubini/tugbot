@@ -359,11 +359,12 @@ func TestGateExclusions(t *testing.T) {
 // TestGateDeleteFailure (S6.5): a gate delete failure degrades
 // best-effort — the 3rd post's DeleteMessage fails (the blanket fake
 // delErr), the flow does NOT panic, and the fake records only
-// successes (len(ops.deleted) == 0), BUT the path='slowmode' decision
-// row is still written with Deleted == true (the write is
-// unconditional — the row is an audit of the GATE decision, not of the
-// REST outcome). After clearing ops.delErr the 4th post is
-// gate-deleted (the single success is recorded).
+// successes (len(ops.deleted) == 0), but the path='slowmode' decision
+// row records the FAILED delete per the fast/slow arms' discipline
+// (Deleted == false + RejectReason == "delete failed" — the log never
+// records a failed delete as successful). After clearing ops.delErr
+// the 4th post is gate-deleted and its row records the success
+// (Deleted == true, NULL reject reason).
 func TestGateDeleteFailure(t *testing.T) {
 	store, ops, pi, h, _ := newGateDerpies(nil)
 	ops.delErr = errors.New("429")
@@ -388,8 +389,11 @@ func TestGateDeleteFailure(t *testing.T) {
 	if rowA3.Path == nil || *rowA3.Path != "slowmode" {
 		t.Errorf("a3 row Path = %v, want 'slowmode'", rowA3.Path)
 	}
-	if !rowA3.Deleted {
-		t.Errorf("a3 row Deleted = false, want true (best-effort recorded — the delete failed, the row stands)")
+	if rowA3.Deleted {
+		t.Errorf("a3 row Deleted = true, want false (the REST delete failed — the row records the failure, house discipline)")
+	}
+	if rowA3.RejectReason == nil || *rowA3.RejectReason != "delete failed" {
+		t.Errorf("a3 row RejectReason = %v, want 'delete failed' (the failed REST delete, same as the fast/slow arms)", rowA3.RejectReason)
 	}
 	if rowA3.Learned {
 		t.Errorf("a3 row Learned = true, want false")
@@ -403,6 +407,21 @@ func TestGateDeleteFailure(t *testing.T) {
 	}
 	if ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "a4" {
 		t.Errorf("deleted[0] = %v, want [c1 a4]", ops.deleted[0])
+	}
+	var rowA4 *decisionRecord
+	for _, d := range store.decisions {
+		if d.MessageID == "a4" {
+			rowA4 = d
+		}
+	}
+	if rowA4 == nil {
+		t.Fatal("no decision row for a4 (the gate-deleted post)")
+	}
+	if !rowA4.Deleted {
+		t.Errorf("a4 row Deleted = false, want true (the REST delete succeeded after the error cleared)")
+	}
+	if rowA4.RejectReason != nil {
+		t.Errorf("a4 row RejectReason = %v, want nil (a successful delete carries no rejection)", *rowA4.RejectReason)
 	}
 }
 
