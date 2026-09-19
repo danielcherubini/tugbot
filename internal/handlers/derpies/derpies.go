@@ -67,7 +67,9 @@ const (
 )
 
 // Derpies handles the derpies flow (feature gate → guild guard →
-// author-ID gate → fast-path token match → pi RPC verdict). It also
+// author-ID gate → [single-slowmode gate, creates only — decision 0011,
+// the 3rd+ single-token post per channel within 30 s] → fast-path
+// token match → pi RPC verdict). It also
 // watches GUILD_MEMBER_UPDATE events for the same gated users and resets
 // their nicks to a fixed neutral name when the flow judges them
 // gimmicks (nicknames.go).
@@ -511,8 +513,9 @@ func foldedTokenSequence(content string) []string {
 
 // decisionRecord — the in-memory decision row (mirrors the derpies_decisions
 // columns; the nullable fields are pointers so a zero value writes SQL
-// NULL). Path is a *string to match the DDL's "path text CHECK (path IN
-// ('fast','slow'))" — a NULL path passes the CHECK (PostgreSQL evaluates
+// NULL). Path is a *string to match the DDL's
+// "CHECK (path IN ('fast','slow','slowmode'))" (migration 000007 extended
+// the two-value form): a NULL path passes the CHECK (PostgreSQL evaluates
 // CHECK on NULL as satisfied), so the pre-path arms (which never assign
 // Path) persist as "path IS NULL" instead of being rejected by a NOT
 // NULL/empty-string CHECK.
@@ -521,7 +524,7 @@ type decisionRecord struct {
 	ChannelID    string
 	AuthorID     string
 	Content      string
-	Path         *string // "fast" | "slow" | NULL (NULL for every arm that never reached a path)
+	Path         *string // "fast" | "slow" | "slowmode" | NULL (NULL for every arm that never reached a path)
 	Score        *int    // NULL for fast rows + every arm that never reached the matrix
 	Threshold    *int    // NULL, same as Score
 	Word         *string

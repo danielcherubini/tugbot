@@ -16,7 +16,7 @@ import (
 type readDecisionsArgs struct {
 	AuthorID  string     `json:"author_id,omitempty"`
 	ChannelID string     `json:"channel_id,omitempty"`
-	Path      string     `json:"path,omitempty"` // "fast" | "slow" | "" (unfiltered)
+	Path      string     `json:"path,omitempty"` // "fast" | "slow" | "slowmode" | "" (unfiltered)
 	Deleted   *bool      `json:"deleted,omitempty"`
 	ScoreMin  *int       `json:"score_min,omitempty"`
 	ScoreMax  *int       `json:"score_max,omitempty"`
@@ -31,7 +31,7 @@ type readDecisionsArgs struct {
 func registerDecisionsTools(srv *mcpSDK.Server, ds DecisionSource) {
 	mcpSDK.AddTool(srv, &mcpSDK.Tool{
 		Name:        "read_derpies_decisions",
-		Description: "Reads the derpies decision log (one row per judged message/edit) newest first. All filters are optional and AND-combined: author_id, channel_id, path (\"fast\"/\"slow\"), deleted, score_min/score_max, since/until (RFC3339), and limit (default 50, clamped to 500). The text result renders one line per decision — [id] created_at path score/threshold word learned deleted reject_reason: content — followed by a trailing \"--- N decision(s) (first .. last)\" summary; embedded newlines in content collapse to \" ⏎ \". The rows also ride under a \"decisions\" key in the structured payload; a database error surfaces as an error result.",
+		Description: "Reads the derpies decision log (one row per judged message/edit) newest first. All filters are optional and AND-combined: author_id, channel_id, path (\"fast\"/\"slow\"/\"slowmode\"), deleted, score_min/score_max, since/until (RFC3339), and limit (default 50, clamped to 500). The text result renders one line per decision — [id] created_at path score/threshold word learned deleted reject_reason: content — followed by a trailing \"--- N decision(s) (first .. last)\" summary; embedded newlines in content collapse to \" ⏎ \". The rows also ride under a \"decisions\" key in the structured payload; a database error surfaces as an error result.",
 	}, func(ctx context.Context, _ *mcpSDK.CallToolRequest, args readDecisionsArgs) (*mcpSDK.CallToolResult, any, error) {
 		return handleReadDecisions(ctx, ds, args)
 	})

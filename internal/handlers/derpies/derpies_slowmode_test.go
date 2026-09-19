@@ -5,6 +5,7 @@
 package derpies
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -270,5 +271,211 @@ func TestGateIgnoresEdits(t *testing.T) {
 	}
 	if editSlowmode != nil {
 		t.Errorf("m1 (the edit) has a path='slowmode' decision row — edits must never be gate-judged")
+	}
+}
+
+// TestGateExclusions (S6.4): the gate is inert for everything the flow
+// already short-circuits — feature off (the feature gate returns before
+// the gate), non-gated author (the author gate), no guild (the guild
+// guard) — and for 0-token posts, which fall through to the FULL flow.
+// Each sub-case asserts len(ops.deleted) == 0 and NO slowmode row in
+// store.decisions (pinned clock: every post is inside the window, so
+// only these short-circuits excuse the absence of a gate delete).
+func TestGateExclusions(t *testing.T) {
+	// run — the shared sub-case body (feature off / non-gated author /
+	// no guild): a fresh handler over fresh fakes (words nil, the code
+	// default prompt, the fakePi default SCORE:3 verdict), one flow
+	// run, then the three gate assertions (no deletes, the expected ask
+	// count, no slowmode row).
+	run := func(name string, setup func(*fakeStore, *fakeOps, *fakePi, *Derpies), m *discordgo.Message, wantAsks int) {
+		t.Helper()
+		store, ops, pi, h, _ := newGateDerpies(nil)
+		if setup != nil {
+			setup(store, ops, pi, h)
+		}
+		h.flow(m)
+		if len(ops.deleted) != 0 {
+			t.Errorf("deleted = %v, want none (%q is ungated)", ops.deleted, name)
+		}
+		if pi.asks != wantAsks {
+			t.Errorf("asks = %d, want %d (%q)", pi.asks, wantAsks, name)
+		}
+		for _, d := range store.decisions {
+			if d.Path != nil && *d.Path == "slowmode" {
+				t.Errorf("%q wrote a path='slowmode' decision row — it must not be gated", name)
+			}
+		}
+	}
+	t.Run("feature off", func(t *testing.T) {
+		// The feature gate (the flow's step 1) returns before the
+		// author and gate steps: zero asks, no row at all.
+		m := gateMsg("a1", "c1", "cat")
+		run("feature off",
+			func(s *fakeStore, _ *fakeOps, _ *fakePi, _ *Derpies) { s.enabled[FeatureKey] = false },
+			m, 0)
+	})
+	t.Run("non-gated author", func(t *testing.T) {
+		// The author-ID gate (mirroring otherMsg's semantics — a user
+		// who is NOT in DerpiesUserIDs) returns before the gate:
+		// zero asks, no row at all.
+		m := gateMsg("a1", "c1", "cat")
+		m.Author = &discordgo.User{ID: "222"}
+		run("non-gated author", nil, m, 0)
+	})
+	t.Run("no guild", func(t *testing.T) {
+		// The guild guard returns before the gate: zero asks, no row
+		// at all.
+		m := gateMsg("a1", "c1", "cat")
+		m.GuildID = ""
+		run("no guild", nil, m, 0)
+	})
+	t.Run("0-token post", func(t *testing.T) {
+		// Empty content (the attachment-only shape): the gate skips it
+		// (len(toks) != 1) and the flow runs to the slow path —
+		// exactly one ask, no gate row. A normal path='slow' row
+		// (score 3 < 40 → no learn, no delete) IS expected.
+		store, ops, pi, h, _ := newGateDerpies(nil)
+		h.flow(gateMsg("a1", "c1", ""))
+		if len(ops.deleted) != 0 {
+			t.Fatalf("deleted = %v, want none (a 0-token post is ungated)", ops.deleted)
+		}
+		if pi.asks != 1 {
+			t.Errorf("asks = %d, want 1 (the flow continues to the slow path)", pi.asks)
+		}
+		for _, d := range store.decisions {
+			if d.Path != nil && *d.Path == "slowmode" {
+				t.Errorf("a 0-token post wrote a path='slowmode' decision row — it must not be gated")
+			}
+		}
+		if len(store.decisions) != 1 {
+			t.Fatalf("decision rows = %d, want 1 (the full flow's single row)", len(store.decisions))
+		}
+		if store.decisions[0].Path == nil || *store.decisions[0].Path != "slow" {
+			t.Errorf("row Path = %v, want 'slow' (the ordinary slow-path verdict row)", store.decisions[0].Path)
+		}
+	})
+}
+
+// TestGateDeleteFailure (S6.5): a gate delete failure degrades
+// best-effort — the 3rd post's DeleteMessage fails (the blanket fake
+// delErr), the flow does NOT panic, and the fake records only
+// successes (len(ops.deleted) == 0), BUT the path='slowmode' decision
+// row is still written with Deleted == true (the write is
+// unconditional — the row is an audit of the GATE decision, not of the
+// REST outcome). After clearing ops.delErr the 4th post is
+// gate-deleted (the single success is recorded).
+func TestGateDeleteFailure(t *testing.T) {
+	store, ops, pi, h, _ := newGateDerpies(nil)
+	ops.delErr = errors.New("429")
+	for i, content := range []string{"cat", "has", "hit"} {
+		h.flow(gateMsg("a"+string(rune('1'+i)), "c1", content))
+	}
+	if len(ops.deleted) != 0 {
+		t.Fatalf("deleted = %v, want none (the fake records only successes — the 3rd post's delete failed)", ops.deleted)
+	}
+	if pi.asks != 2 {
+		t.Errorf("asks = %d, want 2 (posts 1 and 2 passed the gate; the 3rd never reached it)", pi.asks)
+	}
+	var rowA3 *decisionRecord
+	for _, d := range store.decisions {
+		if d.MessageID == "a3" {
+			rowA3 = d
+		}
+	}
+	if rowA3 == nil {
+		t.Fatal("no decision row for a3 (the gate-deleted post)")
+	}
+	if rowA3.Path == nil || *rowA3.Path != "slowmode" {
+		t.Errorf("a3 row Path = %v, want 'slowmode'", rowA3.Path)
+	}
+	if !rowA3.Deleted {
+		t.Errorf("a3 row Deleted = false, want true (best-effort recorded — the delete failed, the row stands)")
+	}
+	if rowA3.Learned {
+		t.Errorf("a3 row Learned = true, want false")
+	}
+	// The blanket fake otherwise keeps failing — the 4th post is
+	// only meaningful after clearing it.
+	ops.delErr = nil
+	h.flow(gateMsg("a4", "c1", "e"))
+	if len(ops.deleted) != 1 {
+		t.Fatalf("deleted = %v, want exactly [c1 a4] (the 4th post, after the error cleared)", ops.deleted)
+	}
+	if ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "a4" {
+		t.Errorf("deleted[0] = %v, want [c1 a4]", ops.deleted[0])
+	}
+}
+
+// TestGatePerChannelIsolation (S6.6): the window is per-(author,
+// CHANNEL) — c1's window is driven to the cap (2 single-token posts)
+// while c2 stays below it (its two posts are ≥2-token and never
+// enter the window). The 3rd in c1 is gate-deleted; the 3rd single
+// token in c2 passes (its channel's window only ever accumulated 2
+// entries — a buggy shared/author-wide counter would have deleted it
+// as the 3rd single token overall). Sole delete: [c1 a3].
+//
+// Deviation (recorded per the plan's construction-faults rule): the
+// plan's sequence (2 single tokens in c1 + 2 single tokens in c2, same
+// gated author) would cap in BOTH channels — with per-(author, channel)
+// windows the 3rd single-token post in c2 is itself gate-deleted (2
+// entries accumulated in c2's own window), so the plan's "len(
+// ops.deleted) == 1" assertion is unattainable in that sequence. The
+// adjustment above (c2's two early posts are 2-token, uncounted) is
+// the minimal change that still pins the isolation property the test
+// is named for: a cap full in c1 never gates c2, and vice-versa.
+func TestGatePerChannelIsolation(t *testing.T) {
+	_, ops, pi, h, _ := newGateDerpies(nil)
+	h.flow(gateMsg("a1", "c1", "cat"))
+	h.flow(gateMsg("b1", "c2", "very nice")) // 2-token: never enters c2's window
+	h.flow(gateMsg("a2", "c1", "has"))
+	h.flow(gateMsg("b2", "c2", "quite good")) // 2-token: never enters c2's window
+	h.flow(gateMsg("a3", "c1", "hit"))        // 3rd in c1 -> gate-deleted (c1 window at the cap)
+	h.flow(gateMsg("b3", "c2", "fox"))        // 3rd single token in c2 -> passes
+	if len(ops.deleted) != 1 {
+		t.Fatalf("deleted = %v, want exactly one (c1's 3rd post; c2's 3rd passes its own window)", ops.deleted)
+	}
+	if ops.deleted[0][0] != "c1" || ops.deleted[0][1] != "a3" {
+		t.Errorf("deleted[0] = %v, want [c1 a3]", ops.deleted[0])
+	}
+	if pi.asks != 5 {
+		t.Errorf("asks = %d, want 5 (a1, b1, a2, b2, b3 — a3 was gate-deleted)", pi.asks)
+	}
+	// The direct window-state check: c1's window is at the cap (both
+	// surviving entries kept, the over-limit post was NOT added), c2's
+	// window still holds... nothing but that b3's timestamp (b1/b2 were
+	// never added).
+	if got := len(h.rateWindow[editUser+"|c1"]); got != 2 {
+		t.Errorf("c1 window entries = %d, want 2 (the over-limit a3 appends nothing — the cap remains at 2)", got)
+	}
+	if got := len(h.rateWindow[editUser+"|c2"]); got != 1 {
+		t.Errorf("c2 window entries = %d, want 1 (only b3's timestamp — the 2-token b1/b2 are never added)", got)
+	}
+}
+
+// TestGateEmptyOnRestart (S6.9): the counter is in-memory on the
+// handler — a bot restart yields a FRESH handler whose window is empty.
+// Two single-token posts on h hold h's window at 2; a fresh h2 (fresh
+// fakes + a pinned clock) receiving two identical single-token posts
+// never sees 3 entries, so nothing is deleted.
+func TestGateEmptyOnRestart(t *testing.T) {
+	_, ops, pi, h, _ := newGateDerpies(nil)
+	h.flow(gateMsg("a1", "c1", "cat"))
+	h.flow(gateMsg("a2", "c1", "has"))
+	if len(ops.deleted) != 0 {
+		t.Fatalf("deleted = %v, want none (only 2 single-token posts so far — below the gate)", ops.deleted)
+	}
+	if pi.asks != 2 {
+		t.Fatalf("asks = %d, want 2", pi.asks)
+	}
+	// The "restart": a fresh handler over fresh fakes (its rateWindow
+	// is empty — nothing carries over).
+	_, ops2, pi2, h2, _ := newGateDerpies(nil)
+	h2.flow(gateMsg("b1", "c1", "cat"))
+	h2.flow(gateMsg("b2", "c1", "has"))
+	if len(ops2.deleted) != 0 {
+		t.Errorf("deleted after restart = %v, want none (the fresh window is empty — 2 posts < the gate)", ops2.deleted)
+	}
+	if pi2.asks != 2 {
+		t.Errorf("asks after restart = %d, want 2 (both posts ran the full flow)", pi2.asks)
 	}
 }
