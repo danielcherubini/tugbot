@@ -186,6 +186,39 @@ func TestListActivitiesPagination(t *testing.T) {
 		}
 	})
 
+	t.Run("429 plain Retry-After header is extracted", func(t *testing.T) {
+		srv := statusServer(t, http.StatusTooManyRequests, http.Header{
+			"Retry-After": []string{"900"},
+		})
+		defer srv.Close()
+		c := &stravaClient{base: srv.URL}
+		_, err := c.ListActivities(context.Background(), "tok", base)
+		var rl ErrRateLimited
+		if !errors.As(err, &rl) {
+			t.Fatalf("want ErrRateLimited, got %v", err)
+		}
+		if rl.RetryAfter != "900" {
+			t.Errorf("RetryAfter = %q, want \"900\"", rl.RetryAfter)
+		}
+	})
+
+	t.Run("429 X-RateLimit-Retry-After takes precedence over plain Retry-After", func(t *testing.T) {
+		srv := statusServer(t, http.StatusTooManyRequests, http.Header{
+			"X-RateLimit-Retry-After": []string{"123"},
+			"Retry-After":             []string{"900"},
+		})
+		defer srv.Close()
+		c := &stravaClient{base: srv.URL}
+		_, err := c.ListActivities(context.Background(), "tok", base)
+		var rl ErrRateLimited
+		if !errors.As(err, &rl) {
+			t.Fatalf("want ErrRateLimited, got %v", err)
+		}
+		if rl.RetryAfter != "123" {
+			t.Errorf("RetryAfter = %q, want \"123\" (X-RateLimit must win)", rl.RetryAfter)
+		}
+	})
+
 	t.Run("401 maps to ErrUnauthorized", func(t *testing.T) {
 		srv := statusServer(t, http.StatusUnauthorized, nil)
 		defer srv.Close()

@@ -81,6 +81,11 @@ type StravaAPI interface {
 
 type stravaClient struct{ base string }
 
+// stravaHTTP carries an explicit Timeout per the house rule (the
+// mention/derpies pattern): a wedged connection must not block the poll
+// goroutine indefinitely.
+var stravaHTTP = &http.Client{Timeout: 30 * time.Second}
+
 // NewStravaAPI is the production constructor (base = https://www.strava.com);
 // tests construct stravaClient directly with an httptest URL. No network I/O
 // at construction — selftest-safe.
@@ -165,7 +170,7 @@ func (c *stravaClient) RefreshToken(ctx context.Context, clientID, clientSecret,
 		return "", "", time.Time{}, ErrTransient{Cause: err}
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := stravaHTTP.Do(req)
 	if err != nil {
 		return "", "", time.Time{}, ErrTransient{Cause: err}
 	}
@@ -206,7 +211,7 @@ func (c *stravaClient) getJSON(ctx context.Context, endpoint, token string, out 
 		return ErrTransient{Cause: err}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := stravaHTTP.Do(req)
 	if err != nil {
 		return ErrTransient{Cause: err}
 	}
@@ -238,14 +243,21 @@ func (c *stravaClient) getList(ctx context.Context, endpoint, token string) ([]S
 
 // classifyStatus is the exact error mapping: any 401 → ErrUnauthorized; a 400
 // whose body contains invalid_grant → ErrUnauthorized; any 429 →
-// ErrRateLimited (RetryAfter populated from the X-RateLimit-* headers when
-// present, else ""); other 4xx and any 5xx → ErrTransient.
+// ErrRateLimited (RetryAfter from X-RateLimit-Retry-After, then the plain
+// Retry-After header, then any other X-RateLimit-* header when present,
+// else ""); other 4xx and any 5xx → ErrTransient.
 func classifyStatus(status int, hdr http.Header, body []byte) error {
 	switch status {
 	case http.StatusUnauthorized:
 		return ErrUnauthorized{Why: "http 401"}
 	case http.StatusTooManyRequests:
+		// Precedence: X-RateLimit-Retry-After (documented), then Strava's
+		// actual plain Retry-After header, then any other X-RateLimit-*
+		// header (legacy), else "".
 		ra := hdr.Get("X-RateLimit-Retry-After")
+		if ra == "" {
+			ra = hdr.Get("Retry-After")
+		}
 		if ra == "" {
 			for k, vs := range hdr {
 				if strings.HasPrefix(k, "X-RateLimit-") && len(vs) > 0 {
