@@ -1,46 +1,62 @@
 ---
-status: approved
+status: committed
 done-when: a finished Run/Cycling-family Strava activity of any enabled athlete lands in its per-athlete thread (or the shared fallback thread) within ~15 minutes as "{label} finished {noun}" + activity link, with no double posts across restarts, and the features flag 'strava' toggles it live
 ---
 
-# Strava activity posting
+# Strava Activity Posting — Plan
 
-A Go-origin feature (no Rust counterpart — excluded from `docs/parity/checklist.md`; lives in `docs/features/` per the derpies precedent). When a monitored Strava athlete finishes a run or ride, the bot posts the activity to Discord.
+**Goal:** A single 15-minute background poll loop (no public endpoint) detects finished run/cycling activities for a small set of authorized Strava athletes and posts a two-line message (short line + `https://www.strava.com/activities/<id>`) to each athlete's Discord thread, with crash-safe no-double-post guarantees.
 
-## Report it was researched against
+**Architecture:** A new `internal/handlers/strava` package following the house handler pattern (`New(*app.App)`, `FeatureKey`, feature-table gate). `RunPoll` is one `eg.Go` in `cmd/tugbot/main.go` using the exact `gulag/loops.go` ticker shape. Each iteration, per athlete: token refresh (persisting the ROTATING refresh token), `GET /athlete/activities?after=<cursor>` (cursor holds at the oldest un-settled activity's start — "pending-hold" semantics), per-activity disposition (`pending`/`posted`/`skipped` rows in `strava_seen_activities`), ONE DB transaction (seen rows + retries + cursor advance), then posts via `ChannelMessageSend`. Schema via one new migration; the `strava` row of the `features` table gates the loop.
 
-`docs/research/strava-activity-posting.md` (rate-limit math, OAuth/refresh-token rotation, webhook status, codebase integration points — file:line citations there hold).
+**Tech stack:** Go (repo's go.mod), `bwmarrin/discordgo`, `jackc/pgx/v5/pgxpool`, `golang.org/x/sync/errgroup`, Postgres (compose PG via `make db-up`).
 
-## 1. Scope & behavior
+**Ground rules for every task (the repo's gate, from AGENTS.md):**
 
-- **Athletes**: a per-athlete data model from day one. Start with one (the owner); grow to 10 via Strava's self-serve dashboard upgrade (no app review) — purely operational, no code change.
-- **Cadence**: a single background poll loop, default **15 minutes** (no public endpoint; webhooks deferred, additive later).
-- **Trigger**: an activity whose `sport_type` is in the **fixed, non-configured** run/cycling family constant (extension is a one-line change; unit tests pin the set member-by-member):
-  `Run, TrailRun, VirtualRun, Ride, VirtualRide, GravelRide, MountainBikeRide, EBikeRide, EMountainBikeRide`
-  "e-bike" means **both** e-bike variants (`EBikeRide` + `EMountainBikeRide`), per operator choice.
-- **Post target**: the athlete's `target_thread_id` (nullable column) with fallback to the configured **shared thread**.
-- **Gating**: house feature flag `strava` in the `features` table; the loop no-ops when the flag is disabled, when the app credentials are absent, or when no **usable** athlete exists ("usable" = not `needs_reauth` and has a resolvable target).
-- **Post shape** (exactly two lines; `sport_type` is the **raw** enum value — no prettification):
+```bash
+go build ./...
+go vet ./...
+gofmt -l .            # must print NOTHING
+make lint             # golangci-lint (CI-pinned) + go vet
+go test ./...         # without PG: DB-touching tests self-skip cleanly
+```
 
-  ```
-  {label} finished <noun>
-  https://www.strava.com/activities/<id>
-  ```
+DB-touching gate (where a task says "DB gate"):
 
-  `noun` = `{distance} {sport_type}` (e.g. `42.3 km Run`, `98.3 km MountainBikeRide`); when the activity has a title: `"{title}" ({distance} {sport_type})` (e.g. `Matt finished "Tuesday tempo" (42.3 km Run)`). Distance: no decimals ≥ 100 km (`142 km`), one decimal < 100 km (`42.3 km`).
+```bash
+make db-up
+TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...
+```
 
-- **Setup flow (operator, one-time):**
-  1. Register the Strava app (`STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` in `.env`).
-  2. >1 athlete: self-serve dashboard upgrade to 10 (no review).
-  3. Per athlete: one-time OAuth consent over a **localhost redirect** (no public endpoint); the consent output (label, athlete id, fresh tokens) lands in `strava_athletes` via the house SQL/MCP adjustment pattern — **adding an athlete is a single SQL insert, no deploy**.
-  4. Enable the `strava` feature flag in SQL.
-- **Explicitly out of scope (YAGNI):** webhooks (deferred; the `seen` table makes them additive later — rename/privacy update events on seen ids are no-ops by design), writing to Strava, editing/deleting old posts, per-activity-type threads, non-Run/Cycling sports.
+`-p 1` + `-count=1` are mandatory for DB packages (shared compose DB; cache would mask). Selftest (task 6 only; needs `make db-up`):
 
-## 2. Data model
+```bash
+go run ./cmd/tugbot --selftest
+# must log: "selftest: Discord session and all fourteen handlers and the MCP server constructed"
+```
 
-`migrations/000006_strava.up.sql` (one new file, `make migrate`; `dbmigrate` untouched). The feature-seed INSERT matches `000002_derpies_gimmicks.up.sql:50` verbatim in shape. **Declared deviation (both tables):** `timestamptz` instead of the house naive-timestamp frame — an intentional first: the strava values come straight from the Strava epoch-seconds API and are compared against `now()`, so tz-aware columns avoid local-time ambiguity. All other tables are untouched; the DDL uses plain `CREATE TABLE` (not the pg_dump-style explicit-sequence idioms of 000002).
+House warnings (AGENTS.md): DB tests can leave the shared compose DB with dropped/recreated tables and an unsettled migration tracker — remedy before a later `make migrate`: `docker compose down -v`.
+
+---
+
+### Task 1: DB migration (000006)
+
+**Context:**
+The first DB surface change; every later task depends on these tables existing. The house migration runner (`internal/dbmigrate`) globs `migrations/*.up.sql`, sorts lexicographically, and applies each in its own transaction, recording `version = basename` — a new table is exactly one new file, nothing else changes. Applied via `make migrate` against the compose PG. **Deliberate, declared deviation** (do not "fix" it): both tables use `timestamptz` while the rest of the DB is naive-timestamp — the strava values come straight from the Strava epoch-seconds API and are compared against `now()`, so tz-aware columns avoid local-time ambiguity.
+
+**Files:**
+- Create: `migrations/000006_strava.up.sql`
+
+**What to implement:**
+Exactly this content (the header comment is part of it — it records the declared deviation for future readers):
 
 ```sql
+-- 000006_strava — schema for the strava feature (Go-origin).
+-- DECLARED DEVIATION: the first timestamptz columns in a naive-timestamp DB
+-- (only dbmigrate's own schema_migrations.applied_at predates this). Rationale:
+-- these values come straight from the Strava epoch-seconds API and are
+-- compared against now(), so tz-aware columns avoid local-time ambiguity.
+-- All other tables are untouched.
 CREATE TABLE public.strava_athletes (
     id               serial PRIMARY KEY,
     label            text NOT NULL,            -- display name in the post: "Matt"
@@ -68,87 +84,456 @@ CREATE TABLE public.strava_seen_activities (
 INSERT INTO public.features (name, enabled) VALUES ('strava', false) ON CONFLICT (name) DO NOTHING;
 ```
 
-**Status semantics** (every discovered activity gets exactly one row, in one of three states — the dedupe key is the non-negotiable):
-- `pending` — **not yet dispositioned: still processing, or the detail fetch failed transiently (429/5xx/timeout)**; re-fetched each cycle by step d, `retries` incremented, dropped to `skipped` at 5.
-- `posted` — posted (or will be posted in the same pass); **never re-posted, by invariant**.
-- `skipped` — deterministically not posting: outside the family, or a `pending` row that gave up at 5. Never re-fetched.
+Do NOT create a `.down.sql` — the repo has none (dbmigrate is up-only by file convention). Do NOT edit `internal/dbmigrate` or `internal/db` (no sqlc regeneration for this feature — the handler uses raw SQL, house convention).
 
-**Config (`.env`, all optional** — the loop no-ops when absent; `--selftest` never breaks):
+**Steps:**
+- [ ] Create `migrations/000006_strava.up.sql` with exactly the content above.
+- [ ] Run `make db-up` (compose PG; credentials postgres:postgres, database `tugbot`).
+- [ ] Run `DATABASE_URL=postgres://postgres:postgres@localhost:5432/tugbot make migrate` — did it complete without error? (`cmd/migrate` reads the env var directly — no godotenv — the var is MANDATORY; `make db-up` alone is not enough.)
+- [ ] Verify: `docker compose exec postgres psql -U postgres -d tugbot -c "\dt strava_*"` lists `strava_athletes` and `strava_seen_activities`.
+- [ ] Verify: `docker compose exec postgres psql -U postgres -d tugbot -c "SELECT enabled FROM features WHERE name = 'strava'"` prints `f`.
+- [ ] Run `DATABASE_URL=postgres://postgres:postgres@localhost:5432/tugbot make migrate` a second time — did it complete as a no-op (the applied version is skipped; no duplicate errors)?
+- [ ] Run the gate block (nothing Go changed, but the migration must pass the dbmigrate tests: `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./internal/dbmigrate/`).
+- [ ] Commit with message: "db: add strava_athletes + strava_seen_activities (migration 000006)"
 
-| Var | Purpose |
-|---|---|
-| `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | registered app credentials |
-| `STRAVA_SHARED_THREAD_ID` | the fallback thread (per-athlete column takes precedence when set) |
-| `STRAVA_POLL_MINUTES` | default 15; **non-numeric → `LoadError` (fail loud, `parseMCPPort` precedent — a malformed value fails the whole bot's config load, and `--selftest`, by design, even with the flag disabled)**; values below 15 are floor-enforced to 15 with a log warning |
+**Acceptance criteria:**
+- [ ] `make migrate` applies 000006 and is idempotent on re-run.
+- [ ] Both tables exist in the compose PG with the declared `timestamptz` columns; `features` has a `('strava', false)` row.
+- [ ] `dbmigrate` tests green under the DB gate.
 
-Access: raw `pool.Exec/Query` with positional `$n` inside the strava package (house convention — `gulag/loops.go`, `serversStore`); **no sqlc regeneration**.
+---
 
-**Removing an athlete** is a single `DELETE FROM strava_athletes` — the FK `ON DELETE CASCADE` removes the seen rows. No code path needed.
+### Task 2: Config vars
 
-## 3. Loop mechanics
+**Context:**
+The handler needs four optional `.env` vars. "Optional" is load-bearing: `--selftest` (and production startup) must succeed with NONE of them set (the loop then simply no-ops). Only one var fails loud: a SET-but-non-numeric `STRAVA_POLL_MINUTES` is a `LoadError` — the `parseMCPPort` precedent (`config.go:97–103` call site + `config.go:147–160` helper), by design a malformed value fails the WHOLE config load (documented blast radius; the strava feature being disabled does not soften this). Below-15 values are floored to 15 with a warning instead of failing (a human typo like `5` is a usable intent: "faster" = the floor).
 
-One `eg.Go` in `cmd/tugbot/main.go`'s errgroup block (the exact `gulag/loops.go:53–86` shape: ticker + `select` on `ctx.Done()`, iteration errors log-and-continue, `ctx.Err()` on shutdown). One 15-minute rhythm.
+**Files:**
+- Modify: `internal/config/config.go`
+- Test: `internal/config/config_test.go`
 
-**Cursor semantics (defined, per review blocker).** Strava's `after` parameter filters on **activity start time** (epoch seconds), so `last_polled_at` tracks *start times*. Rule: the cursor **holds at the oldest `pending` row's `start_date` while any `pending` rows exist**; otherwise it advances to the newest confirmed `start_date` — and a `pending` row exists for **every** still-undispositioned id (processing or transient detail-failure, per 2.c), so the cursor can never advance past an undispositioned family activity. The held cursor makes the next cycle re-walk the open window, which is what **catches late-synced activities** whose start is still ≥ the window start but hadn't been listed before (seen rows make re-walked ids no-ops); `pending` retries themselves are by-id detail fetches (step d), independent of the list window. **`after` is treated as exclusive** (verify inclusivity once against the live API during implementation; a same-second off-by-one is bounded by seen dedupe + the 5-retry drop).
+**What to implement:**
 
-**Per-iteration sequence** (each step's failure: log + `continue` — one athlete's failure never blocks the others, never crashes the errgroup; **exception: a 401 on any call aborts the athlete's remaining pass** — the per-athlete transaction is discarded, so the cursor is preserved and the post re-auth re-walk re-covers the window, per the failure table):
+Add to the `Config` struct (after the `DerpiesUserIDs` block, mirroring the comment style):
 
-1. **Config preflight** — `features.IsEnabled(ctx, pool, "strava")` (the silently-false flavor) → false, return. `STRAVA_CLIENT_ID/SECRET` unset → return. Load `strava_athletes`; skip `needs_reauth = true` (their cursor is implicitly preserved — no calls are made for them, so nothing advances); none usable, return.
-2. **Per athlete, in order:**
-   - **a. Token** — if `token_expires_at < now + 1h`: `POST /oauth/token` (`grant_type=refresh_token`) → **persist new access token + rotated refresh token + new expiry in one transaction**. 401/invalid-grant → `needs_reauth = true`, log, continue.
-   - **b. Window & list** — `window_start = last_polled_at ?? (now − 24h)`; `GET /athlete/activities?after=<window_start>` (paginate while a full 100-row page returns). 429 → log (with `X-RateLimit-*`), **no cursor change**, next cycle retries the window.
-   - **c. Per listed id** (a `seen` row of any status in the list → no-op, handled by `d` if `pending`):
-     - summary `sport_type` **missing/empty** (device upload not yet parsed by Strava) → `pending` row (step d fetches the detail next cycle) — **not** `skipped` (an unverified-absence must not become a permanent silent miss).
-     - summary `sport_type` **not** in the family → `seen` row `skipped` (with `start_date`), **no detail fetch** — the summary carries `sport_type`; don't burn a read on a non-family activity.
-     - in family → fetch `GET /athlete/activities/{id}`:
-       - still **processing** — `in_progress == true` when the field is present, or (when `in_progress` is absent) `resource_state == -1`, the official API reference's documented processing indicator (**when neither signal is present → treat as ready**, the documented fallback) → `pending` row (with `start_date`).
-       - ready → `seen` row `posted` (inserted **before** the post — a crash ⇒ at worst a *missed* post, never a *double* post), then post.
-     - detail fetch fails transiently (429/5xx/timeout) → `pending` row (with `start_date`): the existing hold rule keeps the id inside the window and step d re-fetches it next cycles — a 429'd id can therefore never be advanced past. **A 401 on the detail (or list) call aborts the pass** (see the sequence preamble).
-   - **d. Pending retry** — for each of the athlete's **carried** `pending` rows (from earlier passes; a row newly created in step c first re-fetches on the *next* cycle, so `retries` counts full re-fetch cycles starting at 0 on the discovery pass): re-fetch the detail by id. ready now → `posted` + post; still processing, or the fetch failed transiently again → `retries += 1`, stays `pending`; `retries ≥ 5` → `skipped` (drop — that workout never gets a post). The retry count is **persisted in the row**, so a restart does not reset the 5-cycle budget (and a restart cannot loop a stuck activity forever).
-   - **e. Cursor** — if `pending` rows remain (processing or transient-failed, per 2.c): `last_polled_at = min(pending.start_date)` (hold the window open — this is the hold that covers the 429'd / failed ids from 2.c; there is no separate "undispositioned" hold condition because step c creates a `pending` row for every such id). Else if this pass dispositioned anything: `last_polled_at = max(this-pass start_dates)`. Else: unchanged.
-3. **Atomicity (per athlete, per pass):** one DB transaction applies all new `seen` rows + `retries` increments + the new `last_polled_at`; **then** the posts. Crash anywhere ⇒ no double posts (the `posted` invariant); a re-poll re-walks the window and seen rows make it a no-op.
-4. 429s elsewhere: log (with `X-RateLimit-*`) + the natural 15-min ticker is the backoff (no extra sleeps).
+```go
+	// StravaClientID / StravaClientSecret are the registered Strava app's
+	// credentials (STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET). Optional: the
+	// strava handler no-ops when absent (feature-flag gated too).
+	StravaClientID string
+	StravaClientSecret string
 
-**First enable (operator-visible, one-time):** `last_polled_at NULL` → **24h lookback**; everything in the window gets a `seen` row (posted / skipped / pending as applicable). Enabling mid-week may post the last day's runs; anything older is never posted. While a lookback window still has `pending` rows the cursor holds at its low end, so the 24h window re-walks until everything settles — which also picks up late-synced activities inside it.
+	// StravaSharedThreadID (STRAVA_SHARED_THREAD_ID) is the fallback post
+	// target: 0 = unset (per-athlete threads only). Malformed → 0 (the
+	// single-ID parseID convention, silently).
+	StravaSharedThreadID int64
 
-**Documented trade-off (late-sync, answered per review):** an activity whose start lands **below** the current window start (device sync lag spanning more than one cycle while the window was closed) is **missed** — the cursor does not backdate. Sync-lag ≥15 min is the residual case; the `pending`-hold machinery covers the common case, and a missed post is a log artifact, not data loss.
+	// StravaPollMinutes (STRAVA_POLL_MINUTES): the poll cadence in minutes.
+	// Default 15. Below 15 → floored to 15 (slog.Warn). A set-but-non-numeric
+	// value fails LOUD (LoadError — the parseMCPPort precedent; a malformed
+	// value fails the whole config load, by design).
+	StravaPollMinutes int
+```
 
-**Rate budget:** ≤10 athletes = 1–2 list calls/cycle (pagination) + 1 detail fetch per family candidate ≈ **≤1,000 read req/day at ≤5 athletes**, at the default cap's edge at 10 — covered by the 2,000/day cap the 10-athlete self-upgrade grants. Token refreshes are OAuth-endpoint calls, not read-budget traffic (even if counted: ≤ ~5/athlete/day). Recorded in `docs/features/strava.md`.
+Add a helper + a call site in `LoadConfig` (mirror the `parseMCPPort` helper at `config.go:147–160` and its call site at `config.go:97–103`, which does `return nil, perr` immediately — do NOT append to `errs` in the parse region: the `len(errs) > 0` early return at `config.go:90–92` (the `errs` block spans `:80–92`) happens before the call site, so an append there would be dead code and the malformed value would sail through):
 
-## 4. Failure behavior
+```go
+// parseStravaPoll — like parseMCPPort: unset → 15; below 15 → 15 (slog.Warn);
+// set-but-non-numeric → LoadError (fail loud: a malformed value fails the WHOLE
+// config load, by design — documented blast radius).
+func parseStravaPoll(v string) (int, error) {
+	if v == "" {
+		return 15, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, &LoadError{problems: []string{"STRAVA_POLL_MINUTES is not a valid minute count: " + v}}
+	}
+	if n < 15 {
+		slog.Warn("STRAVA_POLL_MINUTES below 15 — using 15", "module", "config")
+		return 15, nil
+	}
+	return n, nil
+}
+```
+called from `LoadConfig` exactly the way the `parseMCPPort` result is consumed:
 
-| Failure | Behavior |
-|---|---|
-| 401 / invalid-grant on **any** athlete call (refresh, list, or detail — covers the user de-authorizing the app on the Strava side) | **the athlete's remaining pass aborts and the per-athlete transaction (incl. `last_polled_at`) is discarded** — the cursor is preserved, and the post re-auth re-walk re-covers every id in the window. `needs_reauth = true`; athlete skipped on all later cycles; others unaffected; log with re-auth pointer |
-| Re-auth | re-run the local OAuth consent → SQL update of tokens + flag cleared (no deploy); polling resumes from the preserved cursor — no gap-flood |
-| 429 anywhere | log (with `X-RateLimit-*`); cursor holds for that call; 15-min cadence is the backoff |
-| Discord send fails | log; the activity is `posted` (dispositioned) — **not** re-posted later (a missed post is a log artifact) |
-| Still processing after 5 cycles | drops to `skipped` (persisted `retries` — restart-safe) |
-| Athlete with no resolvable target (no per-athlete id and no `STRAVA_SHARED_THREAD_ID`) | new family activities dispositioned `skipped`; one counted line in the per-cycle log (no per-activity spam) |
-| Late-synced activity with start ≥ window start | caught by the `pending`-hold re-walk (see §3 trade-off note) |
-| Long bot outage (weeks) | refresh tokens may be expired (TTL undocumented) → 401 → `needs_reauth`; operator re-auths; no data loss (cursor + seen survive) |
-| DB flap during an iteration | `IsEnabled` false path or per-athlete error → logged, cycle skipped, loop alive |
-| Title rename / privacy flip on a dispositionsed id | **no-op** (privacy flips to Only-You honored by not re-posting) |
-| Removing an athlete | single SQL delete (FK cascade clears seen rows) |
+```go
+stravaPoll, perr := parseStravaPoll(os.Getenv("STRAVA_POLL_MINUTES"))
+if perr != nil {
+	return nil, perr
+}
+```
 
-## 5. Wiring, tests & docs
+(plus `StravaClientID: os.Getenv("STRAVA_CLIENT_ID")`, `StravaClientSecret: os.Getenv("STRAVA_CLIENT_SECRET")`, `StravaSharedThreadID: parseID(os.Getenv("STRAVA_SHARED_THREAD_ID"))`, `StravaPollMinutes: stravaPoll` in the returned `Config` literal — `parseID` already exists and returns `int64`, 0 on absent/malformed; add `log/slog` to imports if not present.)
 
-| # | File | Kind |
-|---|------|------|
-| 1 | `migrations/000006_strava.up.sql` | new (tables incl. the declared `timestamptz` deviation + feature-flag seed) |
-| 2 | `internal/handlers/strava/strava.go` | new — `New(*app.App)` (network-free, selftest-safe), `FeatureKey`, `RunPoll`, iteration (config preflight, per-athlete error isolation, cursor hold); seams: a `StravaAPI` interface + the house `fu`-style Discord-send seam |
-| 3 | `internal/handlers/strava/client.go` | new — Strava API client (list w/ pagination / detail / token refresh; 429 surfaced to the iteration) |
-| 4 | `internal/handlers/strava/strava_test.go` | new — `TestFeatureKey` pin + pure units: distance/noun formatting incl. title branch, sport-family set pin (all 9 values, member-by-member, vs. e.g. `Swim`/`Walking`), cursor water-mark math (hold-at-oldest-pending, advance-on-all-settled), retry lifecycle (`pending` → `retries` → `skipped` at 5, incl. the carried-only step-d semantics), 429 detail-failure → `pending` retry path (incl. the cursor can-not-advance-past invariant), 429 list-failure → no-cursor-change, processing-detection: the `in_progress` path, the `resource_state == -1` path, and the neither-field-present ⇒ ready fallback, missing/empty summary `sport_type` → `pending` (not `skipped`) |
-| 5 | `internal/handlers/strava/strava_integration_test.go` | new — house DB-skip pattern, strava-specific table names, one+ iteration(s) against a stubbed `StravaAPI`: post triggered / no-op on seen / cursor+seen atomicity in one transaction / `needs_reauth` pause → re-auth → resume from the preserved cursor (no gap-flood) |
-| 6 | `internal/config/config.go` | edit — the 4 optional vars (non-numeric poll minutes → `LoadError`; <15 floored with a log warning) |
-| 7 | `cmd/tugbot/main.go` | edit — struct field, `newHandlers` line, one `eg.Go`, reword "thirteen"→"fourteen" (3 strings) |
-| 8 | `AGENTS.md` | edit — selftest expectation reworded to the FULL log string (the current :28 paraphrase quotes a shorter string than `main.go:314` logs — repair the quote fidelity while touching the line) |
-| 9 | `docs/features/strava.md` | new — **not** the parity checklist: mechanism, setup (registration + self-upgrade), onboarding procedure (localhost consent + SQL insert), the rate budget (incl. the token-refresh note), the re-auth flow, the late-sync trade-off, and a "webhooks — deferred, additive" note |
+Tests — add to `internal/config/config_test.go` using the existing `t.Setenv` pattern (the file's helper at ~line 14 sets the required vars `DISCORD_TOKEN`/`APPLICATION_ID`/`DATABASE_URL`; call it in each new test):
 
-**Test gate:** `go build ./...`, `go vet`, `gofmt -l .`, `make lint`, `go test ./...` (DB tests self-skip without PG); full green gate with `TUGBOT_TEST_DATABASE_URL` + `-p 1 -count=1`; `go run ./cmd/tugbot --selftest` must log `"selftest: Discord session and all fourteen handlers and the MCP server constructed"` (the full expected string, per `cmd/tugbot/main.go:314`).
+1. `TestLoadConfigStravaDefaults` — required vars set, all four strava vars `""` → `cfg.StravaClientID == ""`, `cfg.StravaClientSecret == ""`, `cfg.StravaSharedThreadID == 0`, `cfg.StravaPollMinutes == 15`.
+2. `TestLoadConfigStravaSet` — `STRAVA_CLIENT_ID=abc`, `STRAVA_CLIENT_SECRET=xyz`, `STRAVA_SHARED_THREAD_ID=100`, `STRAVA_POLL_MINUTES=30` → all parsed.
+3. `TestLoadConfigMalformedStravaPoll` — `STRAVA_POLL_MINUTES=abc` → `LoadConfig` returns an error (assert `errors.As` `*LoadError` and its `Error()` contains `STRAVA_POLL_MINUTES`).
+4. `TestLoadConfigStravaPollBelowFloor` — `STRAVA_POLL_MINUTES=5` → `StravaPollMinutes == 15`.
 
-**Rollout:** register app → `.env` vars → `make migrate` → one-time local OAuth consent + SQL insert (owner first) → enable the `strava` flag in SQL.
+**Steps:**
+- [ ] Add the four STRAVA keys (`STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `STRAVA_SHARED_THREAD_ID`, `STRAVA_POLL_MINUTES`) to the `validEnv()` map in `config_test.go` so ambient shell/`.env` values cannot taint the tests.
+- [ ] Write the four tests in `internal/config/config_test.go`.
+- [ ] Run `go test ./internal/config/ -count=1` — did it fail (the fields don't exist yet)?
+- [ ] Implement the struct fields + `LoadConfig` block + the `Config` literal additions.
+- [ ] Run `go test ./internal/config/ -count=1` — did all tests pass?
+- [ ] Run the gate block.
+- [ ] Commit with message: "config: optional strava vars (client credentials, shared thread, poll minutes floor 15)"
 
-## Deferred (additive, no rework planned)
+**Acceptance criteria:**
+- [ ] All four new config tests pass; `go test ./internal/config/ -count=1` fully green.
+- [ ] A config with no strava vars loads cleanly (`--selftest`-safe: no required-status change).
+- [ ] Gate block green.
 
-Webhook receiver (embedded in the existing in-process HTTP layer, per the MCP precedent on :8642) with the 15-min poll as the correctness backstop. The `seen` table absorbs duplicate events; the poll remains the source of truth. Trigger for revisiting: operator wants sub-minute freshness.
+---
+
+### Task 3: Strava API client
+
+**Context:**
+The minimal HTTP surface the loop needs, behind an interface so the handler's tests stub it (the repo's `fu`/seam convention). Three error classes drive the loop's mechanics and MUST be typed: **401** (either an expired-access/invalid-grant or a user deauthorization → `needs_reauth`), **429** (cursor holds; the 15-min ticker is the backoff), and **transient** (5xx/network → the id stays `pending` and is retried). Base URL is swappable for tests (`httptest`).
+
+**Files:**
+- Create: `internal/handlers/strava/client.go`
+- Test: `internal/handlers/strava/client_test.go`
+
+**What to implement:**
+
+```go
+// client.go — the Strava v3 API surface for the strava feature.
+package strava
+
+// Summary is what the list endpoint returns per activity (a subset
+// model — enough to gate the detail fetch on sport_type).
+type Summary struct {
+	ID        int64
+	SportType string    // "" when absent (unparsed device upload → pending, per spec)
+	StartDate time.Time
+}
+
+// Activity is the full detail model.
+// InProgressSet mirrors the SOURCE JSON: whether the "in_progress" key was
+// present at all (the documented fallback: field absent → ready unless
+// resource_state == -1, the official API reference's processing indicator).
+type Activity struct {
+	ID            int64
+	SportType     string
+	Title         string // "" when unset
+	Distance      float64 // meters
+	StartDate     time.Time
+	InProgress    bool
+	InProgressSet bool
+	ResourceState int // as returned; -1 == 'processing'
+}
+
+// Error classes (each with a distinct Error() text).
+type ErrUnauthorized struct{ Why string }        // 401, or refresh 400 invalid_grant
+type ErrRateLimited struct{ RetryAfter string }  // 429 + X-RateLimit headers
+type ErrTransient struct{ Cause error }          // 5xx / network / unexpected 4xx
+
+// StravaAPI is the seam the handler resolves through (tests stub it).
+type StravaAPI interface {
+	// ListActivities pages internally: loop while a full 100-row page returns.
+	ListActivities(ctx context.Context, token string, after time.Time) ([]Summary, error)
+	GetActivity(ctx context.Context, token string, id int64) (Activity, error)
+	// RefreshToken performs POST /oauth/token (grant_type=refresh_token form:
+	// client_id, client_secret, refresh_token). The ROTATED refresh_token is
+	// part of the return — the caller MUST persist it (spec).
+	RefreshToken(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, newRefreshToken string, expiresAt time.Time, err error)
+}
+
+type stravaClient struct{ base string }
+
+// NewStravaAPI is the production constructor (base = https://www.strava.com);
+// tests construct stravaClient directly with an httptest URL.
+func NewStravaAPI() StravaAPI
+```
+
+Mapping rules (exact): **any 401** (list, detail, or refresh), or a refresh-route 400 whose body contains `invalid_grant` → `ErrUnauthorized`; any 429 → `ErrRateLimited` (populate `RetryAfter` from `X-RateLimit-Retry-After` / the `X-RateLimit-*` headers when present, else `"`); other 4xx, any 5xx, dial/TLS/timeout errors → `ErrTransient{Cause}`. JWT parsing is NOT needed — the client never decodes tokens (the server returns `expires_at` epoch seconds; the refresh form is the only token work).
+
+**Steps:**
+- [ ] Write `client_test.go` first (httptest.Server per test; the file's struct needs only the unexported `stravaClient` + `NewStravaAPI`-shaped constructor injection — construct `stravaClient{base: ts.URL}` directly, the test lives in package `strava` so unexported access is fine):
+  1. `TestListActivitiesPagination` — handler returns 100 summaries then 6; client returns all 106 in one call; a 429 response (with `X-RateLimit-Retry-After: 123`) surfaces as `ErrRateLimited{RetryAfter: "123"}`; a 401 surfaces as `ErrUnauthorized`; a 503 surfaces as `ErrTransient`; assert the merged 106 `Summary` values carry parsed `ID`/`SportType`/`StartDate` (the list `StartDate` drives the cursor math).
+  2. `TestGetActivitySignals` — response with `"in_progress": true` → `InProgress true, InProgressSet true`; response with the key absent and `"resource_state": -1` → `InProgressSet false, ResourceState -1`; response with NEITHER signal → `InProgressSet false, ResourceState != -1` (ready class); `sport_type`/`title`/`distance`/`start_date` parsed; 400 body `{"error":"invalid_grant"}` on the refresh route → `ErrUnauthorized`.
+  3. `TestRefreshTokenRotation` — success returns both tokens + `expires_at` (epoch seconds → `time.Time`); verify the request carried `grant_type=refresh_token` + the three form values (assert in the handler).
+- [ ] Run `go test ./internal/handlers/strava/ -count=1` — did it fail (no `client.go`)?
+- [ ] Implement `client.go`.
+- [ ] Run `go test ./internal/handlers/strava/ -count=1` — did all tests pass?
+- [ ] Run the gate block.
+- [ ] Commit with message: "strava: API client (list/detail/refresh; typed 401/429/transient errors)"
+
+**Acceptance criteria:**
+- [ ] All three client test groups pass; error mapping is exact per the rules above.
+- [ ] `NewStravaAPI()` performs no network I/O (selftest-safe; nothing in this task opens connections at construction).
+- [ ] Gate block green.
+
+---
+
+### Task 4: Handler core + pure-logic units
+
+**Context:**
+The loop itself plus its pure decision functions, unit-tested without PG (DB mechanics land in task 5 through a stubbed `StravaAPI` + the real test PG). Everything in spec §3/§4 mechanics is here; this task's discipline: `New` is network-free (the selftest constructs every handler offline), and every decision function is a pure exported-or-unexported helper so a context-free regression test can pin it.
+
+**Files:**
+- Create: `internal/handlers/strava/strava.go`
+- Test: `internal/handlers/strava/strava_test.go`
+
+**What to implement:**
+
+```go
+const FeatureKey = "strava"
+
+// The fixed, non-configured run/cycling family (spec §1 — 9 values; unit
+// test pins EVERY member + known exclusions).
+var familySet = map[string]struct{}{
+	"Run": {}, "TrailRun": {}, "VirtualRun": {}, "Ride": {}, "VirtualRide": {},
+	"GravelRide": {}, "MountainBikeRide": {}, "EBikeRide": {}, "EMountainBikeRide": {},
+}
+
+type Strava struct {
+	app   *app.App
+	api   StravaAPI      // seam: production = NewStravaAPI(); nil until first use
+	poll  time.Duration  // poll interval (from Config, task 2; default 15m)
+	// sendFn seam: func(threadID string, msg string) error → production posts
+	// via h.app.D.ChannelMessageSend (the single-thread discipline: threads are
+	// plain channels in discordgo).
+	sendFn func(threadID string, msg string) error
+}
+
+func New(app *app.App) *Strava // NO network I/O here (selftest discipline).
+                             // discordgo's ChannelMessageSend is
+                             // (channelID string, content string, ...RequestOption) (*Message, error)
+                             // — wire the seam via a CLOSURE (a direct method-value
+                             // does not compile to the seam's signature):
+                             // s.sendFn = func(threadID, msg string) error {
+                             //     _, err := s.app.D.ChannelMessageSend(threadID, msg)
+                             //     return err
+                             // }
+func (s *Strava) RunPoll(ctx context.Context) error // EXACT gulag/loops.go:53–86 shape:
+	// ticker := time.NewTicker(s.poll); defer ticker.Stop(); for { select {
+	// case <-ctx.Done(): return ctx.Err()
+	// case <-ticker.C: if err := s.iteration(ctx); err != nil { slog.Error(...); } } }
+
+func (s *Strava) iteration(ctx context.Context) error
+// spec §3 sequence, verbatim:
+// 1. config preflight: features.IsEnabled(ctx, s.app.Pool, FeatureKey) false →
+//    return nil; cfg.StravaClientID/Secret "" → return nil (log-once optional);
+//    load strava_athletes rows (raw SQL, house style); skip needs_reauth=true
+//    (call nothing for them — their cursor is implicitly preserved); none → return nil.
+// 2. per athlete, in order (an error here: log + continue to the next athlete —
+//    EXCEPT the 401 class below):
+//    a. Token: if token_expires_at < now+1h → api.RefreshToken; on success
+//       persist (access_token, refresh_token=ROTATED, token_expires_at) in ONE
+//       transaction. ErrUnauthorized → UPDATE needs_reauth=true, log (re-auth
+//       pointer), continue (pass ABORTS for this athlete — spec: 401 aborts the
+//       remaining pass, the per-athlete transaction is discarded, cursor preserved; the `needs_reauth = true` UPDATE commits immediately as its OWN statement — only the seen-rows/cursor transaction is discarded (test 7's dual assertion depends on this)).
+//    b. window_start = last_polled_at ?? (now − 24h); api.ListActivities(after=window_start).
+//       ErrRateLimited → log (with RetryAfter), NO cursor change for this athlete,
+//       continue. ErrUnauthorized → abort this athlete's pass (as a.).
+//    c. per listed ID (a seen row of any status → no-op except `pending` via d):
+//       - summary SportType == "" (unparsed) → INSERT seen 'pending' (start_date) —
+//         NOT 'skipped'.
+//       - summary family miss → INSERT seen 'skipped' — NO detail fetch.
+//       - family hit → api.GetActivity:
+//           - isProcessing(a) → INSERT seen 'pending'.
+//           - else → INSERT seen 'posted' BEFORE posting (posted invariant),
+//             then post (below).
+//       - ErrTransient/ErrRateLimited on the detail → INSERT seen 'pending'
+//         (the existing hold rule keeps the id in the window; d re-fetches
+//         next cycles; the 5-retry drop covers a stuck fetch).
+//    d. Pending retry → for each CARRIED pending row — SNAPSHOT the pending-row set at pass start (before step c's inserts); a row created by step c this pass is `pending` with `retries = 0` too, so the snapshot is the only discriminator;
+//       they first re-fetch next cycle, so `retries` counts full cycles from 0):
+//       re-fetch the detail — UNIFORMLY, including rows created via the unparsed
+//       summary path (SportType == ""): the detail yields the activity's final
+//       sport_type + processing state. ready & family → UPDATE 'posted' + post;
+//       detail now outside the family → UPDATE 'skipped'. still processing, or the
+//       fetch failed again → increment `retries`; if the NEW value >= 5, set
+//       status 'skipped' in the SAME UPDATE (drop — that workout never gets a
+//       post); otherwise stays 'pending'.
+//    e. Cursor (nextCursor below): pending remain → hold at min(pending.start_date);
+//       else (nothing pending, all-time dispositioned) → max(dispositioned) per the `nextCursor` doc;
+//       else unchanged.
+// 3. Atomicity: ONE transaction per athlete-per-pass applies the new seen rows +
+//    retries increments + the new last_polled_at. THEN the posts.
+// 4. 429s elsewhere: log (headers) — the 15-min ticker is the backoff (no sleeps).
+// Post (only when a row was dispositioned 'posted' this pass):
+//    The target is resolved at DISPOSITION time — inside the transaction, before
+//    the INSERT (never post-commit): target = athlete.target_thread_id loaded via
+//    SQL COALESCE so a NULL column reads as 0 (no pgx NULL scan); the fallback is then
+//    cfg.StravaSharedThreadID; RESOLUTION APPLIES TO BOTH the step-c INSERT and the step-d UPDATE-to-`'posted'`; still 0 → the family activity is dispositioned
+//    'skipped' instead (one counted line in the per-cycle log — spec failure
+//    table). Build the message via buildPost and call sendFn (strconv.FormatInt
+//    the int64 thread id to the seam's string); a send error: log, no retry (the
+//    activity is 'posted' — not re-posted later; a missed post is a log artifact).
+
+// ---- pure decision functions (the unit-test surface) ----
+func family(sportType string) bool                 // familySet membership
+func isProcessing(a Activity) bool                // a.InProgressSet && a.InProgress
+                                               // || !a.InProgressSet && a.ResourceState == -1
+func nextCursor(pending, dispositioned []time.Time) (next time.Time, advanced bool)
+ // The CALLER loads `dispositioned` = start dates of EVERY seen row with
+ // status != 'pending' — ALL-TIME, not this-pass-only (step-d resolutions
+ // count once their status is updated to posted/skipped).
+ // pending non-empty → (min(pending), false)          [hold the window open]
+ // else dispositioned non-empty → (max(dispositioned), true)
+ // else → (zero time, false)                          [unchanged]
+func formatNoun(a Activity) string
+ // noun = <distance> <SportType>; distance (meters → km): >= 100 km → round
+ // HALF UP to an integer via int64(m/1000 + 0.5) ("142 km"; 142500 m → "143 km");
+ // < 100 km → one decimal via `%.1f` ("42.3 km").
+func buildPost(label, noun, activityID string) string
+ // two lines: label + " finished " + noun + "\n" + "https://www.strava.com/activities/" + id
+ // (title branch composed by the caller: noun = `"%s" (%s)` title, distanceNoun)
+```
+
+(`poll` is set from `app.Cfg.StravaPollMinutes` at first use/iteration — not in `New`, keeping `New` trivial. Task 4's tests need only `FeatureKey` + the five pure helpers — NO constructor seams here; the sole test constructor, `newTestStrava`, lands with task 5's `strava_integration_test.go`).
+
+`strava_test.go` — house-unit pattern (mirror `gokupoll_test.go`'s `TestFeatureKey` pin + `instagram_test.go` style):
+
+- `TestFeatureKey` — `FeatureKey == "strava"`.
+- `TestFamilyPin` — table test: all 9 family values → true; `Swim`, `Walking`, `Badminton`, `""` → false.
+- `TestIsProcessing` — table: `InProgressSet true, InProgress true` → true; `InProgressSet true, InProgress false` → false; `InProgressSet false, ResourceState -1` → true; `InProgressSet false, ResourceState 2` → false; `InProgressSet true, InProgress false, ResourceState -1` → false (a present false field WINS over the -1 fallback).
+- `TestNextCursor` — hold-priority (pending + dispositioned → min(pending), false); advance (dispositioned only → max, true); empty (→ zero, false).
+- `TestFormatNoun` — 42300 m → `"42.3 km Run"`; 142000 m → `"142 km MountainBikeRide"`; 142500 m → `"143 km ..."` (the ≥ 100 km branch, round half up via `int64(m/1000+0.5)`); 99800 m → `"99.8 km Ride"` (the < 100 km branch, `%.1f`); boundary: exactly 100000 m → `"100 km Ride"` (the branch flips at exactly 100.0 — no decimals).
+- `TestBuildPost` — `Matt` + `42.3 km Run` + id `123` → exactly `Matt finished 42.3 km Run\nhttps://www.strava.com/activities/123`; title branch: `Matt finished "Tuesday tempo" (42.3 km Run)\n...`.
+
+**Steps:**
+- [ ] Write `strava_test.go` (all six test groups above).
+- [ ] Run `go test ./internal/handlers/strava/ -run "TestFeatureKey|TestFamilyPin|TestIsProcessing|TestNextCursor|TestFormatNoun|TestBuildPost" -count=1` — did it fail (no `strava.go`)?
+- [ ] Implement `strava.go` (struct, `New`, `RunPoll`, `iteration`, the five pure helpers + `FeatureKey`).
+- [ ] Run the same test command — did all tests pass?
+- [ ] Run the gate block.
+- [ ] Commit with message: "strava: handler core (FeatureKey, RunPoll, iteration, cursor/token/dedupe mechanics)"
+
+**Acceptance criteria:**
+- [ ] All six unit test groups pass; `go test ./internal/handlers/strava/ -count=1` fully green (client tests from task 3 still included).
+- [ ] `New(app)` compiles into the selftest surface with zero network I/O.
+- [ ] The family set is exactly the 9 spec values — not configurable anywhere.
+- [ ] Gate block green.
+
+---
+
+### Task 5: DB integration tests
+
+**Context:**
+The DB-touching mechanics (cursor + seen atomicity, reauth pause/resume, 429 hold, pending lifecycle, first-enable lookback) run against a real Postgres with a stubbed `StravaAPI` and a capturing `sendFn` — the repo's exact skip pattern (`gulag_test.go:23–60`: `skipIfShort`, `TUGBOT_TEST_DATABASE_URL` defaulting to `postgres://tugbot:tugbot@127.0.0.1:5432/tugbot_test`, pool with 10s timeout, `t.Skipf` when unreachable). Because this test resets tables IN the shared compose DB, the DB gate runs `-p 1 -count=1` (AGENTS.md state-residue warning; `docker compose down -v` is the remedy before a later `make migrate`).
+
+**Files:**
+- Test: `internal/handlers/strava/strava_integration_test.go`
+
+**What to implement:**
+
+`setupStravaTestDB(t)` — mirror `setupGulagTestDB` line for line, but reset the strava surface:
+
+```go
+func setupStravaTestDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	skipIfShort(t)
+	// pool with 10s timeout against testDBURL(); t.Skipf on error (same message style
+	// as gulag: "cannot create pool: %v (is the compose PG running?)")
+	// ONE script:
+	//   DROP TABLE IF EXISTS strava_seen_activities;
+	//   DROP TABLE IF EXISTS strava_athletes;
+	//   <exact CREATE TABLE DDL from migrations/000006, both tables>
+	//   CREATE TABLE IF NOT EXISTS features (id serial PRIMARY KEY,
+	//       name character varying(255) UNIQUE NOT NULL,
+	//       enabled boolean DEFAULT false NOT NULL);  -- the derpies precedent
+	//   DELETE FROM features;                        -- the shared compose features table
+	//   INSERT INTO features (name, enabled) VALUES ('strava', true);
+	// t.Cleanup(pool.Close) INSIDE setupStravaTestDB (gulag_test.go:99 — the
+	// house pattern); callers do NOT close.
+}
+```
+
+A `newTestStrava(t, pool, stubAPI, sendCapture)` helper wiring the seams (`api`, `sendFn`, the pool, a `Config` with client id/secret set, `StravaSharedThreadID` = a chosen id, `StravaPollMinutes` = 15) via the unexported test constructor. The stub `StravaAPI` is a small struct with scriptable fields: `listFn func(after time.Time) ([]Summary, error)`, `detailFn func(id int64) (Activity, error)`, `refreshFn func() (string, string, time.Time, error)` + call counters.
+
+Tests (each: `setupStravaTestDB`, seed the athlete row with raw SQL — `INSERT INTO strava_athletes (label, strava_athlete_id, access_token, refresh_token, token_expires_at, last_polled_at, target_thread_id) VALUES (...)` — call `s.iteration(ctx)` directly (or `RunPoll` with a `time.Millisecond*50` `poll` seam for the one loop test), assert via raw SQL + the captured posts):
+
+1. `TestStravaPassPostsNewFamily` — athlete `target_thread_id=9001`, token valid (expiry now+6h), `last_polled_at = now-2h`; stub: list → [A (Run, 42300m, start in window), B (Swim, start in window)]; detail A ready. One iteration → exactly one captured post on `9001` = `Label finished 42.3 km Run\nhttps://www.strava.com/activities/A`; SQL: A row `posted`, B row `skipped`; `last_polled_at` = max(A, B start) (B's skip counts as dispositioned; no pending → advance).
+2. `TestStravaNoRepost` — pre-seed A `posted`; same stub → iteration → ZERO posts; A row unchanged.
+3. `TestStravaPendingHoldAndRetry` — pass 1: A detail processing → A row `pending`, `retries 0`, cursor = A.start (hold), no post. Mutate the stub; pass 2: A ready → A row `posted`, one post, `retries` still 0 (per the carried-row rule `retries` counts full re-fetch cycles from 0 — A resolved on its first re-fetch, so it stays 0).
+4. `TestStravaPendingDropsAt5` — always processing: 6 iterations → A row `skipped`, `retries 5`, ZERO posts.
+5. `TestStravaDetail429CreatePending` — seed with `A.start < B.start`. Pass 1: A detail → `ErrRateLimited`; B (family, ready) posted in the same pass. Assert: A row `pending`, B row `posted`, ONE post (only B), `last_polled_at` = A.start (HOLD — never advanced past the failed id). Pass 2: A detail ready → A posted, second post, `last_polled_at` = B.start (a genuine advance — the all-time seen semantics; A is settled, nothing pending).
+6. `TestStravaNeedsReauthPauseResume` — stub refresh → `ErrUnauthorized`; pass 1 → athlete row `needs_reauth = true`, cursor frozen, API call counters show no list calls for that athlete in passes 2–3. Re-auth: UPDATE the row (flag false, fresh token, stub refresh now succeeds) → pass 4 → A listed, posted exactly once, cursor resumes from the frozen value (the stub's `listFn` called with `after =` the frozen cursor; assert).
+7. `TestStrava401ListAbortsPreservesCursor` — pre-seed A as `pending` (retries 0). Pass with list → `ErrUnauthorized` → row `needs_reauth = true`; the per-athlete transaction is discarded: assert cursor unchanged, A row's `retries` unchanged (0), no post.
+8. `TestStravaNoTargetSkips` — athlete `target_thread_id NULL` + `StravaSharedThreadID = 0`: family activity → row `skipped`, ZERO captured posts (the counted one-line log: assert the row + no post; worry about log text separately).
+9. `TestStravaFirstEnable24hLookback` — `last_polled_at IS NULL`: `listFn` asserts the `after ≈ now-24h` window and returns A (start now-2h) → posted.
+10. `TestRunPollLoopExits` — `poll` seam `50ms`, `run` iterates once, `ctx` canceled → `RunPoll` returns `context.Canceled` (the loop's ctx discipline, the `gulag` shape).
+11. `TestStravaList429Hold` — list → `ErrRateLimited` → assert: cursor unchanged, zero `seen` rows, zero posts; next pass with a normal list (A ready) → A posted (the hold released cleanly, nothing double-posted).
+
+**Steps:**
+- [ ] Write `strava_integration_test.go` (setup + helper + the eleven tests).
+- [ ] Run `go test ./internal/handlers/strava/ -run "TestStrava|TestRunPollLoopExits" -count=1` WITHOUT `TUGBOT_TEST_DATABASE_URL` — did they self-skip cleanly (PG unreachable / the default URL)?
+- [ ] Run `make db-up`, then `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./internal/handlers/strava/` — did ALL eleven execute and pass (no skips under the override — a skip there is a missing override, not a legitimate result)?
+- [ ] Run the gate block + the full DB gate.
+- [ ] Commit with message: "strava: DB integration tests (post/seen/atomicity/reauth/429-pending/lookback/loop-exit)"
+
+**Acceptance criteria:**
+- [ ] No-env var: the eleven tests skip cleanly (no failures).
+- [ ] With the override + `-p 1 -count=1`: all eleven execute and pass.
+- [ ] The full DB gate (`./...` with the override) stays green.
+
+---
+
+### Task 6: Wire into main + selftest + docs
+
+**Context:**
+The last assembly seam: the `strava` handler joins the `handlers` struct + `newHandlers` + the errgroup (the exact pattern of the two `gulag` `eg.Go` blocks), "thirteen" → "fourteen" is 3 strings in `main.go` + 1 in `AGENTS.md` (there is NO numeric assertion — the selftest only constructs; the reword is all), and the house doc surface (`docs/features/strava.md` — a Go-origin feature, so NOT the Rust-parity checklist, the `derpies` precedent).
+
+**Files:**
+- Modify: `cmd/tugbot/main.go`
+- Modify: `AGENTS.md`
+- Modify: `.env.example`
+- Create: `docs/features/strava.md`
+
+**What to implement:**
+
+`cmd/tugbot/main.go` (five edit groups):
+1. Import `github.com/danielcherubini/tugbot/internal/handlers/strava`.
+2. `handlers` struct — add after the `derpies` field (~line 127): `strava *strava.Strava`.
+3. `newHandlers` — add after `derpies: derpies.New(a),`: `strava: strava.New(a),`.
+4. After the `gulag` VoteCheck `eg.Go` block (~line 521, before the MCP `eg.Go`), add EXACTLY:
+   ```go
+   eg.Go(func() error {
+   	if err := h.strava.RunPoll(egCtx); err != nil && !isContextErr(err) {
+   		slog.Error("strava poll loop terminated", "module", "main", "error", err)
+   	}
+   	return nil
+   })
+   ```
+5. The three "thirteen" rewords (`main.go:154` comment, `:241` flag help, `:314` selftest log string): "thirteen" → "fourteen" — all others.
+
+`AGENTS.md:28` — repair the quote fidelity while rewording (the current line quotes a shorter string than `:314` logs):
+```
+go run ./cmd/tugbot --selftest   # must log "selftest: Discord session and all fourteen handlers and the MCP server constructed", exit 0
+```
+Also in AGENTS.md: add `internal/handlers/strava` to the DB-touching test package enumeration (the `:20–22` list) — one word, keeping the doc honest.
+
+`.env.example` — append (following the file's existing comment style):
+```
+# --- strava (optional; the feature is flag-gated in the features table too) ---
+STRAVA_CLIENT_ID=
+STRAVA_CLIENT_SECRET=
+STRAVA_SHARED_THREAD_ID=
+STRAVA_POLL_MINUTES=
+```
+
+`docs/features/strava.md` — front-matter mirroring `docs/features/derpies.md` (`status: live`, `last-verified: <today>`, `verified-by: <the exact gate run of this task>`), sections: **Mechanics** (the 15-min loop; per-athlete: token refresh + rotated persistence, `after` cursor with pending-hold semantics, the `pending`/`posted`/`skipped` disposition, one transaction then post; first enable = 24h lookback; 5-cycle processing drop); **Setup** (register the app at strava.com/settings/api → `STRAVA_CLIENT_ID`/`STRAVA_CLIENT_SECRET`; >1 athlete: self-serve dashboard upgrade to 10, no review; per-athlete: one-time OAuth consent over a localhost redirect — the consent MUST be requested with scope `activity:read_all` (lesser scopes filter 'Only You'/private activities out of the list endpoint; the authorize URL must carry the `scope` parameter — show it in the doc) → ONE SQL insert, show the exact statement); **Re-auth** (401/invalid-grant → `needs_reauth = true`, cursor preserved; re-run the consent → show the exact UPDATE statement + flag clear); **Rate budget** (at ≤5 athletes the default 1,000 read req/day cap suffices; approaching 10 requires the self-serve upgrade to the 2,000/day cap; token refresh is EXPECTED not to count against the read budget — verify against Strava's current rate-limits doc at enable time); **Late-sync trade-off** (the declared miss case); **Removing an athlete** (ONE DELETE FROM strava_athletes → FK cascade); **Webhooks** (deferred, additive — the seen table absorbs duplicate events; the poll stays source of truth; revisit if sub-minute freshness is wanted).
+
+**Steps:**
+- [ ] Make the `main.go` edits (five groups) + the two `AGENTS.md` edits + the `.env.example` edits; write `docs/features/strava.md`.
+- [ ] Run `go build ./...` + `go vet ./...` + `gofmt -l .` (silent) + `make lint`.
+- [ ] Run `go test ./... -count=1` (no PG — the selftest is still built+constructed; the DB tests self-skip).
+- [ ] Run `make db-up`, then the full DB gate: `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` — did ALL packages pass?
+- [ ] Run `go run ./cmd/tugbot --selftest` — did it exit 0 and log EXACTLY `selftest: Discord session and all fourteen handlers and the MCP server constructed`?
+- [ ] Update `docs/features/strava.md`'s `verified-by` with this task's actual gate results (before committing).
+- [ ] Commit with message: "strava: wire the 14th handler (poll loop, selftest 'fourteen handlers', .env.example, feature doc)"
+
+**Acceptance criteria:**
+- [ ] `go run ./cmd/tugbot --selftest` logs the full "fourteen handlers and the MCP server" line, exit 0.
+- [ ] Full DB gate green (`-p 1 -count=1` with the override).
+- [ ] `gofmt -l .` silent; `make lint` green.
+- [ ] `AGENTS.md`'s selftest line quotes the same full string the binary logs.
+- [ ] `.env.example` documents all four optional vars.
