@@ -86,8 +86,10 @@ func (h *Derpies) editFlow(evt *discordgo.MessageUpdate) {
 		}
 		m = fetched
 	}
-	// 5. The full create flow (origin-agnostic; an edit costs at most one
-	//    list SELECT + one pi ask). The flow's own gates re-run on m —
-	//    idempotent and cheap; m already passed the event-level gates.
-	h.flow(m)
+	// 5. The full create flow with the single-slowmode gate EXCLUDED
+	//    (approved v1 rule: the gate watches MessageCreate only — edits
+	//    are judged normally, at most one ask per edit). The flow's own
+	//    gates re-run on m — idempotent and cheap; m already passed the
+	//    event-level gates.
+	h.flowGated(m, false)
 }

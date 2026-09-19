@@ -57,6 +57,12 @@ const (
 	// falls back to; the derpies_config seed row's value.
 	defaultThreshold = 50
 
+	// The single-slowmode gate (decision 0011): the 3rd+ single-token post by a
+	// gated author per channel within a rolling window is deleted before the fast
+	// path. V1 code constants — no dials, no config.
+	slowmodeMaxPosts = 2
+	slowmodeWindow   = 30 * time.Second
+
 	module = "derpies" // slog module tag
 )
 
@@ -91,6 +97,16 @@ type Derpies struct {
 	lastEdit map[string]time.Time
 	busy     map[string]bool
 	nickMu   sync.Mutex // guards the three maps (lastNick, lastEdit, busy)
+	// rateWindow — the single-slowmode gate's per-(author, channel) rolling
+	// window: timestamps of the gated author's pass-through single-token
+	// posts (COUNTS POSTS, NOT OUTCOMES — a fast-path-deleted single token
+	// still counts). Key: authorID + "|" + channelID (the lastNick key
+	// pattern). Lazily initialized (nil map → create, under rateMu); resets
+	// to empty on bot restart (accepted, decision 0011). The overflow arm
+	// writes the pruned window back (no stale entries accumulate); an empty
+	// key cannot persist (a pass-through always appends `now`).
+	rateWindow map[string][]time.Time
+	rateMu     sync.Mutex
 }
 
 // New builds the handler from the shared *app.App (mirrors the mention
@@ -1053,15 +1069,75 @@ func (h *Derpies) recordDecision(ctx context.Context, m *discordgo.Message, d *d
 
 // MessageCreate spawns the goroutine (the flow can block up to the pi
 // RPC's 300s ask deadline; the event thread is never held).
-// Burst amplification: there is no per-author coalescing or cooldown — N novel
-// posts from a filtered user yield N serialized pi asks (the pi RPC queue is shared with the mention handler); rate limiting is out of scope per the spec.
-func (h *Derpies) MessageCreate(m *discordgo.Message) { go h.flow(m) }
+// Burst amplification note (superseded for single-token posts, decision 0011):
+// the single-slowmode gate (step 3.4) deletes a gated author's 3rd+
+// single-token post per channel inside 30 s before the fast path (zero pi
+// asks). LONG posts (≥2 tokens) are still unthrottled — N novel long posts
+// still yield N serialized pi asks (the pi RPC queue is shared with the mention handler).
+func (h *Derpies) MessageCreate(m *discordgo.Message) { go h.flowGated(m, true) }
 
-// flow — the full message flow (gates → fast path → images → slow path →
-// learn/delete). The create and edit paths run the identical flow —
-// origin-agnostic; each post or edit costs at most one list SELECT + one
-// pi ask.
-func (h *Derpies) flow(m *discordgo.Message) {
+// flow — the MessageCreate entry: the full flow WITH the single-slowmode
+// gate. Existing tests call this; production MessageCreate (below) routes
+// through flowGated directly for the gate. The edit flow (edits.go) calls
+// flowGated directly with the gate OFF (approved rule: edits are out of
+// gate scope — the gate watches MessageCreate only).
+func (h *Derpies) flow(m *discordgo.Message) { h.flowGated(m, true) }
+
+// gateSlowmode — the single-slowmode check (S1): called after the
+// author-ID gate and BEFORE the decision-record defer. Returns true when
+// it deleted the post (the caller must return — no fast path, no slow
+// path, no pi ask). Ineligible (0-token or ≥2-token) posts fall through.
+// Overflow (≥ slowmodeMaxPosts recent, window = now.Sub(ts) <=
+// slowmodeWindow, inclusive) deletes via the ops seam (best-effort on
+// failure — logged; the row is still written) and records its OWN
+// path='slowmode' row. A pass-through appends its timestamp. REST + DB
+// writes happen AFTER the lock (the delete can block on a Discord 429;
+// do not hold rateMu across it).
+func (h *Derpies) gateSlowmode(ctx context.Context, m *discordgo.Message) bool {
+	if len(strings.Fields(m.Content)) != 1 {
+		return false
+	}
+	now := h.clock()
+	gated := false
+	h.rateMu.Lock()
+	if h.rateWindow == nil {
+		h.rateWindow = map[string][]time.Time{}
+	}
+	key := m.Author.ID + "|" + m.ChannelID
+	var kept []time.Time
+	for _, ts := range h.rateWindow[key] {
+		if now.Sub(ts) <= slowmodeWindow {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) >= slowmodeMaxPosts {
+		h.rateWindow[key] = kept // pruned write-back (the overflow doesn't append)
+		gated = true
+	} else {
+		h.rateWindow[key] = append(kept, now)
+	}
+	h.rateMu.Unlock()
+	if gated {
+		if err := h.ops.deleteMessage(m.ChannelID, m.ID); err != nil {
+			slog.Error("derpies gate delete failed", "module", module, "message", m.ID, "error", err)
+		}
+		h.recordDecision(ctx, m, &decisionRecord{
+			MessageID: m.ID, ChannelID: m.ChannelID, AuthorID: m.Author.ID,
+			Content: m.Content, Path: strPtr("slowmode"),
+			Learned: false, Deleted: true,
+		})
+	}
+	return gated
+}
+
+// flowGated — the full message flow (gates → [single-slowmode gate,
+// when slowmodeOn] → fast path → images → slow path → learn/delete).
+// Each post costs at most one list SELECT + one pi ask. The
+// MessageCreate entry (flow below) runs it with slowmodeOn=true; the
+// edit flow (edits.go) runs it with slowmodeOn=false — the gate is
+// the only flow element that differs between the two entries (approved
+// v1 rule: edits are out of gate scope).
+func (h *Derpies) flowGated(m *discordgo.Message, slowmodeOn bool) {
 	ctx := context.Background()
 
 	// 1. Feature gate (silent flavor).
@@ -1081,6 +1157,14 @@ func (h *Derpies) flow(m *discordgo.Message) {
 		return
 	}
 	slog.Info("derpies message from filtered user", "module", module, "user", m.Author.ID, "guild", m.GuildID)
+
+	// 3.4 Single-slowmode gate (decision 0011): the 3rd+ single-token post
+	// within 30 s is deleted here — before the fast path (zero pi asks,
+	// zero list fetch, zero image leg). A gate hit writes its own
+	// path='slowmode' row; the deferred "C" record below never fires.
+	if slowmodeOn && h.gateSlowmode(ctx, m) {
+		return
+	}
 
 	// The decision log (C): one defer for every terminal arm — the
 	// pointer is captured at defer-time, so the flow populates dec as it

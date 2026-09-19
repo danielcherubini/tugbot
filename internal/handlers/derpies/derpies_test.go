@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -186,6 +187,7 @@ func newTestDerpies(store *fakeStore, ops *fakeOps, pi app.PiBackend) *Derpies {
 		},
 		store: store,
 		ops:   ops,
+		clock: time.Now, // tests override with a pinned closure (the gate reads h.clock())
 	}
 }
 
