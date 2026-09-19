@@ -67,6 +67,7 @@ Sources: official Strava developer docs (authentication, webhooks, rate-limits, 
 
 **Activity data & dedupe:**
 - `type` is **deprecated in favor of `sport_type`** (adds `MountainBikeRide`, `GravelRide`, `TrailRun`, `VirtualRide`, …). Match the run/cycling families on `sport_type` with `type` fallback; optionally exclude `VirtualRide`/`VirtualRun`.
+- **Finished vs in-progress:** the docs-facing signal is `resource_state` (value `-1` → 'processing' — the official API reference's documented processing indicator; "if an activity is processing, wait a few seconds, then retry"). In-progress GPS sessions do not surface on `/athlete/activities` until saved/uploaded (inference from the documented upload/processing workflow; no explicit official statement).
 - **Build the link from `id`**: `https://www.strava.com/activities/<id>`. `url`/`pr_url` are absent from current official model specs (they exist in real-world responses) — don't depend on them.
 - Multiple webhook events can follow a single save (async attribute updates) → **dedupe on activity `id` in Postgres**, verify `sport_type` and non-processing state on first sight, treat update events on already-posted ids as no-ops.
 
@@ -110,5 +111,5 @@ Sources: official Strava developer docs (authentication, webhooks, rate-limits, 
 ## Gaps / What Remains Unknown
 
 - Refresh-token TTL is unlisted in current official docs (historical ~42-day/inactivity behavior from community). The per-cycle refresh loop neutralizes it; a long outage may require user re-auth.
-- `in_progress`, `url`, `pr_url` are absent from current official docs (documentation lag vs. real API responses). The design deliberately avoids depending on them.
+- `in_progress`, `url`, `pr_url` are absent from current official docs (documentation lag vs. real API responses). The design deliberately avoids depending on them; `resource_state == -1` remains the documented processing gate (see Activity data above).
 - Intermittent Strava 503/HTML responses reported in community — wrap API calls in retry-with-backoff.
