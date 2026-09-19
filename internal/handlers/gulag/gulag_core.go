@@ -62,6 +62,11 @@ type Gulag struct {
 	// handler uses Session.MessageReactions — see reaction.go).
 	reactionUserFetcher reactionUserFetcherFunc
 
+	// reactionEmojiRemover is the test seam for the vote handler's strip
+	// step — one MessageReactionsRemoveEmoji-style call per remaining
+	// :gulag: reaction (nil = the concrete session path; see loops.go).
+	reactionEmojiRemover func(channelID, messageID, emojiID string) error
+
 	// Test seams (mirroring the reactionUserFetcher convention): when set
 	// they substitute for the concrete surfaces; when nil, the Session /
 	// pool paths run unchanged (production).
@@ -102,6 +107,11 @@ type DiscordSurface interface {
 	GuildRoles(guildID string, options ...discordgo.RequestOption) ([]*discordgo.Role, error)
 	GuildMember(guildID, userID string, options ...discordgo.RequestOption) (*discordgo.Member, error)
 	GuildMemberRoleAdd(guildID, userID, roleID string, options ...discordgo.RequestOption) error
+	// ChannelMessage / ChannelMessageSend mirror the vendor signatures;
+	// they surface the vote handler's live-message fetch (the strip step)
+	// and the shared send-to-gulag post for test fakes.
+	ChannelMessage(channelID, messageID string, options ...discordgo.RequestOption) (*discordgo.Message, error)
+	ChannelMessageSend(channelID, content string, options ...discordgo.RequestOption) (*discordgo.Message, error)
 }
 
 // QueryExec is the DB surface the core's DB-backed methods talk to (the

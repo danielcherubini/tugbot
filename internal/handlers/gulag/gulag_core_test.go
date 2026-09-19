@@ -110,6 +110,12 @@ func (plainGoodSurface) GuildMember(string, string, ...discordgo.RequestOption) 
 func (plainGoodSurface) GuildMemberRoleAdd(string, string, string, ...discordgo.RequestOption) error {
 	return nil
 }
+func (plainGoodSurface) ChannelMessage(string, string, ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return &discordgo.Message{}, nil
+}
+func (plainGoodSurface) ChannelMessageSend(string, string, ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return &discordgo.Message{}, nil
+}
 
 // failingRowDB is a QueryExec whose QueryRow rows always error (the fail-all
 // shape; the select treats the non-NoRows error as "not in gulag" and the

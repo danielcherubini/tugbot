@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danielcherubini/tugbot/internal/db"
@@ -698,6 +700,12 @@ func (f *fakeGulagSurface) GuildMember(_ string, _ string, _ ...discordgo.Reques
 func (f *fakeGulagSurface) GuildMemberRoleAdd(_ string, _ string, _ string, _ ...discordgo.RequestOption) error {
 	return nil
 }
+func (f *fakeGulagSurface) ChannelMessage(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return &discordgo.Message{}, nil
+}
+func (f *fakeGulagSurface) ChannelMessageSend(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return &discordgo.Message{}, nil
+}
 
 // TestHandleGulagOptionValueShapes pins the raw option-value contract:
 // a USER option arrives as the user's snowflake string and an INTEGER
@@ -874,5 +882,195 @@ func commandInteraction(name string) *discordgo.Interaction {
 		GuildID: "1",
 		Member:  &discordgo.Member{User: &discordgo.User{ID: "1"}},
 		Data:    discordgo.ApplicationCommandInteractionData{Name: name},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Vote handler (gulag_check_handler) — unit path on the fake surfaces
+// ---------------------------------------------------------------------------
+
+// fakeVoteRow is a pgx.Row fake: a fixed RETURNING value (the job
+// status enum, the insert id) or a fixed error (the missing-row
+// shape of the IsUserInGulag select).
+type fakeVoteRow struct {
+	err    error
+	status db.JobStatus
+	id     int32
+}
+
+func (r *fakeVoteRow) Close() error { return nil }
+func (r *fakeVoteRow) Err() error   { return nil }
+func (r *fakeVoteRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	for _, d := range dest {
+		switch v := d.(type) {
+		case *db.JobStatus:
+			*v = r.status
+		case *int32:
+			*v = r.id
+		}
+	}
+	return nil
+}
+
+// voteFlowPool is a QueryExec fake for the unit path of the state
+// helpers (injected through the g.db seam; in this path the
+// production pool stays nil): the status-RETURNING statement yields
+// the fixed job status, the IsUserInGulag select reports a missing
+// row (fresh send_to_gulag branch), the INSERT … RETURNING id fills
+// an id, and the done transition's Exec captures the new total.
+type voteFlowPool struct {
+	returningStatus db.JobStatus
+	finalDoneTotal  int32
+	finalDoneCalls  int
+}
+
+func (p *voteFlowPool) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	switch {
+	case strings.Contains(sql, "RETURNING job_status"):
+		return &fakeVoteRow{status: p.returningStatus}
+	case strings.Contains(sql, "FROM gulag_users"):
+		return &fakeVoteRow{err: pgx.ErrNoRows}
+	case strings.Contains(sql, "RETURNING id"):
+		return &fakeVoteRow{id: 77}
+	default:
+		return &fakeVoteRow{err: fmt.Errorf("voteFlowPool: unhandled SELECT: %s", sql)}
+	}
+}
+
+func (p *voteFlowPool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "SET job_status = 'done'") && len(args) > 0 {
+		if total, ok := args[0].(int32); ok {
+			p.finalDoneTotal = total
+		}
+		p.finalDoneCalls++
+	}
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+
+// voteFlowSurface is a DiscordSurface for the unit path of the vote
+// handler: the strip step and the shared send path fetch the same
+// live message, the role/channel scans hit the fixtures, the member
+// fetch/role add succeed, and the send post is captured.
+type voteFlowSurface struct {
+	roles    []*discordgo.Role
+	channels []*discordgo.Channel
+	member   *discordgo.Member
+	msg      *discordgo.Message
+	sent     []string
+}
+
+func (f *voteFlowSurface) GuildChannels(_ string, _ ...discordgo.RequestOption) ([]*discordgo.Channel, error) {
+	return f.channels, nil
+}
+func (f *voteFlowSurface) GuildRoles(_ string, _ ...discordgo.RequestOption) ([]*discordgo.Role, error) {
+	return f.roles, nil
+}
+func (f *voteFlowSurface) GuildMember(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Member, error) {
+	return f.member, nil
+}
+func (f *voteFlowSurface) GuildMemberRoleAdd(_ string, _ string, _ string, _ ...discordgo.RequestOption) error {
+	return nil
+}
+func (f *voteFlowSurface) ChannelMessage(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return f.msg, nil
+}
+func (f *voteFlowSurface) ChannelMessageSend(_ string, content string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	f.sent = append(f.sent, content)
+	return f.msg, nil
+}
+
+// reactionFixture builds a MessageReactions fixture (the
+// Message.Reactions shape; the handler reads only the pointed Emoji).
+func reactionFixture(emoji *discordgo.Emoji, count int) *discordgo.MessageReactions {
+	return &discordgo.MessageReactions{Count: count, Emoji: emoji}
+}
+
+// TestGulagCheckHandler_StripsGulagReactionsAsNameID pins the full
+// vote-handler chain on the unit path (no REST, no real PG): the
+// running transition, the :gulag: strip step (Rust mod.rs:606-617),
+// the shared 300s send, and the done transition. Pins: the strip
+// call is emitted as the GUILD EMOJI IDENTIFIER `name:ID` (Emoji.
+// APIName — the same contract the fixed voter fetch enforces) for
+// BOTH the static and the animated :gulag: arm, NEVER the bare
+// snowflake ID (proven live 2026-09-19: the fixed fetch first
+// exposed this arm, and Discord rejected the bare-ID call with 10014
+// "Unknown Emoji"); a non-:gulag: emoji is never stripped; and the
+// done transition commits total = 0 + 8 = 8 exactly once.
+func TestGulagCheckHandler_StripsGulagReactionsAsNameID(t *testing.T) {
+	fixtureMsg := &discordgo.Message{
+		ID:        "1550950373064446154",
+		ChannelID: "1044752345583599626",
+		Reactions: []*discordgo.MessageReactions{
+			reactionFixture(&discordgo.Emoji{Name: "gulag", ID: "843909650931515445"}, 8),
+			reactionFixture(&discordgo.Emoji{Name: "fire"}, 1),
+			reactionFixture(&discordgo.Emoji{Name: "gulag", ID: "121212", Animated: true}, 2),
+		},
+	}
+	surface := &voteFlowSurface{
+		roles:    []*discordgo.Role{{ID: "999", Name: "gulag"}},
+		channels: []*discordgo.Channel{{ID: "900", Name: "the-gulag"}},
+		member:   &discordgo.Member{User: &discordgo.User{ID: "393984581747081226"}},
+		msg:      fixtureMsg,
+	}
+	pool := &voteFlowPool{returningStatus: db.JobStatusRunning}
+	var removed []string
+	g := &Gulag{
+		db:             pool,
+		discordSurface: surface,
+		reactionEmojiRemover: func(_, _, emoji string) error {
+			removed = append(removed, emoji)
+			return nil
+		},
+	}
+	err := g.gulagCheckHandler(context.Background(), &db.MessageVote{
+		MessageID:        1550950373064446154,
+		ChannelID:        1044752345583599626,
+		GuildID:          840674637808533605,
+		UserID:           393984581747081226,
+		TotalVoteTally:   0,
+		CurrentVoteTally: 8,
+		Voters:           []int64{1, 2, 3, 4, 5, 6, 7, 8},
+		JobStatus:        db.JobStatusCreated,
+	})
+	if err != nil {
+		t.Fatalf("gulagCheckHandler: %v", err)
+	}
+	want := []string{"gulag:843909650931515445", "gulag:121212"}
+	if len(removed) != len(want) {
+		t.Fatalf("removed = %v, want exactly %v (both :gulag: arms stripped, the non-:gulag: emoji untouched)", removed, want)
+	}
+	for i := range want {
+		if removed[i] != want[i] {
+			t.Fatalf("removed[%d] = %q, want %q (name:ID — NOT the bare snowflake ID)", i, removed[i], want[i])
+		}
+	}
+	if pool.finalDoneTotal != 8 || pool.finalDoneCalls != 1 {
+		t.Fatalf("done transition = total %d / calls %d, want exactly one commit of total 8 (0 + 8)", pool.finalDoneTotal, pool.finalDoneCalls)
+	}
+	if len(surface.sent) != 1 || !strings.HasPrefix(surface.sent[0], "Sending ") {
+		t.Fatalf("sent posts = %v, want exactly one shared send-path post", surface.sent)
+	}
+}
+
+// TestGulagCheckHandler_NonRunningStatusEndsWithoutSideEffects pins
+// the running-verify guard: when the status-RETURNING arm does not
+// return running, the handler ends with NO strip and NO send (the
+// vote stays for whoever owns it).
+func TestGulagCheckHandler_NonRunningStatusEndsWithoutSideEffects(t *testing.T) {
+	surface := &voteFlowSurface{
+		member: &discordgo.Member{User: &discordgo.User{ID: "1"}},
+	}
+	pool := &voteFlowPool{returningStatus: db.JobStatusCreated} // not running
+	g := &Gulag{db: pool, discordSurface: surface}
+	if err := g.gulagCheckHandler(context.Background(), &db.MessageVote{
+		MessageID: 6, ChannelID: 5, GuildID: 4, UserID: 3, JobStatus: db.JobStatusCreated,
+	}); err != nil {
+		t.Fatalf("gulagCheckHandler (non-running): %v", err)
+	}
+	if pool.finalDoneCalls != 0 {
+		t.Fatalf("non-running handler committed %d done transitions, want 0 (no side effects)", pool.finalDoneCalls)
 	}
 }

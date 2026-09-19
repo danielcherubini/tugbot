@@ -861,6 +861,17 @@ func (f *fakeCoreDiscord) GuildMemberRoleAdd(guildID, userID, roleID string, _ .
 	return f.roleAddErr
 }
 
+// The two channel-message surface methods are unused on the
+// auto-gulag path (the mention flow never reaches the shared
+// send-to-gulag message post); they error so a silent regression to
+// the concrete session is loud.
+func (f *fakeCoreDiscord) ChannelMessage(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return nil, errors.New("fakeCoreDiscord: ChannelMessage is not part of the mention auto-gulag path")
+}
+func (f *fakeCoreDiscord) ChannelMessageSend(_ string, _ string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	return nil, errors.New("fakeCoreDiscord: ChannelMessageSend is not part of the mention auto-gulag path")
+}
+
 // fakeCoreDB implements core.QueryExec: the gulag_users SELECT (the
 // IsUserInGulag lookup) reports a missing row (so the fresh send_to_gulag
 // branch runs); the INSERT ... RETURNING id fills id; the UPDATE animates

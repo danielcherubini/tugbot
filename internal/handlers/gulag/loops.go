@@ -183,20 +183,12 @@ func (g *Gulag) gulagCheckHandler(ctx context.Context, result *db.MessageVote) e
 	}
 	slog.Debug("Updated Gulag Vote Check Item to Running", "module", "gulag")
 
-	// Remove all gulag emoji's from the message (Rust lines 606-617).
 	channelID := strconv.FormatInt(result.ChannelID, 10)
 	messageID := strconv.FormatInt(result.MessageID, 10)
-	message, err := g.d.ChannelMessage(channelID, messageID)
-	if err != nil {
-		return fmt.Errorf("failed to get Message: %w", err)
-	}
-	for i := range message.Reactions {
-		r := message.Reactions[i]
-		if r.Emoji != nil && strings.Contains(reactionEmojiString(r.Emoji), ":gulag") {
-			if err := g.d.MessageReactionsRemoveEmoji(channelID, messageID, r.Emoji.ID); err != nil {
-				return fmt.Errorf("failed to delete reaction emoji: %w", err)
-			}
-		}
+
+	// Remove all gulag emoji's from the message (Rust lines 606-617).
+	if err := g.removeGulagReactions(ctx, channelID, messageID); err != nil {
+		return err
 	}
 
 	// Send to gulag and message (Rust lines 632-646).
@@ -213,19 +205,50 @@ func (g *Gulag) gulagCheckHandler(ctx context.Context, result *db.MessageVote) e
 	return nil
 }
 
+// removeGulagReactions ports the strip loop of gulag_check_handler
+// (Rust mod.rs:606-617): fetch the live message (context
+// "Failed to get Message"), then remove every reaction whose emoji
+// serialization contains ":gulag" (context "Failed to delete reaction
+// emoji"). The emoji argument is the same guild-emoji identifier
+// contract as the voter fetch (Rust's remove_reaction took the &Emoji
+// object; discordgo wants `name:ID` via Emoji.APIName) — a BARE
+// snowflake ID is rejected by Discord with 10014 "Unknown Emoji"
+// (proven live 2026-09-19 when the fixed voter fetch first exposed
+// this arm). Test seam: reactionEmojiRemover substitutes the per-emoji
+// REST call; when nil the concrete session path runs unchanged.
+func (g *Gulag) removeGulagReactions(ctx context.Context, channelID, messageID string) error {
+	message, err := g.discord().ChannelMessage(channelID, messageID)
+	if err != nil {
+		return fmt.Errorf("failed to get Message: %w", err)
+	}
+	remove := g.reactionEmojiRemover
+	if remove == nil {
+		remove = func(cid, mid, e string) error { return g.d.MessageReactionsRemoveEmoji(cid, mid, e) }
+	}
+	for i := range message.Reactions {
+		r := message.Reactions[i]
+		if r.Emoji != nil && strings.Contains(reactionEmojiString(r.Emoji), ":gulag") {
+			if err := remove(channelID, messageID, r.Emoji.APIName()); err != nil {
+				return fmt.Errorf("failed to delete reaction emoji: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // The 30s stale reset
 // ---------------------------------------------------------------------------
 
 func (g *Gulag) setJobStatus(ctx context.Context, messageID int64, status db.JobStatus) error {
-	_, err := g.pool.Exec(ctx,
+	_, err := g.query().Exec(ctx,
 		`UPDATE message_votes SET job_status = $1 WHERE message_id = $2`, status, messageID)
 	return err
 }
 
 func (g *Gulag) setJobStatusReturning(ctx context.Context, messageID int64, status db.JobStatus) (db.JobStatus, error) {
 	var s db.JobStatus
-	err := g.pool.QueryRow(ctx,
+	err := g.query().QueryRow(ctx,
 		`UPDATE message_votes SET job_status = $1 WHERE message_id = $2 RETURNING job_status`, status, messageID).
 		Scan(&s)
 	if err != nil {
@@ -239,7 +262,7 @@ func (g *Gulag) setJobStatusReturning(ctx context.Context, messageID int64, stat
 // return whether it ended done.
 func (g *Gulag) setMessageVoteDone(ctx context.Context, messageID int64) (bool, error) {
 	var s db.JobStatus
-	if err := g.pool.QueryRow(ctx,
+	if err := g.query().QueryRow(ctx,
 		`UPDATE message_votes SET job_status = 'done' WHERE message_id = $1 RETURNING job_status`, messageID).
 		Scan(&s); err != nil {
 		return false, err
@@ -250,7 +273,7 @@ func (g *Gulag) setMessageVoteDone(ctx context.Context, messageID int64) (bool, 
 // setMessageVoteFinalDone ports the done commit of gulag_check_handler
 // via the Task-1 sqlc shape (update_message_vote_final_done).
 func (g *Gulag) setMessageVoteFinalDone(ctx context.Context, messageID int64, newTotal int32) error {
-	_, err := g.pool.Exec(ctx,
+	_, err := g.query().Exec(ctx,
 		`UPDATE message_votes
 		 SET job_status = 'done',
 		     total_vote_tally = $1,
@@ -271,7 +294,7 @@ func (g *Gulag) resetStaleRunningVotes(ctx context.Context) {
 		lastStaleVoteResetAt.Store(now)
 		// Rust: .ok() — the reset UPDATE's failure is silently swallowed,
 		// no log arm.
-		_, _ = g.pool.Exec(ctx, staleRunningVoteResetSQL)
+		_, _ = g.query().Exec(ctx, staleRunningVoteResetSQL)
 	}
 }
 
@@ -339,12 +362,12 @@ func (g *Gulag) selectPendingGulagVotes(ctx context.Context) ([]db.MessageVote, 
 }
 
 func (g *Gulag) deleteGulagUser(ctx context.Context, id int32) error {
-	_, err := g.pool.Exec(ctx, deleteGulagUserSQL, id)
+	_, err := g.query().Exec(ctx, deleteGulagUserSQL, id)
 	return err
 }
 
 func (g *Gulag) setGulagUserNotInGulag(ctx context.Context, id int32) error {
-	_, err := g.pool.Exec(ctx, setGulagUserNotInGulagSQL, id)
+	_, err := g.query().Exec(ctx, setGulagUserNotInGulagSQL, id)
 	return err
 }
 
@@ -427,11 +450,11 @@ func (g *Gulag) sendToGulagAndMessage(ctx context.Context, guildID, userID, chan
 	}
 	channelIDStr := strconv.FormatInt(channelID, 10)
 	messageIDStr := strconv.FormatInt(messageID, 10)
-	msg, err := g.d.ChannelMessage(channelIDStr, messageIDStr)
+	msg, err := g.discord().ChannelMessage(channelIDStr, messageIDStr)
 	if err != nil {
 		return fmt.Errorf("failed to get message: %w", err)
 	}
-	mem, err := g.d.GuildMember(strconv.FormatInt(guildID, 10), strconv.FormatInt(userID, 10))
+	mem, err := g.discord().GuildMember(strconv.FormatInt(guildID, 10), strconv.FormatInt(userID, 10))
 	if err != nil || mem == nil || mem.User == nil {
 		return fmt.Errorf("failed to get guild member: %w", err)
 	}
@@ -448,7 +471,7 @@ func (g *Gulag) sendToGulagAndMessage(ctx context.Context, guildID, userID, chan
 
 	content := fmt.Sprintf("Sending %s to the Gulag for %d minutes because of %s, they have %d minutes remaining%s",
 		mem.User.Mention(), gulenLength/60, messageLink(strconv.FormatInt(guildID, 10), msg), gulenUser.GulagLength/60, userString)
-	if _, err := g.d.ChannelMessageSend(channel.ID, content); err != nil {
+	if _, err := g.discord().ChannelMessageSend(channel.ID, content); err != nil {
 		return fmt.Errorf("failed to send gulag message: %w", err)
 	}
 	return nil
