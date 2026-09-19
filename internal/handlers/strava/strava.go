@@ -167,10 +167,22 @@ func (s *Strava) iteration(ctx context.Context) error {
 	}
 	// per athlete, in order: a pass error logs + continues to the next athlete
 	// (the 401 class returns nil from the pass — abort for THIS athlete only).
+	// A list-endpoint 429 is different: Strava's 15-min rate window is
+	// APP-WIDE, so the remaining athletes are deferred to the next tick
+	// entirely — the 15-min ticker IS the backoff (no cursor change for any
+	// not-yet-processed athlete; they were simply never visited).
 	for i := range athletes {
-		if err := s.passForAthlete(ctx, &athletes[i]); err != nil {
-			slog.Error("strava pass failed for athlete", "module", "strava", "label", athletes[i].label, "error", err)
+		err := s.passForAthlete(ctx, &athletes[i])
+		if err == nil {
+			continue
 		}
+		var lrl *errListRateLimited
+		if errors.As(err, &lrl) {
+			slog.Info("strava list rate limited; aborting iteration; remaining athletes deferred to the next tick",
+				"module", "strava", "label", athletes[i].label, "retry_after", lrl.retryAfter)
+			break
+		}
+		slog.Error("strava pass failed for athlete", "module", "strava", "label", athletes[i].label, "error", err)
 	}
 	return nil
 }
@@ -214,9 +226,12 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 	if err != nil {
 		var erl ErrRateLimited
 		if errors.As(err, &erl) {
-			// NO cursor change; the 15-min ticker is the backoff.
-			slog.Info("strava list rate limited; cursor held", "module", "strava", "label", a.label, "retry_after", erl.RetryAfter)
-			return nil
+			// App-wide window (not per-athlete): signal the CALLER to abort the
+			// WHOLE iteration. This athlete's pass simply ends — no tx commit,
+			// cursor unchanged — and the remaining athletes' cursors are
+			// implicitly preserved (never visited); the 15-min ticker is the
+			// backoff.
+			return &errListRateLimited{retryAfter: erl.RetryAfter}
 		}
 		var eua ErrUnauthorized
 		if errors.As(err, &eua) {
@@ -416,6 +431,18 @@ func (s *Strava) abortReauth(ctx context.Context, a *athleteRow) error {
 		"module", "strava", "label", a.label, "hint", "re-run the consent and clear needs_reauth")
 	return nil
 }
+
+// errListRateLimited is the pass-error token for a list-endpoint 429: the
+// Strava 15-min rate window is APP-WIDE, so the entire iteration (not just
+// this athlete's pass) is aborted and the remaining athletes are deferred to
+// the next tick. Distinct from a DETAIL-endpoint 429, which is per-activity
+// and stays handled inside the pass (→ pending / retry increment) without
+// stopping the other athletes.
+type errListRateLimited struct {
+	retryAfter string
+}
+
+func (e *errListRateLimited) Error() string { return "strava list rate limited (app-wide window)" }
 
 // makePost resolves the target (already) and builds the post message; the
 // title branch composes noun = `"title" (distNoun)`.

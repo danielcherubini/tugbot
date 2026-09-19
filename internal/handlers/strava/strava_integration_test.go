@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +219,12 @@ func muTime(v time.Time) time.Time { return v.Truncate(time.Microsecond) }
 // lastPolledAt zero = NULL (the first-enable 24h lookback),
 // targetThreadID zero = NULL; returns the row id.
 func seedAthlete(t *testing.T, pool *pgxpool.Pool, targetThreadID int64, lastPolledAt time.Time, tokenExpiresIn time.Duration) int32 {
+	return seedAthlete2(t, pool, "Matt", 1, targetThreadID, lastPolledAt, tokenExpiresIn)
+}
+
+// seedAthlete2 is seedAthlete with an explicit label and strava_athlete_id
+// (for seeding multiple athletes in one test table reset).
+func seedAthlete2(t *testing.T, pool *pgxpool.Pool, label string, stravaAthleteID int64, targetThreadID int64, lastPolledAt time.Time, tokenExpiresIn time.Duration) int32 {
 	t.Helper()
 	now := time.Now().UTC()
 	var lastPolled any // zero time.Time encodes as an invalid timestamp; NULL for the first-enable lookback
@@ -230,12 +237,12 @@ func seedAthlete(t *testing.T, pool *pgxpool.Pool, targetThreadID int64, lastPol
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO strava_athletes (label, strava_athlete_id, access_token, refresh_token, token_expires_at, last_polled_at, target_thread_id)
-		 VALUES ($1, 1, 'tok', 'rtok', $2, $3, $4)`,
-		"Matt", now.Add(tokenExpiresIn), lastPolled, target); err != nil {
+		 VALUES ($1, $2, 'tok', 'rtok', $3, $4, $5)`,
+		label, stravaAthleteID, now.Add(tokenExpiresIn), lastPolled, target); err != nil {
 		t.Fatalf("seed athlete: %v", err)
 	}
 	var id int32
-	if err := pool.QueryRow(context.Background(), `SELECT id FROM strava_athletes WHERE strava_athlete_id = 1`).Scan(&id); err != nil {
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM strava_athletes WHERE strava_athlete_id = $1`, stravaAthleteID).Scan(&id); err != nil {
 		t.Fatalf("read athlete id: %v", err)
 	}
 	return id
@@ -808,5 +815,132 @@ func TestStravaList429Hold(t *testing.T) {
 	}
 	if len(caps.posts) != 1 {
 		t.Errorf("pass 2: captured %d posts, want exactly 1 (the hold released cleanly, no double-post)", len(caps.posts))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 12. list 429 -> abort the WHOLE iteration (the Strava rate window is
+//     app-wide, not per-athlete; the 15-min ticker IS the app-wide backoff)
+// ---------------------------------------------------------------------------
+
+// TestStravaList429AbortsIteration pins the app-wide 429 abort: A (first,
+// valid token, cursor W_A) hits a list-endpoint 429 and B (second, token
+// inside the 1h refresh lead — so a visit would have called the refresh seam —
+// cursor W_B) is NEVER visited: B's refreshFn and a second listFn call never
+// fire, and NEITHER cursor is touched. In pass 2 (clean list) both windows
+// proceed: each posts its activity exactly once, and the follow-up pass is
+// deduped (no double-post). The detail-endpoint 429->pending behavior is a
+// distinct per-activity path and is NOT affected by this abort.
+func TestStravaList429AbortsIteration(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	W_A := muTime(now.Add(-2 * time.Hour))
+	W_B := muTime(now.Add(-3 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute)) // inside A's window (after W_A)
+	startB := muTime(now.Add(-60 * time.Minute)) // inside B's window (after W_B)
+
+	aidA := seedAthlete2(t, pool, "AG", 1, 9001, W_A, 6*time.Hour)    // valid token: no refresh path
+	aidB := seedAthlete2(t, pool, "BG", 2, 9001, W_B, 30*time.Minute) // inside the 1h refresh lead
+	stub := &stubStrava{
+		listFn:    func(_ time.Time) ([]Summary, error) { return nil, ErrRateLimited{RetryAfter: "900"} },
+		refreshFn: func() error { return nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 9001)
+	ctx := context.Background()
+
+	// ---- pass 1: A's list 429 aborts the whole iteration ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 1 (429): %v (iteration must return nil; the errgroup never sees a 429 as fatal)", err)
+	}
+	if stub.listCalls != 1 {
+		t.Fatalf("pass 1: list calls = %d, want exactly 1 (a list 429 aborts the pass; B is never visited)", stub.listCalls)
+	}
+	if stub.refreshCalls != 0 {
+		t.Errorf("pass 1: refresh calls = %d, want 0 (visiting B's near-expiry token would call refresh; B was never visited)", stub.refreshCalls)
+	}
+	if got := cursorAt(t, pool, aidA); !got.Equal(W_A) {
+		t.Errorf("pass 1: A cursor = %v, want unchanged (%v)", got, W_A)
+	}
+	if got := cursorAt(t, pool, aidB); !got.Equal(W_B) {
+		t.Errorf("pass 1: B cursor = %v, want UNTOUCHED (%v) — B was never visited this pass", got, W_B)
+	}
+	if n := seenCount(t, pool, aidA) + seenCount(t, pool, aidB); n != 0 {
+		t.Errorf("pass 1: %d seen rows, want zero (a 429 pass commits no transaction for any athlete)", n)
+	}
+	if len(caps.posts) != 0 {
+		t.Errorf("pass 1: captured %d posts, want zero", len(caps.posts))
+	}
+
+	// ---- pass 2: clean list; both windows proceed, each posts exactly once ----
+	stub.listFn = func(after time.Time) ([]Summary, error) {
+		if after.Equal(W_A) {
+			return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
+		}
+		if after.Equal(W_B) {
+			return []Summary{{ID: 2, SportType: "Ride", StartDate: startB}}, nil
+		}
+		t.Errorf("pass 2: unexpected list after = %v (want W_A or W_B)", after)
+		return nil, nil
+	}
+	stub.detailFn = func(id int64) (Activity, error) {
+		switch id {
+		case 1:
+			return readyAct(1, startA, 42300), nil
+		case 2:
+			return readyAct(2, startB, 100050), nil
+		}
+		t.Errorf("pass 2: unexpected detail id = %d", id)
+		return Activity{}, nil
+	}
+
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 2 (clean): %v", err)
+	}
+	posts := caps.byThread("9001")
+	if len(posts) != 2 {
+		t.Fatalf("pass 2: captured %d posts on 9001, want exactly 2 (one per athlete)", len(posts))
+	}
+	var gotA, gotB bool
+	for _, p := range posts {
+		switch {
+		case strings.Contains(p.msg, "activities/1"):
+			gotA = true
+		case strings.Contains(p.msg, "activities/2"):
+			gotB = true
+		}
+	}
+	if !gotA || !gotB {
+		t.Errorf("pass 2: posts = %v, want one containing activities/1 and one containing activities/2 (each posted exactly once)", posts)
+	}
+	if got := cursorAt(t, pool, aidA); !got.Equal(startA) {
+		t.Errorf("pass 2: A cursor = %v, want advanced to %v", got, startA)
+	}
+	if got := cursorAt(t, pool, aidB); !got.Equal(startB) {
+		t.Errorf("pass 2: B cursor = %v, want advanced to %v", got, startB)
+	}
+	if status, _ := seenRow(t, pool, aidA, 1); status != statusPosted {
+		t.Errorf("pass 2: A row = %q, want posted", status)
+	}
+	if status, _ := seenRow(t, pool, aidB, 2); status != statusPosted {
+		t.Errorf("pass 2: B row = %q, want posted", status)
+	}
+
+	// ---- pass 3: the held windows close over already-seen ids: deduped, no
+	// double-post ----
+	stub.listFn = func(after time.Time) ([]Summary, error) {
+		if after.Equal(startA) || after.Equal(startB) {
+			return []Summary{}, nil // everything in the window is already seen
+		}
+		t.Errorf("pass 3: unexpected list after = %v (want startA or startB)", after)
+		return nil, nil
+	}
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 3 (dedupe): %v", err)
+	}
+	if n := len(caps.posts); n != 2 {
+		t.Errorf("pass 3: captured %d total posts, want still 2 (deduped — no double-post)", n)
+	}
+	if n := seenCount(t, pool, aidA) + seenCount(t, pool, aidB); n != 2 {
+		t.Errorf("pass 3: %d seen rows, want 2 (one per athlete, no new rows)", n)
 	}
 }
