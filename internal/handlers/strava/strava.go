@@ -366,8 +366,8 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 			`UPDATE strava_seen_activities
 			   SET status = COALESCE(NULLIF($2, ''), status),
 			       retries = COALESCE($3, retries)
-			   WHERE strava_athletes_id = $1 AND strava_activity_id = $2`,
-			a.id, up.status, up.retries); err != nil {
+			   WHERE strava_athletes_id = $1 AND strava_activity_id = $4`,
+			a.id, up.status, up.retries, up.activityID); err != nil {
 			return err
 		}
 	}
