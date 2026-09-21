@@ -11,6 +11,8 @@ package strava
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -119,14 +121,18 @@ func setupStravaTestDB(t *testing.T) *pgxpool.Pool {
 // call counters + the `after` values observed by the list seam — the cursor
 // assertions).
 type stubStrava struct {
-	mu           sync.Mutex
-	listFn       func(after time.Time) ([]Summary, error)
-	detailFn     func(id int64) (Activity, error)
-	refreshFn    func() error
-	listCalls    int
-	detailCalls  int
-	refreshCalls int
-	listAfters   []time.Time
+	mu            sync.Mutex
+	listFn        func(after time.Time) ([]Summary, error)
+	detailFn      func(id int64) (Activity, error)
+	refreshFn     func() error
+	listCalls     int
+	detailCalls   int
+	refreshCalls  int
+	listAfters    []time.Time
+	athleteFn     func() (Athlete, error)
+	athleteCalls  int
+	exchangeFn    func() (string, string, time.Time, string, error)
+	exchangeCalls int
 }
 
 func (s *stubStrava) ListActivities(_ context.Context, _ string, after time.Time) ([]Summary, error) {
@@ -164,6 +170,28 @@ func (s *stubStrava) RefreshToken(_ context.Context, _, _, _ string) (string, st
 		return "", "", time.Time{}, err
 	}
 	return "tok2", "rtok2", time.Now().UTC().Add(6 * time.Hour), nil
+}
+
+func (s *stubStrava) GetAthlete(_ context.Context, _ string) (Athlete, error) {
+	s.mu.Lock()
+	s.athleteCalls++
+	fn := s.athleteFn
+	s.mu.Unlock()
+	if fn == nil {
+		return Athlete{}, nil
+	}
+	return fn()
+}
+
+func (s *stubStrava) ExchangeCode(_ context.Context, _, _, _ string) (string, string, time.Time, string, error) {
+	s.mu.Lock()
+	s.exchangeCalls++
+	fn := s.exchangeFn
+	s.mu.Unlock()
+	if fn == nil {
+		return "canned-access", "canned-refresh", time.Now().UTC().Add(6 * time.Hour), "read activity:read_all", nil
+	}
+	return fn()
 }
 
 // capturedPost is one recorded call to the sendFn seam.
@@ -1371,5 +1399,459 @@ func TestStravaCommandUnparsableChannelID(t *testing.T) {
 	}
 	if n := onboardingRowCount(t, pool); n != 0 {
 		t.Errorf("onboarding rows = %d, want zero", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding callback (task 6): the :8643 in-process flow against a real PG
+// with a stubbed StravaAPI and a capturing sendFn.
+// ---------------------------------------------------------------------------
+
+// seedOnboarding inserts one strava_onboardings row (label nil = NULL
+// column; expiresAt controls the TTL branch).
+func seedOnboarding(t *testing.T, pool *pgxpool.Pool, state string, threadID int64, label *string, status string, expiresAt time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO strava_onboardings (state, thread_id, label, status, created_at, expires_at)
+		 VALUES ($1, $2, $3, $4, now(), $5)`,
+		state, threadID, label, status, expiresAt); err != nil {
+		t.Fatalf("seed onboarding: %v", err)
+	}
+}
+
+// onboardingStatus reads the onboarding row's status (ok=false when the row
+// is gone — the expired-delete assertion).
+func onboardingStatus(t *testing.T, pool *pgxpool.Pool, state string) (string, bool) {
+	t.Helper()
+	var s string
+	err := pool.QueryRow(context.Background(), `SELECT status FROM strava_onboardings WHERE state = $1`, state).Scan(&s)
+	if err != nil {
+		var n int
+		if e := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_onboardings WHERE state = $1`, state).Scan(&n); e == nil && n == 0 {
+			return "", false
+		}
+		t.Fatalf("read onboarding status: %v", err)
+	}
+	return s, true
+}
+
+// athleteRowState reads one strava_athletes row by strava_athlete_id
+// (targetThread zero = NULL column; ok=false when the row is absent).
+func athleteRowState(t *testing.T, pool *pgxpool.Pool, stravaAthleteID int64) (label, access, refresh string, targetThread int64, needsReauth bool, ok bool) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(),
+		`SELECT label, access_token, refresh_token, COALESCE(target_thread_id, 0), needs_reauth
+		 FROM strava_athletes WHERE strava_athlete_id = $1`, stravaAthleteID).
+		Scan(&label, &access, &refresh, &targetThread, &needsReauth)
+	if err != nil {
+		var n int
+		if e := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes WHERE strava_athlete_id = $1`, stravaAthleteID).Scan(&n); e == nil && n == 0 {
+			return "", "", "", 0, false, false
+		}
+		t.Fatalf("read athlete row: %v", err)
+	}
+	return label, access, refresh, targetThread, needsReauth, true
+}
+
+// doCallback drives one request through a fresh OnboardingHandler (fresh
+// closure-local throttle state per call — no cross-request budgeting).
+func doCallback(t *testing.T, s *Strava, method, url string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(method, url, nil)
+	rec := httptest.NewRecorder()
+	s.OnboardingHandler().ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+// seedExistingAthlete inserts a strava_athletes row with an explicit
+// needs_reauth flag (the re-consent upsert setup).
+func seedExistingAthlete(t *testing.T, pool *pgxpool.Pool, label string, stravaAthleteID int64, targetThreadID int64, needsReauth bool) {
+	t.Helper()
+	now := time.Now().UTC()
+	var target any
+	if targetThreadID != 0 {
+		target = targetThreadID
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO strava_athletes (label, strava_athlete_id, access_token, refresh_token, token_expires_at, target_thread_id, needs_reauth)
+		 VALUES ($1, $2, 'old-access', 'old-refresh', $3, $4, $5)`,
+		label, stravaAthleteID, now.Add(6*time.Hour), target, needsReauth); err != nil {
+		t.Fatalf("seed existing athlete: %v", err)
+	}
+}
+
+// TestOnboardingHappyPath pins the happy path: 200 "Matt is set up", the
+// athlete row (label resolved from the first name — the row label was NULL,
+// the canned tokens, needs_reauth false, the onboarding thread), the
+// onboarding row 'done', and the captured confirm on the athlete's thread.
+func TestOnboardingHappyPath(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt", Username: "matt"}, nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", code, body)
+	}
+	if !strings.Contains(body, "Matt is set up") {
+		t.Errorf("body = %q, want it to contain \"Matt is set up\"", body)
+	}
+	label, access, refresh, target, needsReauth, ok := athleteRowState(t, pool, 31337)
+	if !ok {
+		t.Fatalf("no strava_athletes row")
+	}
+	if label != "Matt" {
+		t.Errorf("label = %q, want \"Matt\" (resolved from the first name — the row label was NULL)", label)
+	}
+	if access != "canned-access" || refresh != "canned-refresh" {
+		t.Errorf("tokens = (%q, %q), want the canned exchange values", access, refresh)
+	}
+	if needsReauth {
+		t.Errorf("needs_reauth = true, want false")
+	}
+	if target != 999000111222 {
+		t.Errorf("target_thread_id = %d, want 999000111222", target)
+	}
+	if status, _ := onboardingStatus(t, pool, state); status != "done" {
+		t.Errorf("onboarding status = %q, want \"done\"", status)
+	}
+	sent := caps.byThread("999000111222")
+	if len(sent) != 1 {
+		t.Fatalf("captured %d posts on the thread, want exactly 1", len(sent))
+	}
+	const want = "✅ Matt is now tracked — finished runs and rides will post here."
+	if sent[0].msg != want {
+		t.Errorf("confirm = %q, want %q", sent[0].msg, want)
+	}
+}
+
+// TestOnboardingExplicitLabel pins the explicit-command-label override: the
+// onboarding row's label wins over the athlete's first name.
+func TestOnboardingExplicitLabel(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6"
+	label := "M"
+	seedOnboarding(t, pool, state, 999000111222, &label, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt", Username: "matt"}, nil },
+	}
+	s, _ := newTestStrava(t, pool, stub, 0)
+
+	code, _ := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if label, _, _, _, _, ok := athleteRowState(t, pool, 31337); !ok || label != "M" {
+		t.Errorf("label = %q (ok=%v), want \"M\" (the command label wins over the first name)", label, ok)
+	}
+}
+
+// TestOnboardingUnknownState pins the no-row 404 (and that nothing was
+// upserted).
+func TestOnboardingUnknownState(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt"}, nil },
+	}
+	s, _ := newTestStrava(t, pool, stub, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state=deadbeef")
+	if code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", code)
+	}
+	if !strings.Contains(body, "unknown or expired link") {
+		t.Errorf("body = %q, want it to contain \"unknown or expired link\"", body)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingDenialRedirect pins Strava's Decline redirect: 200 "consent
+// was not granted", NO failed mark (the pending row is left as-is — a
+// denial is not a flow failure; the row expires harmlessly).
+func TestOnboardingDenialRedirect(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?error=access_denied")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if !strings.Contains(body, "consent was not granted") {
+		t.Errorf("body = %q, want it to contain \"consent was not granted\"", body)
+	}
+	if status, ok := onboardingStatus(t, pool, state); !ok || status != "pending" {
+		t.Errorf("onboarding status = %q (ok=%v), want \"pending\" (NO failed mark)", status, ok)
+	}
+}
+
+// TestOnboardingExpiredState pins the expired-row delete: 404 "expired", the
+// onboarding row DELETED, no athlete row.
+func TestOnboardingExpiredState(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(-time.Hour))
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", code)
+	}
+	if !strings.Contains(body, "expired") {
+		t.Errorf("body = %q, want it to contain \"expired\"", body)
+	}
+	if _, ok := onboardingStatus(t, pool, state); ok {
+		t.Errorf("onboarding row still present, want it deleted")
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingAlreadyUsedState pins the non-pending 409 (and that nothing
+// was upserted).
+func TestOnboardingAlreadyUsedState(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6"
+	seedOnboarding(t, pool, state, 999000111222, nil, "done", time.Now().UTC().Add(time.Hour))
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", code)
+	}
+	if !strings.Contains(body, "already used") {
+		t.Errorf("body = %q, want it to contain \"already used\"", body)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingExchangeFailed pins the exchange-failure branch: 400
+// "authorization failed", the row 'failed', no athlete row.
+func TestOnboardingExchangeFailed(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		exchangeFn: func() (string, string, time.Time, string, error) { return "", "", time.Time{}, "", ErrInvalidCode },
+	}
+	s, _ := newTestStrava(t, pool, stub, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if !strings.Contains(body, "authorization failed") {
+		t.Errorf("body = %q, want it to contain \"authorization failed\"", body)
+	}
+	if status, _ := onboardingStatus(t, pool, state); status != "failed" {
+		t.Errorf("onboarding status = %q, want \"failed\"", status)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingScopeMissing pins the scope-check branch: the exchange
+// succeeds with scope "read" (no activity:read_all) → 400 "activity:read_all",
+// the row 'failed', NO athlete row, and GetAthlete is NEVER reached.
+func TestOnboardingScopeMissing(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		exchangeFn: func() (string, string, time.Time, string, error) {
+			return "a", "r", time.Now().UTC().Add(6 * time.Hour), "read", nil
+		},
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt"}, nil },
+	}
+	s, _ := newTestStrava(t, pool, stub, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if !strings.Contains(body, "activity:read_all") {
+		t.Errorf("body = %q, want it to contain \"activity:read_all\"", body)
+	}
+	if stub.athleteCalls != 0 {
+		t.Errorf("GetAthlete calls = %d, want 0 (the scope check must precede the fetch)", stub.athleteCalls)
+	}
+	if status, _ := onboardingStatus(t, pool, state); status != "failed" {
+		t.Errorf("onboarding status = %q, want \"failed\"", status)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingAthleteFetchFailed pins the athlete-fetch-failure branch:
+// 400 "could not load the athlete profile", the row 'failed', no athlete row.
+func TestOnboardingAthleteFetchFailed(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{}, errors.New("fetch failed") },
+	}
+	s, _ := newTestStrava(t, pool, stub, 0)
+
+	code, body := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if !strings.Contains(body, "could not load the athlete profile") {
+		t.Errorf("body = %q, want it to contain \"could not load the athlete profile\"", body)
+	}
+	if status, _ := onboardingStatus(t, pool, state); status != "failed" {
+		t.Errorf("onboarding status = %q, want \"failed\"", status)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("athlete rows = %d, want zero", n)
+	}
+}
+
+// TestOnboardingExistingAthleteUpsert pins the re-consent edge case: an
+// EXISTING athlete with an omitted (NULL) onboarding label → the stored
+// label is PRESERVED, the thread moves to the newest, needs_reauth is
+// cleared, the tokens are replaced, and the confirm is the refresh variant.
+func TestOnboardingExistingAthleteUpsert(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9"
+	seedExistingAthlete(t, pool, "OldName", 31337, 111, true)
+	seedOnboarding(t, pool, state, 222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt"}, nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+
+	code, _ := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	label, access, refresh, target, needsReauth, ok := athleteRowState(t, pool, 31337)
+	if !ok {
+		t.Fatalf("no strava_athletes row")
+	}
+	if label != "OldName" {
+		t.Errorf("label = %q, want \"OldName\" (PRESERVED — the onboarding label was NULL: the spec's edge case)", label)
+	}
+	if target != 222 {
+		t.Errorf("target_thread_id = %d, want 222 (moved to the newest)", target)
+	}
+	if needsReauth {
+		t.Errorf("needs_reauth = true, want false")
+	}
+	if access != "canned-access" || refresh != "canned-refresh" {
+		t.Errorf("tokens = (%q, %q), want the new canned exchange values", access, refresh)
+	}
+	sent := caps.byThread("222")
+	if len(sent) != 1 {
+		t.Fatalf("captured %d posts on 222, want exactly 1", len(sent))
+	}
+	const want = "🔄 OldName's Strava authorization was refreshed."
+	if sent[0].msg != want {
+		t.Errorf("confirm = %q, want %q", sent[0].msg, want)
+	}
+}
+
+// TestOnboardingExistingAthleteExplicitLabelOverrides pins the explicit
+// command label overriding the stored label on a re-consent.
+func TestOnboardingExistingAthleteExplicitLabelOverrides(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0"
+	seedExistingAthlete(t, pool, "OldName", 31337, 111, true)
+	label := "New"
+	seedOnboarding(t, pool, state, 222, &label, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt"}, nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+
+	code, _ := doCallback(t, s, http.MethodGet, "/strava/callback?code=c1&state="+state)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if label, _, _, _, _, ok := athleteRowState(t, pool, 31337); !ok || label != "New" {
+		t.Errorf("label = %q (ok=%v), want \"New\" (the explicit command label overrides the stored one)", label, ok)
+	}
+	sent := caps.byThread("222")
+	if len(sent) != 1 {
+		t.Fatalf("captured %d posts on 222, want exactly 1", len(sent))
+	}
+	const want = "🔄 New's Strava authorization was refreshed."
+	if sent[0].msg != want {
+		t.Errorf("confirm = %q, want %q", sent[0].msg, want)
+	}
+}
+
+// TestOnboardingWrongRoute pins the route guard: GET / and POST
+// /strava/callback both 404.
+func TestOnboardingWrongRoute(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, nil, 0)
+
+	if code, _ := doCallback(t, s, http.MethodGet, "/"); code != http.StatusNotFound {
+		t.Errorf("GET / status = %d, want 404", code)
+	}
+	if code, _ := doCallback(t, s, http.MethodPost, "/strava/callback"); code != http.StatusNotFound {
+		t.Errorf("POST /strava/callback status = %d, want 404", code)
+	}
+}
+
+// TestOnboardingTickCleanup pins the per-tick hygiene: the expired
+// onboarding row is deleted by iteration (BEFORE the flag check — the flag
+// state doesn't matter; it's left as-is here), the live row remains.
+func TestOnboardingTickCleanup(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const (
+		expiredState = "e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1"
+		liveState    = "f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2"
+	)
+	seedOnboarding(t, pool, expiredState, 111, nil, "pending", time.Now().UTC().Add(-time.Hour))
+	seedOnboarding(t, pool, liveState, 222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+
+	if err := s.iteration(context.Background()); err != nil {
+		t.Fatalf("iteration: %v", err)
+	}
+	if _, ok := onboardingStatus(t, pool, expiredState); ok {
+		t.Errorf("expired onboarding row still present, want it deleted")
+	}
+	if _, ok := onboardingStatus(t, pool, liveState); !ok {
+		t.Errorf("live onboarding row deleted, want it to remain")
 	}
 }

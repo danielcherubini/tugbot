@@ -314,7 +314,15 @@ func runSelftest() int {
 		slog.Error("Failed to construct MCP server", "module", "main")
 		return 1
 	}
-	slog.Info("selftest: Discord session and all fourteen handlers and the MCP server constructed", "module", "main")
+	// The onboarding callback is CONSTRUCTED (its handler's construction
+	// step); Start is NOT called here — production wiring is the
+	// errgroup arm. The check mirrors the mcpSrv == nil check (kept for
+	// symmetry).
+	if h.strava.OnboardingHandler() == nil {
+		slog.Error("Failed to construct the strava onboarding callback", "module", "main")
+		return 1
+	}
+	slog.Info("selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback constructed", "module", "main")
 	return 0
 }
 
@@ -540,6 +548,22 @@ func run() {
 			// Start returns nil on clean ctx-cancel; anything else is a
 			// startup-failure class (port-in-use, etc.)
 			slog.Error("MCP server failed to start and bind port", "module", "main", "error", err)
+			os.Exit(1)
+		}
+		return nil
+	})
+
+	// Strava onboarding callback (decision 0012): Start blocks until the
+	// ctx cancels and returns nil on a clean cancel (the mcp.Server.Start
+	// template), so eg.Wait() stays clean on SIGTERM. Anything else is the
+	// startup-failure class (port-in-use and friends) — that must be
+	// FATAL (slog.Error + os.Exit(1)), NOT degenerate into the SIGTERM
+	// slog.Warn path (which would swallow the bind failure and continue).
+	eg.Go(func() error {
+		if err := h.strava.Start(egCtx); err != nil {
+			// Start returns nil on clean ctx-cancel; anything else is a
+			// startup-failure class (port-in-use, etc.)
+			slog.Error("strava onboarding listener failed to start and bind port", "module", "main", "error", err)
 			os.Exit(1)
 		}
 		return nil

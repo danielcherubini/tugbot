@@ -3,6 +3,8 @@ package strava
 import (
 	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -309,5 +311,82 @@ func TestSetupCommandShape(t *testing.T) {
 	}
 	if o.Required {
 		t.Errorf("option Required = true, want false")
+	}
+}
+
+// TestScopeHasReadAll pins the exact-FIELD scope check (whitespace-split; a
+// field must equal "activity:read_all" — NOT a substring match).
+func TestScopeHasReadAll(t *testing.T) {
+	cases := []struct {
+		scope string
+		want  bool
+	}{
+		{"activity:read_all read", true},
+		{"read", false},
+		{"", false},
+		{"activity:read_all", true},
+		{"activity:read_allx read", false},
+	}
+	for _, c := range cases {
+		t.Run(c.scope, func(t *testing.T) {
+			if got := scopeHasReadAll(c.scope); got != c.want {
+				t.Errorf("scopeHasReadAll(%q) = %v, want %v", c.scope, got, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveLabel pins the display/fallback resolution: the first non-empty
+// of (rowLabel, existingLabel, firstname, username), else "Athlete". An
+// explicit label wins over everything; an omitted label preserves the stored
+// label for an existing athlete; a new athlete falls to first name → username
+// → "Athlete".
+func TestResolveLabel(t *testing.T) {
+	cases := []struct {
+		name      string
+		rowLabel  string
+		existing  string
+		firstname string
+		username  string
+		want      string
+	}{
+		{"explicit wins over everything", "Sam", "OldName", "Daniel", "daniel", "Sam"},
+		{"omitted → stored label preserved", "", "OldName", "Daniel", "daniel", "OldName"},
+		{"new athlete → first name", "", "", "Daniel", "daniel", "Daniel"},
+		{"new athlete, empty first name → username", "", "", "", "daniel", "daniel"},
+		{"all empty → Athlete", "", "", "", "", "Athlete"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolveLabel(c.rowLabel, c.existing, c.firstname, c.username); got != c.want {
+				t.Errorf("resolveLabel(%q, %q, %q, %q) = %q, want %q", c.rowLabel, c.existing, c.firstname, c.username, got, c.want)
+			}
+		})
+	}
+}
+
+// TestOnboardingThrottle pins the throttle's edge semantics with a BARE
+// handler (no app, no pool — the throttle state is closure-local to
+// OnboardingHandler and fires at the request edge before any app/pool
+// access): 10 requests from one client pass (any status, but not 429), the
+// 11th gets 429. Key = the X-Forwarded-For first hop, falling back to
+// RemoteAddr when the header is absent (absent here — the specified keying).
+func TestOnboardingThrottle(t *testing.T) {
+	s := &Strava{}
+	h := s.OnboardingHandler()
+	doReq := func() int {
+		req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
+		req.RemoteAddr = "1.2.3.4:9999"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < 10; i++ {
+		if code := doReq(); code == http.StatusTooManyRequests {
+			t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+		}
+	}
+	if code := doReq(); code != http.StatusTooManyRequests {
+		t.Fatalf("request 11 got %d, want 429", code)
 	}
 }

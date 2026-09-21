@@ -460,3 +460,173 @@ func TestRefreshTokenRotation(t *testing.T) {
 		t.Errorf("refresh_token = %q, want \"rt_old\"", gotValues["refresh_token"])
 	}
 }
+
+func TestGetAthlete(t *testing.T) {
+	var (
+		gotAuth  string
+		gotPath  string
+		gotQuery string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		if r.URL.Path != "/api/v3/athlete" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":        2703661,
+			"firstname": "Daniel",
+			"lastname":  "Cherubini",
+			"username":  "danielcherubini",
+		})
+	}))
+	defer srv.Close()
+
+	t.Run("200 decodes the athlete struct", func(t *testing.T) {
+		c := &stravaClient{base: srv.URL}
+		a, err := c.GetAthlete(context.Background(), "tok")
+		if err != nil {
+			t.Fatalf("GetAthlete: %v", err)
+		}
+		if a.ID != 2703661 {
+			t.Errorf("ID = %d, want 2703661", a.ID)
+		}
+		if a.Firstname != "Daniel" {
+			t.Errorf("Firstname = %q, want \"Daniel\"", a.Firstname)
+		}
+		if a.Lastname != "Cherubini" {
+			t.Errorf("Lastname = %q, want \"Cherubini\"", a.Lastname)
+		}
+		if a.Username != "danielcherubini" {
+			t.Errorf("Username = %q, want \"danielcherubini\"", a.Username)
+		}
+		if gotPath != "/api/v3/athlete" {
+			t.Errorf("path = %s, want /api/v3/athlete", gotPath)
+		}
+		if gotQuery != "" {
+			t.Errorf("query = %q, want empty", gotQuery)
+		}
+		if gotAuth != "Bearer tok" {
+			t.Errorf("Authorization = %q, want \"Bearer tok\"", gotAuth)
+		}
+	})
+
+	t.Run("401 maps to ErrUnauthorized", func(t *testing.T) {
+		srv401 := statusServer(t, http.StatusUnauthorized, nil)
+		defer srv401.Close()
+		c := &stravaClient{base: srv401.URL}
+		_, err := c.GetAthlete(context.Background(), "tok")
+		var u ErrUnauthorized
+		if !errors.As(err, &u) {
+			t.Fatalf("want ErrUnauthorized, got %v", err)
+		}
+	})
+
+	t.Run("404 maps to ErrGone", func(t *testing.T) {
+		srv404 := statusServer(t, http.StatusNotFound, nil)
+		defer srv404.Close()
+		c := &stravaClient{base: srv404.URL}
+		_, err := c.GetAthlete(context.Background(), "tok")
+		var g ErrGone
+		if !errors.As(err, &g) {
+			t.Fatalf("want ErrGone, got %v", err)
+		}
+	})
+}
+
+func TestExchangeCode(t *testing.T) {
+	const epoch = 1789864896
+
+	var (
+		gotMethod  string
+		gotPath    string
+		gotValues  map[string]string
+		gotContent string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContent = r.Header.Get("Content-Type")
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		gotValues = map[string]string{
+			"client_id":     r.PostForm.Get("client_id"),
+			"client_secret": r.PostForm.Get("client_secret"),
+			"grant_type":    r.PostForm.Get("grant_type"),
+			"code":          r.PostForm.Get("code"),
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "a",
+			"refresh_token": "r",
+			"expires_at":    float64(epoch),
+			"scope":         "read activity:read_all",
+		})
+	}))
+	defer srv.Close()
+
+	t.Run("200 returns all five values", func(t *testing.T) {
+		c := &stravaClient{base: srv.URL}
+		at, rt, exp, scope, err := c.ExchangeCode(context.Background(), "cid", "sec", "code123")
+		if err != nil {
+			t.Fatalf("ExchangeCode: %v", err)
+		}
+		if at != "a" {
+			t.Errorf("accessToken = %q, want \"a\"", at)
+		}
+		if rt != "r" {
+			t.Errorf("refreshToken = %q, want \"r\"", rt)
+		}
+		if !exp.Equal(time.Unix(epoch, 0)) {
+			t.Errorf("expiresAt = %v, want %v", exp, time.Unix(epoch, 0))
+		}
+		if scope != "read activity:read_all" {
+			t.Errorf("scope = %q, want \"read activity:read_all\"", scope)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %s, want POST", gotMethod)
+		}
+		if gotPath != "/oauth/token" {
+			t.Errorf("path = %s, want /oauth/token (the ROOT endpoint — NOT /api/…)", gotPath)
+		}
+		if !strings.HasPrefix(gotContent, "application/x-www-form-urlencoded") {
+			t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", gotContent)
+		}
+		if gotValues["grant_type"] != "authorization_code" {
+			t.Errorf("grant_type = %q, want \"authorization_code\"", gotValues["grant_type"])
+		}
+		if gotValues["client_id"] != "cid" {
+			t.Errorf("client_id = %q, want \"cid\"", gotValues["client_id"])
+		}
+		if gotValues["client_secret"] != "sec" {
+			t.Errorf("client_secret = %q, want \"sec\"", gotValues["client_secret"])
+		}
+		if gotValues["code"] != "code123" {
+			t.Errorf("code = %q, want \"code123\"", gotValues["code"])
+		}
+	})
+
+	t.Run("400 maps to ErrInvalidCode (the code grant — NOT the refresh invalid_grant class)", func(t *testing.T) {
+		srv400 := statusServer(t, http.StatusBadRequest, nil)
+		defer srv400.Close()
+		c := &stravaClient{base: srv400.URL}
+		_, _, _, _, err := c.ExchangeCode(context.Background(), "cid", "sec", "code123")
+		if !errors.Is(err, ErrInvalidCode) {
+			t.Fatalf("want ErrInvalidCode, got %v", err)
+		}
+	})
+
+	t.Run("401 maps to ErrUnauthorized", func(t *testing.T) {
+		srv401 := statusServer(t, http.StatusUnauthorized, nil)
+		defer srv401.Close()
+		c := &stravaClient{base: srv401.URL}
+		_, _, _, _, err := c.ExchangeCode(context.Background(), "cid", "sec", "code123")
+		var u ErrUnauthorized
+		if !errors.As(err, &u) {
+			t.Fatalf("want ErrUnauthorized, got %v", err)
+		}
+	})
+}
