@@ -8,12 +8,18 @@ package strava
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"math"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -53,6 +59,10 @@ const firstPollLookback = 24 * time.Hour
 // ONLY the list window — the cursor ADVANCE math (step e) is unchanged.
 const windowOverlap = time.Hour
 
+// onboardingTTL is how long a /strava authorize link stays valid before the
+// pending row expires (unused rows simply lapse).
+const onboardingTTL = time.Hour
+
 // The seen-activity dispositions.
 const (
 	statusPending = "pending"
@@ -69,8 +79,9 @@ type dbTx interface {
 
 // Strava is the handler; a *app.App is injected (house pattern).
 type Strava struct {
-	app  *app.App
-	api  StravaAPI // seam: production = NewStravaAPI(); nil until first use
+	app *app.App
+	api StravaAPI // seam: production = NewStravaAPI() (built in New — never
+	//             // nil at runtime); tests inject the stub
 	poll time.Duration
 
 	// sendFn seam: func(threadID, msg string) error — production posts via
@@ -82,10 +93,13 @@ type Strava struct {
 }
 
 // New builds the handler. NO network I/O here (selftest discipline — every
-// handler is constructed offline). The API is lazy (nil until first use);
-// the seam is wired via a CLOSURE (the house single-thread send shape).
+// handler is constructed offline): NewStravaAPI is network-free. The API is
+// built HERE (not lazily in iteration) so the onboarding callback goroutine
+// can never touch a nil s.api on a flag-off bot — and so the HTTP goroutine
+// and RunPoll's goroutine never race on the initialization write. The seam
+// is wired via a CLOSURE (the house single-thread send shape).
 func New(app *app.App) *Strava {
-	s := &Strava{app: app}
+	s := &Strava{app: app, api: NewStravaAPI()}
 	s.sendFn = func(threadID, msg string) error {
 		// MessageAllowedMentions' Parse is deliberately NOT omitempty: an
 		// empty Parse slice marshals parse: [] — complete mention suppression
@@ -162,6 +176,12 @@ type postItem struct {
 
 // iteration is one pass (spec §3, verbatim).
 func (s *Strava) iteration(ctx context.Context) error {
+	// Per-tick cleanup (hygiene, not feature work — runs even while the
+	// flag is off): expire the lapsed onboarding rows. Non-fatal: a failure
+	// logs and the tick continues.
+	if _, err := s.app.Pool.Exec(ctx, `DELETE FROM strava_onboardings WHERE expires_at < now()`); err != nil {
+		slog.Error("strava onboarding cleanup failed", "module", "strava", "error", err)
+	}
 	if !features.IsEnabled(ctx, s.app.Pool, FeatureKey) {
 		return nil
 	}
@@ -172,10 +192,6 @@ func (s *Strava) iteration(ctx context.Context) error {
 			s.cfgWarned = true
 		}
 		return nil
-	}
-	// lazy API (first use) — NewStravaAPI is network-free, selftest-safe.
-	if s.api == nil {
-		s.api = NewStravaAPI()
 	}
 
 	athletes, err := s.loadAthletes(ctx)
@@ -675,4 +691,570 @@ func formatNoun(a Activity) string {
 // buildPost is the exact two-line post: the label line + the activity link.
 func buildPost(label, noun, activityID string) string {
 	return label + " finished " + noun + "\n" + "https://www.strava.com/activities/" + activityID
+}
+
+// ---------------------------------------------------------------------------
+// The /strava command (onboarding): a member runs it in the thread they
+// want posts to; the bot replies with a one-time, state-scoped authorize
+// link and inserts a pending row (migration 000008).
+// ---------------------------------------------------------------------------
+
+// Response is this module's share of Rust's HandlerResponse shape: the
+// command never defers, so the fields it uses are Content and Ephemeral
+// (always true — the reply is visible ONLY to the invoker, binding the
+// posted link to them); DeferResponse is present for parity with the
+// Rust struct default `Option::None`.
+type Response struct {
+	Content       string
+	Ephemeral     bool
+	DeferResponse *bool
+}
+
+// sanitizeLabel trims the label, collapses newline sequences to single
+// spaces, and caps at 32 runes (first 32). The newline order matters: "\r\n"
+// is replaced as a UNIT first (one space, not two), then lone "\r", then
+// lone "\n" — a naive two-pass ReplaceAll would turn "A\r\nB" into "A  B".
+// Empty/whitespace-only input returns "".
+func sanitizeLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	r := []rune(s)
+	if len(r) > 32 {
+		return string(r[:32])
+	}
+	return s
+}
+
+// newState is the one-time state token: 16 random bytes as 32 lowercase
+// hex chars.
+func newState() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// authorizeURL is the exact Strava authorize URL. The redirect URI is a
+// code constant (public, not a secret); the client_id is already public in
+// the URL.
+func authorizeURL(clientID, state string) string {
+	return "https://www.strava.com/oauth/authorize?client_id=" + clientID +
+		"&redirect_uri=https%3A%2F%2Ftugbot.wizards.town%2Fstrava%2Fcallback&response_type=code&scope=activity:read_all&state=" + state
+}
+
+// SetupCommand is the /strava registration: one optional string option
+// "label" (the feat handler's option shape is the template).
+func (s *Strava) SetupCommand() *discordgo.ApplicationCommand {
+	return &discordgo.ApplicationCommand{
+		Type:        discordgo.ChatApplicationCommand,
+		Name:        "strava",
+		Description: "Add your Strava account — finished runs and rides post to this thread",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Name:        "label",
+				Type:        discordgo.ApplicationCommandOptionString,
+				Description: "Display name for posts (defaults to your Strava first name)",
+				// Required left false — the label is optional.
+			},
+		},
+	}
+}
+
+// HandleInteraction is the /strava command body. It does NOT gate on the
+// feature flag (onboarding is valid while the feature is off — the row just
+// sits until it's enabled) and does NOT dedupe (a second /strava in the same
+// thread inserts a fresh row; the unused one expires). DB failures become an
+// error Response — never a panic.
+func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
+	// Creds preflight: without client credentials the link would be dead —
+	// reply without inserting a row.
+	if s.app.Cfg.StravaClientID == "" || s.app.Cfg.StravaClientSecret == "" {
+		return Response{Content: "strava is not configured on this bot — the owner needs to set the client credentials first", Ephemeral: true}
+	}
+	// Extract the label: the first option whose name is "label" (a name
+	// match, not Options[0] — a future second option must not be
+	// silently misread; no matching option → empty label), string value.
+	var label string
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok {
+		for _, opt := range data.Options {
+			if opt.Name != "label" {
+				continue
+			}
+			if v, ok := opt.Value.(string); ok {
+				label = sanitizeLabel(v)
+			}
+			break
+		}
+	}
+	state, err := newState()
+	if err != nil {
+		slog.Error("onboarding state generation failed", "module", "strava", "error", err)
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
+	}
+	// thread_id: the interaction's ChannelID is a string; the column is
+	// bigint. Empty/unparsable → the setup-failed reply (no row).
+	threadID, err := strconv.ParseInt(i.ChannelID, 10, 64)
+	if err != nil {
+		slog.Error("onboarding channel id unparsable", "module", "strava", "channel_id", i.ChannelID, "error", err)
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
+	}
+	var labelArg any = nil
+	if label != "" {
+		labelArg = label
+	}
+	_, err = s.app.Pool.Exec(context.Background(),
+		`INSERT INTO strava_onboardings (state, thread_id, label, status, created_at, expires_at)
+		VALUES ($1, $2, $3, 'pending', now(), now() + $4::interval)`,
+		state, threadID, labelArg, onboardingTTL.String())
+	if err != nil {
+		slog.Error("onboarding row insert failed", "module", "strava", "error", err)
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
+	}
+	content := authorizeURL(s.app.Cfg.StravaClientID, state) + " — this link expires in an hour."
+	// The disabled-clause (the command itself is NOT gated on the flag).
+	// CheckEnabled, not IsEnabled: IsEnabled silently returns false on ANY
+	// DB error, so a transient pool blip would append the clause on a
+	// perfectly valid link. On a DB error append nothing — the link is
+	// still valid and the row is still inserted (the command is ungated).
+	enabled, flagErr := features.CheckEnabled(context.Background(), s.app.Pool, FeatureKey)
+	switch {
+	case flagErr != nil:
+		slog.Warn("strava feature flag check failed", "module", "strava", "error", flagErr)
+	case !enabled:
+		content += " (the strava feature is disabled — you'll be tracked once it's enabled)"
+	}
+	// Ephemeral: the link is visible ONLY to the invoker (a thread member
+	// can no longer consume it — the ownership check is impossible in a
+	// plain browser redirect, so visibility IS the binding). The later
+	// confirm is a SEPARATE, non-ephemeral channel message that posts to
+	// the thread for everyone (the sendFn seam — unchanged).
+	return Response{Content: content, Ephemeral: true}
+}
+
+// ---------------------------------------------------------------------------
+// The onboarding callback (decision 0012): the :8643 in-process listener.
+// Strava redirects the consenting athlete's browser to
+// tugbot.wizards.town/strava/callback?code=…&state=…; this handler
+// completes the flow and renders the "Done" page. Deliberately inside the
+// bot process — consolidated liveness, one unit, confirm on the bot's own
+// session.
+// ---------------------------------------------------------------------------
+
+// stravaOnboardAddr is the in-process callback listener address — a code
+// constant (no env var, per the spec). Unexported: package main never
+// references it — the address is hidden inside Start.
+const stravaOnboardAddr = ":8643"
+
+// scopeHasReadAll reports whether the space-separated scope string (the
+// token response's `scope`, e.g. "activity:read_all read") contains the
+// EXACT field "activity:read_all" — a field match, not a substring.
+func scopeHasReadAll(scope string) bool {
+	for _, f := range strings.Fields(scope) {
+		if f == "activity:read_all" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveLabel is the display/fallback resolution: the first non-empty of
+// (rowLabel, existingLabel, firstname, username), else "Athlete". An
+// explicit command label overrides (new or existing athlete); an omitted
+// label preserves the stored label for an existing athlete (a re-consent
+// never silently relabels a custom label); a new athlete falls to first
+// name → username → "Athlete".
+func resolveLabel(rowLabel, existingLabel, firstname, username string) string {
+	for _, v := range []string{rowLabel, existingLabel, firstname, username} {
+		if v != "" {
+			return v
+		}
+	}
+	return "Athlete"
+}
+
+// onboardingPage renders the full HTML page (the same shape the retired
+// sidecar rendered). Both fields are escaped. The page never carries
+// secrets: the code is single-use and the tokens are never rendered.
+func onboardingPage(title, body string) []byte {
+	var b strings.Builder
+	b.WriteString("<!doctype html>\n<html><head><meta charset=\"utf-8\">" +
+		"<style>body{font-family:monospace}</style></head><body>\n")
+	b.WriteString("<h2>" + html.EscapeString(title) + "</h2>\n")
+	b.WriteString("<p>" + html.EscapeString(body) + "</p>\n")
+	b.WriteString("</body></html>\n")
+	return []byte(b.String())
+}
+
+// throttleEntry is one client's fixed 60 s window (10 per window; the
+// entry resets fully when the window lapses).
+type throttleEntry struct {
+	count       int
+	windowStart time.Time
+}
+
+// OnboardingHandler returns the single-route callback handler (GET
+// /strava/callback; any other method or path 404s). The throttle state is
+// created HERE (closure-local, mutex-protected, lazily pruned on access) —
+// NEVER a struct field initialized in New(): the unit throttle test
+// constructs a bare &Strava{} and the integration tests build the handler
+// via struct literal; neither goes through New(), so a New()-initialized
+// field would be a nil map and panic on first write.
+func (s *Strava) OnboardingHandler() http.Handler {
+	var (
+		thMu    sync.Mutex
+		thState = make(map[string]throttleEntry)
+	)
+	const (
+		throttleLimit  = 10
+		throttleWindow = 60 * time.Second
+	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. Route guard: only GET /strava/callback.
+		if r.Method != http.MethodGet || r.URL.Path != "/strava/callback" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write(onboardingPage("Not found", ""))
+			return
+		}
+		render := func(status int, title, body string) {
+			w.WriteHeader(status)
+			_, _ = w.Write(onboardingPage(title, body))
+		}
+		// 2. Throttle — 10 per fixed 60 s window (resets at lapse), BEFORE
+		// any DB work. Key = the LAST hop of X-Forwarded-For — caddy's
+		// default reverse_proxy PRESERVES an inbound client-supplied XFF
+		// and APPENDS the trusted client IP at the END of the chain, so
+		// the first hop is attacker-controlled (an internet client
+		// rotating its own XFF would get a fresh bucket per request);
+		// behind the proxy r.RemoteAddr is always caddy's own address, so
+		// RemoteAddr alone would be one global bucket for every athlete.
+		// Fall back to r.RemoteAddr when the header is absent. Guarantee:
+		// the per-IP throttle holds BEHIND the trusted proxy (caddy
+		// appends the client IP); on the direct (non-proxied) path the
+		// hardening is ReadHeaderTimeout + the cheap route guard + the
+		// port-stripped fallback bucket.
+		key := r.RemoteAddr
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			hops := strings.Split(xff, ",")
+			for i := len(hops) - 1; i >= 0; i-- {
+				if hop := strings.TrimSpace(hops[i]); hop != "" {
+					key = hop
+					break
+				}
+			}
+		} else if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			// Direct path: the source port is ephemeral — a raw
+			// RemoteAddr would be a fresh bucket per connection and the
+			// 10/min limit would never fire. Strip the port (fall back
+			// to the raw RemoteAddr on error).
+			key = host
+		}
+		now := time.Now()
+		thMu.Lock()
+		// Sweep: delete entries whose window has lapsed — without this
+		// every unique key ever seen leaks an entry forever (attacker-
+		// controlled unbounded growth on an unauthenticated port). The map
+		// is small at onboarding scale, so a full sweep under the mutex is
+		// cheap.
+		for k, e := range thState {
+			if now.Sub(e.windowStart) >= throttleWindow {
+				delete(thState, k)
+			}
+		}
+		e := thState[key]
+		if e.windowStart.IsZero() || now.Sub(e.windowStart) >= throttleWindow {
+			// Hard cap: a single-window burst of unique keys can balloon
+			// the map past the sweep's steady-state bound — past 10 000
+			// stored entries a NEW key is throttled, not inserted.
+			if len(thState) > 10000 {
+				thMu.Unlock()
+				w.Header().Set("Retry-After", "60")
+				render(http.StatusTooManyRequests, "Too many requests", "Too many requests — try again later")
+				return
+			}
+			e = throttleEntry{windowStart: now} // lazy pruning: the stale entry resets
+		}
+		if e.count >= throttleLimit {
+			thMu.Unlock()
+			w.Header().Set("Retry-After", "60")
+			render(http.StatusTooManyRequests, "Too many requests", "Too many requests — try again later")
+			return
+		}
+		e.count++
+		thState[key] = e
+		thMu.Unlock()
+
+		// 3. Parse. Strava's denial redirect (the athlete clicked Decline):
+		// error=access_denied, no code → 200; the pending row is left
+		// as-is (it expires harmlessly; the athlete may retry — a denial
+		// is not a flow failure, so NO failed mark).
+		q := r.URL.Query()
+		if q.Get("error") != "" {
+			render(http.StatusOK, "Declined", "consent was not granted — run /strava again")
+			return
+		}
+		code := q.Get("code")
+		state := q.Get("state")
+		if code == "" || state == "" {
+			render(http.StatusNotFound, "Not found", "missing code or state")
+			return
+		}
+		// ctx provenance: the HTTP request context (client-abort-cancellable;
+		// the 30 s stravaHTTP timeout bounds the Strava calls).
+		ctx := r.Context()
+
+		// 4. State lookup (label scans into *string — the column is
+		// nullable; a NULL label becomes "" for resolveLabel).
+		var (
+			status   string
+			expires  time.Time
+			threadID int64
+			rowLabel *string
+		)
+		pool := s.app.Pool
+		if err := pool.QueryRow(ctx,
+			`SELECT status, expires_at, thread_id, label FROM strava_onboardings WHERE state = $1`, state).
+			Scan(&status, &expires, &threadID, &rowLabel); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				render(http.StatusNotFound, "Not found", "unknown or expired link — run /strava again")
+				return
+			}
+			slog.Error("strava onboarding state lookup failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		if status != statusPending {
+			render(http.StatusConflict, "Already used", "this link was already used")
+			return
+		}
+		if expires.Before(time.Now()) {
+			if _, err := pool.Exec(ctx, `DELETE FROM strava_onboardings WHERE state = $1`, state); err != nil {
+				slog.Error("strava onboarding expired-row delete failed", "module", "strava", "state", state, "error", err)
+				render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+				return
+			}
+			render(http.StatusNotFound, "Expired", "expired — run /strava again")
+			return
+		}
+		rowLabelStr := ""
+		if rowLabel != nil {
+			rowLabelStr = *rowLabel
+		}
+		// markFailed leaves the row 'pending' on a DB error — the 1h TTL +
+		// the per-tick cleanup absorb it (no compensating rollback).
+		markFailed := func(logMsg string) {
+			if _, err := pool.Exec(ctx, `UPDATE strava_onboardings SET status = 'failed' WHERE state = $1 AND status = 'pending'`, state); err != nil {
+				slog.Error(logMsg+" (failed-mark update errored)", "module", "strava", "state", state, "error", err)
+			}
+		}
+
+		// 5. Exchange (never log the code or tokens).
+		accessToken, refreshToken, expiresAt, scope, err := s.api.ExchangeCode(ctx, s.app.Cfg.StravaClientID, s.app.Cfg.StravaClientSecret, code)
+		if err != nil {
+			markFailed("strava onboarding exchange failed")
+
+			slog.Warn("strava onboarding exchange failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusBadRequest, "Authorization failed", "authorization failed — run /strava again")
+			return
+		}
+		// 6. Scope check.
+		if !scopeHasReadAll(scope) {
+			markFailed("strava onboarding scope missing")
+			slog.Warn("strava onboarding scope missing", "module", "strava", "state", state, "reason", "consent lacked activity:read_all")
+			render(http.StatusBadRequest, "Insufficient scope", "consent lacked activity:read_all — use the link /strava posts")
+			return
+		}
+		// 7. Athlete fetch.
+		athlete, err := s.api.GetAthlete(ctx, accessToken)
+		if err != nil {
+			markFailed("strava onboarding athlete fetch failed")
+			slog.Warn("strava onboarding athlete fetch failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusBadRequest, "Profile fetch failed", "could not load the athlete profile — run /strava again")
+			return
+		}
+		// 9. Existing-athlete pre-check (drives step 8's existingLabel and
+		// the confirm text).
+		var existingLabelPtr *string
+		err = pool.QueryRow(ctx, `SELECT label FROM strava_athletes WHERE strava_athlete_id = $1`, athlete.ID).Scan(&existingLabelPtr)
+		isNew := true
+		existingLabel := ""
+		switch {
+		case err == nil:
+			isNew = false
+			if existingLabelPtr != nil {
+				existingLabel = *existingLabelPtr
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			// no row → new athlete
+		default:
+			slog.Error("strava onboarding existing-athlete pre-check failed", "module", "strava", "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		// 8. Label (the Go-side resolution decides the final value — the
+		// upsert applies it unconditionally; no SQL-side COALESCE).
+		label := resolveLabel(rowLabelStr, existingLabel, athlete.Firstname, athlete.Username)
+		// 10+11. ONE transaction: the locked re-check + the athlete upsert
+		// + the claim. The pre-exchange lookup (step 4) is only the fast
+		// path (404/409/expired before burning the single-use code); THIS
+		// re-check under SELECT ... FOR UPDATE is the arbiter — a
+		// concurrent same-state replay blocks here until we commit, then
+		// sees 'done' and gets 409. A zero-row claim is therefore
+		// impossible: the confirm (step 12) fires only after a successful
+		// commit, so a replay can never double-upsert or double-confirm.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			slog.Error("strava onboarding claim tx begin failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		defer func() {
+			if rerr := tx.Rollback(ctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
+				slog.Error("strava onboarding claim tx deferred rollback failed", "module", "strava", "state", state, "error", rerr)
+			}
+		}()
+		var (
+			lockedStatus string
+			lockedExpiry time.Time
+		)
+		if err := tx.QueryRow(ctx,
+			`SELECT status, expires_at FROM strava_onboardings WHERE state = $1 FOR UPDATE`, state).
+			Scan(&lockedStatus, &lockedExpiry); err != nil {
+			_ = tx.Rollback(ctx)
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Gone between step 4 and the lock (a concurrent expired-delete
+				// or the per-tick sweep) — same 404 as the fast path.
+				render(http.StatusNotFound, "Not found", "unknown or expired link — run /strava again")
+				return
+			}
+			slog.Error("strava onboarding locked re-check failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		if lockedStatus != statusPending {
+			_ = tx.Rollback(ctx)
+			render(http.StatusConflict, "Already used", "this link was already used")
+			return
+		}
+		if lockedExpiry.Before(time.Now()) {
+			// Expired in the sub-second window between step 4 and the lock:
+			// delete + rollback (the per-tick sweep absorbs the row either
+			// way) + 404.
+			if _, err := tx.Exec(ctx, `DELETE FROM strava_onboardings WHERE state = $1`, state); err != nil {
+				_ = tx.Rollback(ctx)
+				slog.Error("strava onboarding expired-row delete failed", "module", "strava", "state", state, "error", err)
+				render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+				return
+			}
+			_ = tx.Rollback(ctx)
+			render(http.StatusNotFound, "Expired", "expired — run /strava again")
+			return
+		}
+		// 10. Upsert (inside the claim transaction — the locked re-check
+		// already verified pending, so no replay reaches this statement).
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO strava_athletes (label, strava_athlete_id, access_token, refresh_token, token_expires_at, target_thread_id, needs_reauth)
+			VALUES ($1, $2, $3, $4, $5, $6, false)
+			ON CONFLICT (strava_athlete_id) DO UPDATE SET
+			    access_token = EXCLUDED.access_token,
+			    refresh_token = EXCLUDED.refresh_token,
+			    token_expires_at = EXCLUDED.token_expires_at,
+			    needs_reauth = false,
+			    target_thread_id = EXCLUDED.target_thread_id,
+			    label = EXCLUDED.label`,
+			label, athlete.ID, accessToken, refreshToken, expiresAt, threadID); err != nil {
+			_ = tx.Rollback(ctx)
+			slog.Error("strava onboarding athlete upsert failed", "module", "strava", "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		// 11. Claim (the locked re-check already verified pending — the
+		// status='pending' condition is no longer load-bearing).
+		if _, err := tx.Exec(ctx, `UPDATE strava_onboardings SET status = 'done' WHERE state = $1`, state); err != nil {
+			_ = tx.Rollback(ctx)
+			slog.Error("strava onboarding claim failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			slog.Error("strava onboarding claim tx commit failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		// 12. Confirm via the handler's existing send (the posts'
+		// ChannelMessageSendComplex parse: [] sender). Fires ONLY after a
+		// successful commit (a zero-row claim is impossible — the locked
+		// re-check is the arbiter). A send failure is logged — the flow
+		// still succeeds (the page still says Done; the row is live).
+		confirm := "✅ " + label + " is now tracked — finished runs and rides will post here."
+		if !isNew {
+			confirm = "🔄 " + label + "'s Strava authorization was refreshed."
+		}
+		if s.sendFn != nil {
+			if err := s.sendFn(strconv.FormatInt(threadID, 10), confirm); err != nil {
+				slog.Error("strava onboarding confirm failed", "module", "strava", "label", label, "error", err)
+			}
+		}
+		// 13. Log + render.
+		slog.Info("strava onboarding completed", "module", "strava", "label", label, "thread", threadID, "new", isNew)
+		render(http.StatusOK, "Done", label+" is set up. You can close this tab.")
+	})
+}
+
+// Start runs the onboarding callback listener on stravaOnboardAddr. It
+// blocks until ctx cancels, then http.Server.Shutdown with a ≤10s grace
+// (the mcp.Server.Start template, verbatim). A bind failure is returned
+// immediately at boot (fail fast — the errgroup arm's os.Exit(1) fires at
+// startup, not at the next SIGTERM); a clean cancel returns nil (never
+// leaking context.Canceled or http.ErrServerClosed).
+func (s *Strava) Start(ctx context.Context) error {
+	hs := &http.Server{
+		Addr:    stravaOnboardAddr,
+		Handler: s.OnboardingHandler(),
+		// ReadHeaderTimeout: a slowloris against the all-interfaces :8643
+		// directly (bypassing caddy) could otherwise hold connections
+		// indefinitely.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	// Capacity 1: the single ListenAndServe result (the bind error or the
+	// server-closed termination) is exactly once, and a buffered send
+	// never blocks the goroutine on any path.
+	errCh := make(chan error, 1)
+	go func() { errCh <- hs.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		// Clean-cancel path: become the ≤10s shutdown grace.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(shutdownCtx)
+		if shutdownCtx.Err() != nil {
+			// Deadline: active connections may still be in flight. A
+			// previous bind failure already delivered its error to the
+			// buffered channel, so a non-blocking read is exact.
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					return err
+				}
+				// Mapped clean listen-terminator (nil / ErrServerClosed): nil.
+				return nil
+			default:
+				return nil
+			}
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	case err := <-errCh:
+		// ListenAndServe finished without us cancelling: the bind failure
+		// (address in use — returned immediately at boot) or a clean
+		// listen-terminator (nil / ErrServerClosed → nil).
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
