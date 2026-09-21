@@ -701,8 +701,9 @@ func buildPost(label, noun, activityID string) string {
 
 // Response is this module's share of Rust's HandlerResponse shape: the
 // command never defers, so the fields it uses are Content and Ephemeral
-// (always false — the reply lands in the thread); DeferResponse is present
-// for parity with the Rust struct default `Option::None`.
+// (always true — the reply is visible ONLY to the invoker, binding the
+// posted link to them); DeferResponse is present for parity with the
+// Rust struct default `Option::None`.
 type Response struct {
 	Content       string
 	Ephemeral     bool
@@ -771,7 +772,7 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 	// Creds preflight: without client credentials the link would be dead —
 	// reply without inserting a row.
 	if s.app.Cfg.StravaClientID == "" || s.app.Cfg.StravaClientSecret == "" {
-		return Response{Content: "strava is not configured on this bot — the owner needs to set the client credentials first"}
+		return Response{Content: "strava is not configured on this bot — the owner needs to set the client credentials first", Ephemeral: true}
 	}
 	// Extract the label: the first option whose name is "label" (a name
 	// match, not Options[0] — a future second option must not be
@@ -791,14 +792,14 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 	state, err := newState()
 	if err != nil {
 		slog.Error("onboarding state generation failed", "module", "strava", "error", err)
-		return Response{Content: "onboarding setup failed — try again"}
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
 	}
 	// thread_id: the interaction's ChannelID is a string; the column is
 	// bigint. Empty/unparsable → the setup-failed reply (no row).
 	threadID, err := strconv.ParseInt(i.ChannelID, 10, 64)
 	if err != nil {
 		slog.Error("onboarding channel id unparsable", "module", "strava", "channel_id", i.ChannelID, "error", err)
-		return Response{Content: "onboarding setup failed — try again"}
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
 	}
 	var labelArg any = nil
 	if label != "" {
@@ -810,7 +811,7 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 		state, threadID, labelArg, onboardingTTL.String())
 	if err != nil {
 		slog.Error("onboarding row insert failed", "module", "strava", "error", err)
-		return Response{Content: "onboarding setup failed — try again"}
+		return Response{Content: "onboarding setup failed — try again", Ephemeral: true}
 	}
 	content := authorizeURL(s.app.Cfg.StravaClientID, state) + " — this link expires in an hour."
 	// The disabled-clause (the command itself is NOT gated on the flag).
@@ -825,9 +826,12 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 	case !enabled:
 		content += " (the strava feature is disabled — you'll be tracked once it's enabled)"
 	}
-	// Ephemeral stays false — the reply lands in the thread (where the
-	// later confirm lands).
-	return Response{Content: content}
+	// Ephemeral: the link is visible ONLY to the invoker (a thread member
+	// can no longer consume it — the ownership check is impossible in a
+	// plain browser redirect, so visibility IS the binding). The later
+	// confirm is a SEPARATE, non-ephemeral channel message that posts to
+	// the thread for everyone (the sendFn seam — unchanged).
+	return Response{Content: content, Ephemeral: true}
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,8 +1096,65 @@ func (s *Strava) OnboardingHandler() http.Handler {
 		// 8. Label (the Go-side resolution decides the final value — the
 		// upsert applies it unconditionally; no SQL-side COALESCE).
 		label := resolveLabel(rowLabelStr, existingLabel, athlete.Firstname, athlete.Username)
-		// 10. Upsert (idempotent — a concurrent replay's claim is absorbed).
-		if _, err := pool.Exec(ctx,
+		// 10+11. ONE transaction: the locked re-check + the athlete upsert
+		// + the claim. The pre-exchange lookup (step 4) is only the fast
+		// path (404/409/expired before burning the single-use code); THIS
+		// re-check under SELECT ... FOR UPDATE is the arbiter — a
+		// concurrent same-state replay blocks here until we commit, then
+		// sees 'done' and gets 409. A zero-row claim is therefore
+		// impossible: the confirm (step 12) fires only after a successful
+		// commit, so a replay can never double-upsert or double-confirm.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			slog.Error("strava onboarding claim tx begin failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		defer func() {
+			if rerr := tx.Rollback(ctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
+				slog.Error("strava onboarding claim tx deferred rollback failed", "module", "strava", "state", state, "error", rerr)
+			}
+		}()
+		var (
+			lockedStatus string
+			lockedExpiry time.Time
+		)
+		if err := tx.QueryRow(ctx,
+			`SELECT status, expires_at FROM strava_onboardings WHERE state = $1 FOR UPDATE`, state).
+			Scan(&lockedStatus, &lockedExpiry); err != nil {
+			_ = tx.Rollback(ctx)
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Gone between step 4 and the lock (a concurrent expired-delete
+				// or the per-tick sweep) — same 404 as the fast path.
+				render(http.StatusNotFound, "Not found", "unknown or expired link — run /strava again")
+				return
+			}
+			slog.Error("strava onboarding locked re-check failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
+		if lockedStatus != statusPending {
+			_ = tx.Rollback(ctx)
+			render(http.StatusConflict, "Already used", "this link was already used")
+			return
+		}
+		if lockedExpiry.Before(time.Now()) {
+			// Expired in the sub-second window between step 4 and the lock:
+			// delete + rollback (the per-tick sweep absorbs the row either
+			// way) + 404.
+			if _, err := tx.Exec(ctx, `DELETE FROM strava_onboardings WHERE state = $1`, state); err != nil {
+				_ = tx.Rollback(ctx)
+				slog.Error("strava onboarding expired-row delete failed", "module", "strava", "state", state, "error", err)
+				render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+				return
+			}
+			_ = tx.Rollback(ctx)
+			render(http.StatusNotFound, "Expired", "expired — run /strava again")
+			return
+		}
+		// 10. Upsert (inside the claim transaction — the locked re-check
+		// already verified pending, so no replay reaches this statement).
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO strava_athletes (label, strava_athlete_id, access_token, refresh_token, token_expires_at, target_thread_id, needs_reauth)
 			VALUES ($1, $2, $3, $4, $5, $6, false)
 			ON CONFLICT (strava_athlete_id) DO UPDATE SET
@@ -1104,21 +1165,29 @@ func (s *Strava) OnboardingHandler() http.Handler {
 			    target_thread_id = EXCLUDED.target_thread_id,
 			    label = EXCLUDED.label`,
 			label, athlete.ID, accessToken, refreshToken, expiresAt, threadID); err != nil {
+			_ = tx.Rollback(ctx)
 			slog.Error("strava onboarding athlete upsert failed", "module", "strava", "error", err)
 			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
 			return
 		}
-		// 11. Claim (a zero-row result is fine — a concurrent replay already
-		// claimed it, and the upsert is idempotent).
-		if _, err := pool.Exec(ctx, `UPDATE strava_onboardings SET status = 'done' WHERE state = $1 AND status = 'pending'`, state); err != nil {
+		// 11. Claim (the locked re-check already verified pending — the
+		// status='pending' condition is no longer load-bearing).
+		if _, err := tx.Exec(ctx, `UPDATE strava_onboardings SET status = 'done' WHERE state = $1`, state); err != nil {
+			_ = tx.Rollback(ctx)
 			slog.Error("strava onboarding claim failed", "module", "strava", "state", state, "error", err)
 			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
 			return
 		}
+		if err := tx.Commit(ctx); err != nil {
+			slog.Error("strava onboarding claim tx commit failed", "module", "strava", "state", state, "error", err)
+			render(http.StatusInternalServerError, "Internal error", "internal error — try again")
+			return
+		}
 		// 12. Confirm via the handler's existing send (the posts'
-		// ChannelMessageSendComplex parse: [] sender). A send failure is
-		// logged — the flow still succeeds (the page still says Done; the
-		// row is live).
+		// ChannelMessageSendComplex parse: [] sender). Fires ONLY after a
+		// successful commit (a zero-row claim is impossible — the locked
+		// re-check is the arbiter). A send failure is logged — the flow
+		// still succeeds (the page still says Done; the row is live).
 		confirm := "✅ " + label + " is now tracked — finished runs and rides will post here."
 		if !isNew {
 			confirm = "🔄 " + label + "'s Strava authorization was refreshed."

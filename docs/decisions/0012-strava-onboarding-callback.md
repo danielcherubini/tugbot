@@ -20,3 +20,7 @@ The Strava feature spec (2026-09-19) declared the bot's runtime to have **zero p
 - The caddy `tugbot.wizards.town` block is scoped to `handle /strava/callback` (everything else 404s) and its target flips `:8080` → `:8643`; the ad-hoc `strava-callback` systemd unit is retired (its source was never in the repo).
 - The "zero public surface" property no longer holds for the bot runtime. The entire surface is: one unauthenticated GET on a caddy-routed port, serving one path.
 - `update-tugbot` is unchanged (it builds the bot binary, which now carries the listener); no new systemd unit, no new env vars.
+
+## Post-ship amendment
+
+The `/strava` reply is **ephemeral** (invoker-only visibility), so the posted authorize link is bound to the invoker (a thread member can no longer consume another member's link — the ownership check is impossible in a plain browser redirect, so visibility IS the binding). The in-thread confirm remains a separate, non-ephemeral message posted to the thread for everyone.

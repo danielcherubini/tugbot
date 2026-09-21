@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -201,17 +202,25 @@ type capturedPost struct {
 }
 
 // capture opts into the sendFn seam and records every post.
+// mutex-protected: the concurrency test fires two callbacks that both
+// reach the seam (pre-fix), so the append must not race.
 type capture struct {
+	mu sync.Mutex
+
 	posts []capturedPost
 }
 
 func (c *capture) sendFn(threadID, msg string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.posts = append(c.posts, capturedPost{threadID, msg})
 	return nil
 }
 
 // byThread records only the posts that went to one thread id (string form).
 func (c *capture) byThread(threadID string) []capturedPost {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var out []capturedPost
 	for _, p := range c.posts {
 		if p.threadID == threadID {
@@ -1232,9 +1241,10 @@ func onboardingRowCount(t *testing.T, pool *pgxpool.Pool) int {
 }
 
 // TestStravaCommandInsertsPendingOnboarding pins the happy path: the reply
-// carries the authorize URL with a 32-hex state=, and the row is inserted
-// (state, thread_id, label, status='pending', expires_at within 60–120 min
-// of now()).
+// carries the authorize URL with a 32-hex state=, is EPHEMERAL (visible
+// only to the invoker — the link is bound to them; a thread member cannot
+// consume it), and the row is inserted (state, thread_id, label,
+// status='pending', expires_at within 60–120 min of now()).
 func TestStravaCommandInsertsPendingOnboarding(t *testing.T) {
 	pool := setupStravaTestDB(t)
 	s, _ := newTestStrava(t, pool, nil, 0)
@@ -1244,6 +1254,9 @@ func TestStravaCommandInsertsPendingOnboarding(t *testing.T) {
 		Value: "Matt",
 	})
 	r := s.HandleInteraction(i)
+	if !r.Ephemeral {
+		t.Errorf("Ephemeral = false, want true (the link is visible only to the invoker)")
+	}
 
 	wantPrefix := "https://www.strava.com/oauth/authorize?client_id=test-client-id&"
 	if !strings.HasPrefix(r.Content, wantPrefix) {
@@ -1508,6 +1521,62 @@ func TestOnboardingHappyPath(t *testing.T) {
 	const want = "✅ Matt is now tracked — finished runs and rides will post here."
 	if sent[0].msg != want {
 		t.Errorf("confirm = %q, want %q", sent[0].msg, want)
+	}
+}
+
+// TestOnboardingConcurrentSameState pins the claim race: two concurrent
+// callbacks for the SAME state, both with valid codes (the stub's
+// ExchangeCode and GetAthlete always succeed — deliberately bypassing
+// the real single-use-code reality: the DB must be the arbiter). The
+// exchange sleep widens the window so both requests pass the pre-exchange
+// fast path before either claims (deterministic RED on the old code:
+// both 200, both confirm). Assertions: exactly one 200 and one 409,
+// exactly one confirm, the onboarding row 'done', exactly one athlete
+// row.
+func TestOnboardingConcurrentSameState(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	const state = "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+	seedOnboarding(t, pool, state, 999000111222, nil, "pending", time.Now().UTC().Add(time.Hour))
+	stub := &stubStrava{
+		exchangeFn: func() (string, string, time.Time, string, error) {
+			time.Sleep(100 * time.Millisecond) // widen the race window
+			return "canned-access", "canned-refresh", time.Now().UTC().Add(6 * time.Hour), "read activity:read_all", nil
+		},
+		athleteFn: func() (Athlete, error) { return Athlete{ID: 31337, Firstname: "Matt", Username: "matt"}, nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/strava/callback?code=c1&state="+state, nil)
+			rec := httptest.NewRecorder()
+			s.OnboardingHandler().ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	sort.Ints(codes)
+	if codes[0] != http.StatusOK || codes[1] != http.StatusConflict {
+		t.Fatalf("codes = %v, want exactly one 200 and one 409", codes)
+	}
+	sent := caps.byThread("999000111222")
+	if len(sent) != 1 {
+		t.Fatalf("captured %d confirms, want exactly 1", len(sent))
+	}
+	if status, ok := onboardingStatus(t, pool, state); !ok || status != "done" {
+		t.Fatalf("onboarding status = %q (ok=%v), want \"done\"", status, ok)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes`).Scan(&n); err != nil {
+		t.Fatalf("count strava_athletes: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("athlete rows = %d, want exactly 1", n)
 	}
 }
 
