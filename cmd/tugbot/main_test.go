@@ -101,8 +101,8 @@ func TestReadyThreeWayKeepsNegativeIDRows(t *testing.T) {
 
 // TestRegisterCommandsUsesReadySliceRustOrder locks the single-load reuse
 // (M3: registerCommands takes the readyThreeWay slice, no second read) and
-// the Rust mod.rs:285-302 vector order on the six non-gulag shapes
-// (M11: AI Slop, horny, phony, feature, cull, gimmick).
+// the Rust mod.rs:285-302 vector order on the seven non-gulag shapes
+// (M11: AI Slop, horny, phony, feature, cull, gimmick, strava).
 func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	pool := setupTestDB(t)
 	if pool == nil {
@@ -140,14 +140,14 @@ func TestRegisterCommandsUsesReadySliceRustOrder(t *testing.T) {
 	}
 	want := []string{
 		"999/AI Slop", "999/horny", "999/phony", "999/feature", "999/cull",
-		"999/gimmick",
+		"999/gimmick", "999/strava",
 	}
 	if len(shapes) != len(want) {
 		t.Fatalf("shape registrations: got %v, want %v", shapes, want)
 	}
 	for i := range want {
 		if shapes[i] != want[i] {
-			t.Errorf("shape %d: got %q, want %q (Rust mod.rs vector order: AI Slop, horny, phony, feature, cull, gimmick)", i, shapes[i], want[i])
+			t.Errorf("shape %d: got %q, want %q (Rust mod.rs vector order: AI Slop, horny, phony, feature, cull, gimmick, strava)", i, shapes[i], want[i])
 		}
 	}
 }

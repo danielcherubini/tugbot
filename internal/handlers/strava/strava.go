@@ -8,6 +8,8 @@ package strava
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -52,6 +54,10 @@ const firstPollLookback = 24 * time.Hour
 // table (a re-listed 'posted' row never re-posts), and the overlap widens
 // ONLY the list window — the cursor ADVANCE math (step e) is unchanged.
 const windowOverlap = time.Hour
+
+// onboardingTTL is how long a /strava authorize link stays valid before the
+// pending row expires (unused rows simply lapse).
+const onboardingTTL = time.Hour
 
 // The seen-activity dispositions.
 const (
@@ -675,4 +681,125 @@ func formatNoun(a Activity) string {
 // buildPost is the exact two-line post: the label line + the activity link.
 func buildPost(label, noun, activityID string) string {
 	return label + " finished " + noun + "\n" + "https://www.strava.com/activities/" + activityID
+}
+
+// ---------------------------------------------------------------------------
+// The /strava command (onboarding): a member runs it in the thread they
+// want posts to; the bot replies with a one-time, state-scoped authorize
+// link and inserts a pending row (migration 000008).
+// ---------------------------------------------------------------------------
+
+// Response is this module's share of Rust's HandlerResponse shape: the
+// command never defers, so the fields it uses are Content and Ephemeral
+// (always false — the reply lands in the thread); DeferResponse is present
+// for parity with the Rust struct default `Option::None`.
+type Response struct {
+	Content       string
+	Ephemeral     bool
+	DeferResponse *bool
+}
+
+// sanitizeLabel trims the label, collapses newline sequences to single
+// spaces, and caps at 32 runes (first 32). The newline order matters: "\r\n"
+// is replaced as a UNIT first (one space, not two), then lone "\r", then
+// lone "\n" — a naive two-pass ReplaceAll would turn "A\r\nB" into "A  B".
+// Empty/whitespace-only input returns "".
+func sanitizeLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	r := []rune(s)
+	if len(r) > 32 {
+		return string(r[:32])
+	}
+	return s
+}
+
+// newState is the one-time state token: 16 random bytes as 32 lowercase
+// hex chars.
+func newState() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// authorizeURL is the exact Strava authorize URL. The redirect URI is a
+// code constant (public, not a secret); the client_id is already public in
+// the URL.
+func authorizeURL(clientID, state string) string {
+	return "https://www.strava.com/oauth/authorize?client_id=" + clientID +
+		"&redirect_uri=https%3A%2F%2Ftugbot.wizards.town%2Fstrava%2Fcallback&response_type=code&scope=activity:read_all&state=" + state
+}
+
+// SetupCommand is the /strava registration: one optional string option
+// "label" (the feat handler's option shape is the template).
+func (s *Strava) SetupCommand() *discordgo.ApplicationCommand {
+	return &discordgo.ApplicationCommand{
+		Type:        discordgo.ChatApplicationCommand,
+		Name:        "strava",
+		Description: "Add your Strava account — finished runs and rides post to this thread",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Name:        "label",
+				Type:        discordgo.ApplicationCommandOptionString,
+				Description: "Display name for posts (defaults to your Strava first name)",
+				// Required left false — the label is optional.
+			},
+		},
+	}
+}
+
+// HandleInteraction is the /strava command body. It does NOT gate on the
+// feature flag (onboarding is valid while the feature is off — the row just
+// sits until it's enabled) and does NOT dedupe (a second /strava in the same
+// thread inserts a fresh row; the unused one expires). DB failures become an
+// error Response — never a panic.
+func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
+	// Creds preflight: without client credentials the link would be dead —
+	// reply without inserting a row.
+	if s.app.Cfg.StravaClientID == "" || s.app.Cfg.StravaClientSecret == "" {
+		return Response{Content: "strava is not configured on this bot — the owner needs to set the client credentials first"}
+	}
+	// Extract the label: first option (if any), string value.
+	var label string
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok && len(data.Options) > 0 {
+		if v, ok := data.Options[0].Value.(string); ok {
+			label = sanitizeLabel(v)
+		}
+	}
+	state, err := newState()
+	if err != nil {
+		slog.Error("onboarding state generation failed", "module", "strava", "error", err)
+		return Response{Content: "onboarding setup failed — try again"}
+	}
+	// thread_id: the interaction's ChannelID is a string; the column is
+	// bigint. Empty/unparsable → the setup-failed reply (no row).
+	threadID, err := strconv.ParseInt(i.ChannelID, 10, 64)
+	if err != nil {
+		slog.Error("onboarding channel id unparsable", "module", "strava", "channel_id", i.ChannelID, "error", err)
+		return Response{Content: "onboarding setup failed — try again"}
+	}
+	var labelArg any = nil
+	if label != "" {
+		labelArg = label
+	}
+	_, err = s.app.Pool.Exec(context.Background(),
+		`INSERT INTO strava_onboardings (state, thread_id, label, status, created_at, expires_at)
+		VALUES ($1, $2, $3, 'pending', now(), now() + $4::interval)`,
+		state, threadID, labelArg, onboardingTTL.String())
+	if err != nil {
+		slog.Error("onboarding row insert failed", "module", "strava", "error", err)
+		return Response{Content: "onboarding setup failed — try again"}
+	}
+	content := authorizeURL(s.app.Cfg.StravaClientID, state) + " — this link expires in an hour."
+	// The disabled-clause (the command itself is NOT gated on the flag).
+	if !features.IsEnabled(context.Background(), s.app.Pool, FeatureKey) {
+		content += " (the strava feature is disabled — you'll be tracked once it's enabled)"
+	}
+	// Ephemeral stays false — the reply lands in the thread (where the
+	// later confirm lands).
+	return Response{Content: content}
 }

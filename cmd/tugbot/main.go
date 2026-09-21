@@ -724,7 +724,7 @@ func (r reply) deliverySet() []string {
 // the pinned name order: gulag, gulag-release, gulag-list, Add Gulag
 // Vote (message-kind, target_id = message id → outific author), AI Slop
 // (message-kind, first resolved message), phony, horny (both via
-// prefixhandler), feature (Feat), cull, gimmick. Fallthrough: ephemeral "Not
+// prefixhandler), feature (Feat), cull, gimmick, strava (Strava). Fallthrough: ephemeral "Not
 // Implemented" WITHOUT a defer (Rust defer_response: None).
 func (h *handlers) dispatchCommand(i *discordgo.Interaction) reply {
 	name := ""
@@ -765,6 +765,9 @@ func (h *handlers) dispatchCommand(i *discordgo.Interaction) reply {
 	case "gimmick":
 		r := h.gimmick.HandleInteraction(i)
 		return reply{content: r.Content, ephemeral: r.Ephemeral, chunks: r.Chunks}
+	case "strava":
+		r := h.strava.HandleInteraction(i)
+		return reply{content: r.Content, ephemeral: r.Ephemeral}
 	default:
 		return reply{content: "Not Implemented", ephemeral: true}
 	}
@@ -856,12 +859,12 @@ func (h *handlers) readyThreeWay(ctx context.Context) []serverRow {
 	return verified
 }
 
-// registerCommands pins the per-guild registration: EXACTLY the ten
-// command shapes (8 slash + 2 message-kind; there is no "goku"). The
+// registerCommands pins the per-guild registration: EXACTLY the eleven
+// command shapes (9 slash + 2 message-kind; there is no "goku"). The
 // four gulag shapes (gulag, gulag-release, gulag-list, Add Gulag Vote)
 // go through the canonical gulag.SetupCommand — registered onto every
-// configured guild at once — then the remaining six shapes (AI Slop,
-// phony, horny, feature, cull, gimmick) in the Rust ready() vector
+// configured guild at once — then the remaining seven shapes (AI Slop,
+// phony, horny, feature, cull, gimmick, strava) in the Rust ready() vector
 // order, per
 // guild. The per-guild iteration consumes the ready three-way's row
 // slice (the caller's readyThreeWay result, passed in) — ONE load,
@@ -875,7 +878,7 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 	for _, s := range servers {
 		gid := strconv.FormatInt(s.GuildID, 10)
 		// Rust ready() vector order (after the four gulag shapes):
-		// AI Slop, horny, phony, feature, cull, gimmick.
+		// AI Slop, horny, phony, feature, cull, gimmick, strava.
 		shapes := []*discordgo.ApplicationCommand{
 			h.aiSlop.SetupCommand(),
 			h.prefix.SetupCommand("horny", "Mark yourself as horny/lfg"),
@@ -883,6 +886,7 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 			h.feat.SetupCommand(),
 			h.cull.SetupCommand(),
 			h.gimmick.SetupCommand(),
+			h.strava.SetupCommand(),
 		}
 		for _, cmd := range shapes {
 			if err := h.applyShape(gid, cmd); err != nil {
@@ -892,7 +896,7 @@ func (h *handlers) registerCommands(ctx context.Context, servers []serverRow) {
 	}
 
 	slog.Info("I now have the following guild slash commands:", "module", "main")
-	for _, n := range []string{"gulag", "gulag-release", "gulag-list", "Add Gulag Vote", "AI Slop", "horny", "phony", "feature", "cull", "gimmick"} {
+	for _, n := range []string{"gulag", "gulag-release", "gulag-list", "Add Gulag Vote", "AI Slop", "horny", "phony", "feature", "cull", "gimmick", "strava"} {
 		slog.Info(n, "module", "main")
 	}
 }

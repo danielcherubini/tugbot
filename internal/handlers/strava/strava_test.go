@@ -198,3 +198,116 @@ func TestMakePostTitleSanitize(t *testing.T) {
 		t.Errorf("makePost(label) = %q, want exactly two lines %q", gotL.message, wantL)
 	}
 }
+
+// TestSanitizeLabel pins the /strava label sanitizer: trims, newlines
+// collapse to single spaces, 32-rune cap (first 32 runes), empty for
+// empty/whitespace-only input.
+func TestSanitizeLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"trims spaces", "  Sam  ", "Sam"},
+		{"lone newline", "An\nna", "An na"},
+		{"CRLF unit", "A\r\nB", "A B"},
+		{"40-rune input caps at 32", strings.Repeat("a", 40), strings.Repeat("a", 32)},
+		{"empty", "", ""},
+		{"whitespace only", "   ", ""},
+		{"32-rune input unchanged", strings.Repeat("b", 32), strings.Repeat("b", 32)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sanitizeLabel(c.in); got != c.want {
+				t.Errorf("sanitizeLabel(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeLabelCR pins the newline-ordering: \r\n is replaced as a
+// UNIT first (one space, not two), then lone \r, then lone \n — a
+// naive two-pass ReplaceAll would turn "A\r\nB" into "A  B".
+func TestSanitizeLabelCR(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"CRLF as a unit -> one space", "A\r\nB", "A B"},
+		{"lone CR", "A\rB", "A B"},
+		{"lone LF", "A\nB", "A B"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sanitizeLabel(c.in); got != c.want {
+				t.Errorf("sanitizeLabel(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNewState pins the onboarding state: exactly 32 lowercase hex chars,
+// and 1000 consecutive calls produce 1000 distinct values (collision
+// guard).
+func TestNewState(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		s, err := newState()
+		if err != nil {
+			t.Fatalf("newState() call %d: %v", i, err)
+		}
+		if len(s) != 32 {
+			t.Fatalf("newState() call %d = %q (len %d), want 32 chars", i, s, len(s))
+		}
+		for _, r := range s {
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				t.Fatalf("newState() call %d = %q, want all [0-9a-f]", i, s)
+			}
+		}
+	}
+	seen := make(map[string]struct{}, 1000)
+	for i := 0; i < 1000; i++ {
+		s, err := newState()
+		if err != nil {
+			t.Fatalf("newState() call %d: %v", i, err)
+		}
+		if _, dup := seen[s]; dup {
+			t.Fatalf("newState() collision at call %d: %q", i, s)
+		}
+		seen[s] = struct{}{}
+	}
+}
+
+// TestAuthorizeURL pins the exact authorize URL (code constant redirect URI
+// — public, not a secret; the client_id is already public in the URL).
+func TestAuthorizeURL(t *testing.T) {
+	got := authorizeURL("280525", "abc123")
+	want := "https://www.strava.com/oauth/authorize?client_id=280525&redirect_uri=https%3A%2F%2Ftugbot.wizards.town%2Fstrava%2Fcallback&response_type=code&scope=activity:read_all&state=abc123"
+	if got != want {
+		t.Errorf("authorizeURL = %q, want %q", got, want)
+	}
+}
+
+// TestSetupCommandShape pins the /strava registration shape: name, exactly
+// one option (label, string, optional — the feat handler's option shape is
+// the template).
+func TestSetupCommandShape(t *testing.T) {
+	s := &Strava{}
+	cmd := s.SetupCommand()
+	if cmd.Name != "strava" {
+		t.Fatalf("Name = %q, want %q", cmd.Name, "strava")
+	}
+	if len(cmd.Options) != 1 {
+		t.Fatalf("Options = %d, want exactly 1", len(cmd.Options))
+	}
+	o := cmd.Options[0]
+	if o.Name != "label" {
+		t.Errorf("option Name = %q, want %q", o.Name, "label")
+	}
+	if o.Type != discordgo.ApplicationCommandOptionString {
+		t.Errorf("option Type = %v, want string", o.Type)
+	}
+	if o.Required {
+		t.Errorf("option Required = true, want false")
+	}
+}

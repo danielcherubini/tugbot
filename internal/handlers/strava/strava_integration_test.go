@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danielcherubini/tugbot/internal/app"
@@ -92,6 +93,16 @@ func setupStravaTestDB(t *testing.T) *pgxpool.Pool {
 		);
 		DELETE FROM features;
 		INSERT INTO features (name, enabled) VALUES ('strava', true);
+		DROP TABLE IF EXISTS strava_onboardings;
+		CREATE TABLE strava_onboardings (
+		    state      text PRIMARY KEY,
+		    thread_id  bigint NOT NULL,
+		    label      text,
+		    status     text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'failed')),
+		    created_at timestamptz NOT NULL DEFAULT now(),
+		    expires_at timestamptz NOT NULL
+		);
+		CREATE INDEX strava_onboardings_expires_at_idx ON strava_onboardings (expires_at);
 	`); err != nil {
 		pool.Close()
 		t.Skipf("cannot set up tables: %v", err)
@@ -1159,6 +1170,206 @@ func TestStravaDetailGoneSkipsDeterministic(t *testing.T) {
 		t.Errorf("pass 2: detail calls = %d, want still 1 (a seen 'skipped' row is never re-fetched)", n)
 	}
 	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
+		t.Errorf("pass 1: cursor = %v, want advanced to %v as a normal disposition", got, startG)
+	}
+
+	// ---- pass 2: G is re-listed (the −1h overlap window); detailFn still ERRs
+	// GONE: the row stays skipped, detail is NOT re-invoked, cursor untouched ----
+	if err := s.iteration(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if status, _ := seenRow(t, pool, aid, 1); status != statusSkipped {
+		t.Errorf("pass 2: G row = %q, want still skipped", status)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("pass 2: captured %d posts, want zero", n)
+	}
+	if n := stub.detailCalls; n != 1 {
+		t.Errorf("pass 2: detail calls = %d, want still 1 (a seen 'skipped' row is never re-fetched)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
 		t.Errorf("pass 2: cursor = %v, want unchanged (%v) — nothing newly dispositioned", got, startG)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The /strava command (onboarding): the command path needs no StravaAPI
+// calls — a real test-DB pool is all it touches.
+// ---------------------------------------------------------------------------
+
+// commandInteraction builds a /strava slash-command interaction (the
+// interaction-construction style: a *discordgo.Interaction carrying the
+// command data + channel id directly).
+func commandInteraction(channelID string, opts ...*discordgo.ApplicationCommandInteractionDataOption) *discordgo.Interaction {
+	return &discordgo.Interaction{
+		ChannelID: channelID,
+		Data: discordgo.ApplicationCommandInteractionData{
+			Name:    "strava",
+			Options: opts,
+		},
+	}
+}
+
+// onboardingRowCount is the strava_onboardings row count (the setup resets
+// the table per test, so the count is isolated).
+func onboardingRowCount(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_onboardings`).Scan(&n); err != nil {
+		t.Fatalf("count strava_onboardings: %v", err)
+	}
+	return n
+}
+
+// TestStravaCommandInsertsPendingOnboarding pins the happy path: the reply
+// carries the authorize URL with a 32-hex state=, and the row is inserted
+// (state, thread_id, label, status='pending', expires_at within 60–120 min
+// of now()).
+func TestStravaCommandInsertsPendingOnboarding(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, nil, 0)
+	i := commandInteraction("999000111222", &discordgo.ApplicationCommandInteractionDataOption{
+		Name:  "label",
+		Type:  discordgo.ApplicationCommandOptionString,
+		Value: "Matt",
+	})
+	r := s.HandleInteraction(i)
+
+	wantPrefix := "https://www.strava.com/oauth/authorize?client_id=test-client-id&"
+	if !strings.HasPrefix(r.Content, wantPrefix) {
+		t.Fatalf("reply = %q, want it to start with %q", r.Content, wantPrefix)
+	}
+	stateSuffix := strings.SplitN(r.Content, "&state=", 2)
+	if len(stateSuffix) != 2 {
+		t.Fatalf("reply = %q, want a &state= token", r.Content)
+	}
+	if len(stateSuffix[1]) < 32 {
+		t.Fatalf("state = %q, want at least 32 chars", stateSuffix[1])
+	}
+	state := stateSuffix[1][:32]
+	for _, c := range state {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			t.Fatalf("state = %q, want all [0-9a-f]", state)
+		}
+	}
+
+	var threadID int64
+	var label, status string
+	var expires time.Time
+	err := pool.QueryRow(context.Background(),
+		`SELECT thread_id, label, status, expires_at FROM strava_onboardings WHERE state = $1`, state).
+		Scan(&threadID, &label, &status, &expires)
+	if err != nil {
+		t.Fatalf("row lookup: %v", err)
+	}
+	if threadID != 999000111222 {
+		t.Errorf("thread_id = %d, want 999000111222", threadID)
+	}
+	if label != "Matt" {
+		t.Errorf("label = %q, want 'Matt'", label)
+	}
+	if status != "pending" {
+		t.Errorf("status = %q, want 'pending'", status)
+	}
+	delta := time.Until(expires)
+	// ±1 min: the DB's now() and Go's time.Now() skew by milliseconds
+	// (the delta lands just under 60m in the DB-time-earlier case).
+	if delta < 59*time.Minute || delta > 121*time.Minute {
+		t.Errorf("expires_at = %v (%v from now), want within ~60–120 min (59–121)", expires, delta)
+	}
+}
+
+// TestStravaCommandOmittedLabelIsNULL pins the omitted-label path: no
+// options → the row's label IS NULL; the reply still carries a valid link.
+func TestStravaCommandOmittedLabelIsNULL(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, nil, 0)
+	i := commandInteraction("999000111222")
+	r := s.HandleInteraction(i)
+	if !strings.Contains(r.Content, "https://www.strava.com/oauth/authorize?client_id=test-client-id") {
+		t.Fatalf("reply = %q, want a valid authorize link", r.Content)
+	}
+	state := strings.SplitN(r.Content, "&state=", 2)
+	if len(state) != 2 || len(state[1]) < 32 {
+		t.Fatalf("reply = %q, want a 32-hex &state= token", r.Content)
+	}
+	var label any
+	if err := pool.QueryRow(context.Background(),
+		`SELECT label FROM strava_onboardings WHERE state = $1`, state[1][:32]).Scan(&label); err != nil {
+		t.Fatalf("row lookup: %v", err)
+	}
+	if label != nil {
+		t.Errorf("label = %v, want SQL NULL", label)
+	}
+}
+
+// TestStravaCommandUnconfiguredCreds pins the creds preflight: an empty
+// StravaClientID → the "not configured" text, ZERO rows inserted (the link
+// would be dead).
+func TestStravaCommandUnconfiguredCreds(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s := &Strava{
+		app: &app.App{
+			Pool: pool,
+			Cfg:  &config.Config{StravaPollMinutes: 15},
+		},
+		poll: 15 * time.Minute,
+	}
+	i := commandInteraction("999000111222", &discordgo.ApplicationCommandInteractionDataOption{
+		Name:  "label",
+		Type:  discordgo.ApplicationCommandOptionString,
+		Value: "Matt",
+	})
+	r := s.HandleInteraction(i)
+	want := "strava is not configured on this bot — the owner needs to set the client credentials first"
+	if r.Content != want {
+		t.Errorf("reply = %q, want %q", r.Content, want)
+	}
+	if n := onboardingRowCount(t, pool); n != 0 {
+		t.Errorf("onboarding rows = %d, want zero", n)
+	}
+}
+
+// TestStravaCommandFlagOffClause pins the disabled-clause: with the strava
+// feature flag OFF the reply appends the clause (the command itself is NOT
+// gated on the flag — the row is still inserted). The flag is restored in
+// a t.Cleanup.
+func TestStravaCommandFlagOffClause(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	if _, err := pool.Exec(context.Background(), `UPDATE features SET enabled = false WHERE name = 'strava'`); err != nil {
+		t.Fatalf("disable flag: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `UPDATE features SET enabled = true WHERE name = 'strava'`); err != nil {
+			t.Errorf("restore flag: %v", err)
+		}
+	})
+	s, _ := newTestStrava(t, pool, nil, 0)
+	i := commandInteraction("999000111222")
+	r := s.HandleInteraction(i)
+	if !strings.Contains(r.Content, "(the strava feature is disabled — you'll be tracked once it's enabled)") {
+		t.Errorf("reply = %q, want the disabled-clause", r.Content)
+	}
+	if !strings.Contains(r.Content, "https://www.strava.com/oauth/authorize") {
+		t.Errorf("reply = %q, want the authorize link (the command is NOT gated on the flag)", r.Content)
+	}
+	if n := onboardingRowCount(t, pool); n != 1 {
+		t.Errorf("onboarding rows = %d, want 1 (the row sits until the flag is enabled)", n)
+	}
+}
+
+// TestStravaCommandUnparsableChannelID pins the empty ChannelID path: the
+// "onboarding setup failed — try again" reply, ZERO rows inserted.
+func TestStravaCommandUnparsableChannelID(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, nil, 0)
+	i := commandInteraction("")
+	r := s.HandleInteraction(i)
+	want := "onboarding setup failed — try again"
+	if r.Content != want {
+		t.Errorf("reply = %q, want %q", r.Content, want)
+	}
+	if n := onboardingRowCount(t, pool); n != 0 {
+		t.Errorf("onboarding rows = %d, want zero", n)
 	}
 }
