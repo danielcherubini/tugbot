@@ -36,8 +36,14 @@ func setupPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// resetMigrateState wipes all objects the test migrations create so each case
-// starts deterministic.
+// resetMigrateState wipes all objects the test migrations AND the real
+// migrations/ chain (000001-000008) create, so both kinds of test start
+// deterministic on the shared test DB. The list is verified against the
+// actual migrations/*.up.sql files (the 000001 baseline creates the
+// job_status TYPE — not a table — the two diesel functions, its tables and
+// the later files' tables; 000004 only INSERTs). Tables drop first (their
+// indexes, triggers, owned sequences go with them), then the functions,
+// then the type (a message_votes column references it).
 func resetMigrateState(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
@@ -45,6 +51,15 @@ func resetMigrateState(t *testing.T, pool *pgxpool.Pool) {
 		DROP TABLE IF EXISTS servers;
 		DROP TABLE IF EXISTS mig_test_baseline_guard;
 		DROP TABLE IF EXISTS extra_mig_test;
+		DROP TABLE IF EXISTS __diesel_schema_migrations, ai_slop_usage, features,
+			goku_poll_usage, gulag_users, gulag_votes, is_this_real_usage,
+			message_votes, reversal_of_fortunes, user_activity,
+			derpies_gimmicks, derpies_prompt, derpies_config, derpies_decisions,
+			derpies_gimmick_phrases, strava_athletes, strava_seen_activities,
+			strava_onboardings;
+		DROP FUNCTION IF EXISTS public.diesel_manage_updated_at(regclass) CASCADE;
+		DROP FUNCTION IF EXISTS public.diesel_set_updated_at() CASCADE;
+		DROP TYPE IF EXISTS public.job_status CASCADE;
 	`); err != nil {
 		t.Fatalf("reset state: %v", err)
 	}
@@ -74,7 +89,9 @@ func writeTestMigrations(t *testing.T, dir string) {
 	files := map[string]string{
 		// Note: this test migration deliberately does NOT touch the
 		// `features` table — the features package tests own that table on
-		// the same shared test database (packages run in parallel).
+		// the same shared test database (the full gate runs the DB-touching
+		// packages with -p 1; the features tests self-heal it with
+		// CREATE TABLE IF NOT EXISTS after resetMigrateState drops it).
 		"000001_baseline.up.sql": `
 			CREATE TABLE servers (
 				id serial PRIMARY KEY,
@@ -296,5 +313,144 @@ func TestNoMigrationsErrors(t *testing.T) {
 	defer cancel()
 	if err := Run(ctx, pool, dir); err == nil {
 		t.Error("Run() on empty dir: error = nil, want error")
+	}
+}
+
+// TestStravaOnboardingTable: the REAL migration chain (the migrations/ dir,
+// 000001-000008) applies cleanly through Run — the shared test DB may
+// already have the real tables (the reset above wipes them; the runner's
+// skip semantics make any leftover state a no-op) — and 000008 creates
+// strava_onboardings with the shape the onboarding flow requires: a state
+// PK, thread_id bigint NOT NULL, a nullable label, a status CHECK on the
+// three values with a 'pending' default, a created_at defaulting to now(),
+// an expires_at timestamptz NOT NULL, and an index on expires_at.
+func TestStravaOnboardingTable(t *testing.T) {
+	pool := setupPool(t)
+	resetMigrateState(t, pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := os.Stat(filepath.Join("..", "..", "migrations", "000008_strava_onboarding.up.sql")); err != nil {
+		t.Fatalf("000008_strava_onboarding.up.sql missing: %v", err)
+	}
+	if err := Run(ctx, pool, "../../migrations"); err != nil {
+		t.Fatalf("Run() on the real migrations dir: %v", err)
+	}
+
+	// The whole real chain applied: one schema_migrations row per .up.sql
+	// file (7 today — 000007 is reserved for the derpies-slowmode plan).
+	migFiles, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("glob migrations: %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	if n != len(migFiles) {
+		t.Errorf("schema_migrations rows = %d, want %d (one per .up.sql file)", n, len(migFiles))
+	}
+
+	// state is the PRIMARY KEY (structural + enforced).
+	var pkCols int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.key_column_usage k
+		JOIN information_schema.table_constraints c USING (constraint_name)
+		WHERE c.constraint_type = 'PRIMARY KEY'
+		  AND k.table_schema = 'public' AND k.table_name = 'strava_onboardings'
+		  AND k.column_name = 'state'
+	`).Scan(&pkCols); err != nil {
+		t.Fatalf("pk query: %v", err)
+	}
+	if pkCols != 1 {
+		t.Error("strava_onboardings has no PRIMARY KEY on state")
+	}
+
+	// Column shapes: thread_id bigint NOT NULL, label text NULL,
+	// status text NOT NULL DEFAULT 'pending', created_at timestamptz
+	// defaulting to now(), expires_at timestamptz NOT NULL.
+	col := func(name string) (dataType, nullable, def string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `
+			SELECT data_type, is_nullable, coalesce(column_default, '')
+			FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'strava_onboardings' AND column_name = $1
+		`, name).Scan(&dataType, &nullable, &def); err != nil {
+			t.Fatalf("column %s: %v (table missing?)", name, err)
+		}
+		return dataType, nullable, def
+	}
+	if dt, null, _ := col("thread_id"); dt != "bigint" || null != "NO" {
+		t.Errorf("thread_id = %s nullable=%s, want bigint NOT NULL", dt, null)
+	}
+	if dt, null, def := col("label"); dt != "text" || null != "YES" || def != "" {
+		t.Errorf("label = %s nullable=%s default=%q, want text NULL (no default)", dt, null, def)
+	}
+	if dt, null, def := col("status"); dt != "text" || null != "NO" || def != "'pending'::text" {
+		t.Errorf("status = %s nullable=%s default=%q, want text NOT NULL DEFAULT 'pending'", dt, null, def)
+	}
+	if dt, null, def := col("created_at"); dt != "timestamp with time zone" || null != "NO" || def != "now()" {
+		t.Errorf("created_at = %s nullable=%s default=%q, want timestamptz NOT NULL DEFAULT now()", dt, null, def)
+	}
+	if dt, null, def := col("expires_at"); dt != "timestamp with time zone" || null != "NO" || def != "" {
+		t.Errorf("expires_at = %s nullable=%s default=%q, want timestamptz NOT NULL (no default)", dt, null, def)
+	}
+
+	// The defaults apply and the PK is enforced — in one transaction (the
+	// duplicate insert aborts the tx, so it goes last; the rollback leaves
+	// no residue on the shared DB).
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO strava_onboardings (state, thread_id, expires_at) VALUES ('s1', 1, now())`); err != nil {
+		t.Fatalf("insert (status omitted): %v", err)
+	}
+	var gotStatus string
+	var gotCreatedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT status, created_at FROM strava_onboardings WHERE state = 's1'`).Scan(&gotStatus, &gotCreatedAt); err != nil {
+		t.Fatalf("read back s1: %v", err)
+	}
+	if gotStatus != "pending" {
+		t.Errorf("status default = %q, want 'pending'", gotStatus)
+	}
+	if gotCreatedAt.IsZero() {
+		t.Error("created_at = NULL on a status-omitting insert, want the now() default")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO strava_onboardings (state, thread_id, expires_at) VALUES ('s1', 2, now())`); err == nil {
+		t.Error("duplicate state inserted — the state PRIMARY KEY is not enforced")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// The CHECK rejects a fourth value and expires_at is enforced NOT NULL
+	// — each in its own transaction (a failed statement aborts the tx).
+	expectErr := func(query string) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if _, err := tx.Exec(ctx, query); err == nil {
+			t.Errorf("statement unexpectedly succeeded: %s", query)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+	}
+	expectErr(`INSERT INTO strava_onboardings (state, thread_id, status, expires_at) VALUES ('s2', 1, 'bogus', now())`) // CHECK
+	expectErr(`INSERT INTO strava_onboardings (state, thread_id) VALUES ('s3', 1)`)                                     // expires_at NOT NULL
+
+	// The index on expires_at.
+	var idx int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_indexes
+		WHERE tablename = 'strava_onboardings' AND indexdef ILIKE '%expires_at%'
+	`).Scan(&idx); err != nil {
+		t.Fatalf("index query: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("index on expires_at: found %d, want 1", idx)
 	}
 }

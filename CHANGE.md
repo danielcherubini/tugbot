@@ -1,5 +1,11 @@
 
 
+## 2026-09-21
+
+### strava: self-serve onboarding — /strava command + :8643 in-process callback (decision 0012)
+- Changed: onboarding is self-serve — the athlete runs `/strava` in the thread they want posts to go to (optional `label:<name>`), clicks the posted link, and Accepts `activity:read_all`; the `tugbot.wizards.town/strava/callback` page renders "Done — {label} is set up" (the bot exchanged the code, verified the scope, upserted the athlete row — token pair + `target_thread_id` = the command's thread + `needs_reauth = false` — and confirmed in the thread); the next 15-minute tick picks them up (24 h first-enable lookback). Re-auth: the athlete re-runs `/strava` in their (new) thread — the upsert refreshes the token pair, clears `needs_reauth`, moves `target_thread_id` to the newest thread, and lands the resolved label (an explicit label overrides; an omitted one keeps the stored label). The manual flow (consent + code exchange + the one-statement SQL insert) stays the fallback. Infrastructure: the caddy `tugbot.wizards.town` block is scoped to `handle /strava/callback` and proxies to the bot host's `:8643`; the earlier standalone `strava-callback` sidecar (box-local `:8080`) is retired; the selftest gate string gains the clause `… and the strava onboarding callback constructed`.
+- Code: `internal/handlers/strava/{strava,client}.go` (the `/strava` command, the `:8643` `Start(ctx)` errgroup arm, the onboarding callback), `cmd/tugbot/main.go` (wiring + selftest clause), `migrations/000008_strava_onboarding.up.sql` (the `strava_onboardings` table), `docs/features/strava.md` (self-serve as the primary path + re-auth + the runtime-surface section; the `verified-by` gate string updated).
+
 ## 2026-09-19
 
 ### gulag: reaction get-reaction-users emoji argument — the markup form 400'd every voter fetch, the reaction→vote→gulag path was dead since cutover

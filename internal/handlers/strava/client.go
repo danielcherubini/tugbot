@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,12 @@ type ErrRateLimited struct{ RetryAfter string } // 429 + X-RateLimit headers
 type ErrTransient struct{ Cause error }         // 5xx / network / unexpected 4xx (a DETAIL 404 is NOT here — that is ErrGone)
 type ErrGone struct{}                           // 404 on the DETAIL endpoint: the listed id is gone (deleted / access revoked)
 
+// ErrInvalidCode is the code-grant 400/422 class: the authorization code is
+// single-use, so a 400 almost always means it was already consumed or
+// malformed. Distinct from the refresh grant's 400 invalid_grant mapping
+// (ErrUnauthorized) — the code grant routes 400 to THIS class instead.
+var ErrInvalidCode = errors.New("strava: invalid or already-used authorization code")
+
 func (e ErrUnauthorized) Error() string { return "strava: unauthorized: " + e.Why }
 
 func (e ErrRateLimited) Error() string {
@@ -66,6 +73,15 @@ func (e ErrTransient) Error() string { return "strava: transient: " + e.Cause.Er
 
 func (ErrGone) Error() string { return "strava activity gone (404)" }
 
+// Athlete is the GET /api/v3/athlete model (the onboarding callback's
+// profile fetch — the label fallback + the upsert's strava_athlete_id).
+type Athlete struct {
+	ID        int64
+	Firstname string
+	Lastname  string
+	Username  string
+}
+
 // StravaAPI is the seam the handler resolves through (tests stub it).
 type StravaAPI interface {
 	// ListActivities pages internally: fixed `after` anchor, `page` parameter
@@ -76,6 +92,15 @@ type StravaAPI interface {
 	// client_id, client_secret, refresh_token). The ROTATED refresh_token is
 	// part of the return — the caller MUST persist it (spec).
 	RefreshToken(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, newRefreshToken string, expiresAt time.Time, err error)
+	// GetAthlete performs GET /api/v3/athlete (Bearer auth). 401 →
+	// ErrUnauthorized (a deauthorized token mid-onboarding); 404 → ErrGone;
+	// other non-200 → the classifyStatus class (ErrTransient).
+	GetAthlete(ctx context.Context, token string) (Athlete, error)
+	// ExchangeCode performs POST /oauth/token (the ROOT endpoint, grant_type=
+	// authorization_code form: client_id, client_secret, code). The code is
+	// single-use. Status mapping is CUSTOM (not classifyStatus): 401 →
+	// ErrUnauthorized; 400/422 → ErrInvalidCode; other non-200 → plain error.
+	ExchangeCode(ctx context.Context, clientID, clientSecret, code string) (accessToken string, refreshToken string, expiresAt time.Time, scope string, err error)
 }
 
 type stravaClient struct{ base string }
@@ -196,6 +221,69 @@ func (c *stravaClient) RefreshToken(ctx context.Context, clientID, clientSecret,
 	return tok.AccessToken, tok.RefreshToken, time.Unix(int64(tok.ExpiresAt), 0).UTC(), nil
 }
 
+func (c *stravaClient) GetAthlete(ctx context.Context, token string) (Athlete, error) {
+	var raw struct {
+		ID        int64  `json:"id"`
+		Firstname string `json:"firstname"`
+		Lastname  string `json:"lastname"`
+		Username  string `json:"username"`
+	}
+	status, err := c.getJSON(ctx, c.base+"/api/v3/athlete", token, &raw)
+	if err != nil {
+		// Endpoint-specific mapping on top of classifyStatus: a 404 on this
+		// profile endpoint is ErrGone (the account is gone / access revoked);
+		// 401 stays ErrUnauthorized (a deauthorized token mid-onboarding);
+		// the other non-200 class stays classifyStatus (ErrTransient).
+		if status == http.StatusNotFound {
+			return Athlete{}, ErrGone{}
+		}
+		return Athlete{}, err
+	}
+	return Athlete{ID: raw.ID, Firstname: raw.Firstname, Lastname: raw.Lastname, Username: raw.Username}, nil
+}
+
+func (c *stravaClient) ExchangeCode(ctx context.Context, clientID, clientSecret, code string) (string, string, time.Time, string, error) {
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("client_secret", clientSecret)
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+tokenPath, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", time.Time{}, "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := stravaHTTP.Do(req)
+	if err != nil {
+		return "", "", time.Time{}, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", time.Time{}, "", err
+	}
+	// Custom mapping (NOT classifyStatus, whose 400 invalid_grant →
+	// ErrUnauthorized and other-4xx → ErrTransient are wrong for the code
+	// grant): 401 → ErrUnauthorized; 400/422 → ErrInvalidCode (the code is
+	// single-use — a 400 almost always means already-consumed or malformed);
+	// other non-200 → plain error.
+	if resp.StatusCode != http.StatusOK {
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			return "", "", time.Time{}, "", ErrUnauthorized{Why: "http 401"}
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return "", "", time.Time{}, "", ErrInvalidCode
+		}
+		return "", "", time.Time{}, "", fmt.Errorf("strava: unexpected status %d", resp.StatusCode)
+	}
+	var tok tokenWire
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return "", "", time.Time{}, "", fmt.Errorf("decode token response: %w", err)
+	}
+	// expires_at is epoch seconds in the API response.
+	return tok.AccessToken, tok.RefreshToken, time.Unix(int64(tok.ExpiresAt), 0), tok.Scope, nil
+}
+
 // getJSON runs a Bearer-authed GET and decodes the 200 body into out; any
 // non-200 status is mapped through classifyStatus, and transport errors
 // (dial/TLS/timeout) are returned as ErrTransient. The response status is
@@ -302,4 +390,5 @@ type tokenWire struct {
 	AccessToken  string  `json:"access_token"`
 	RefreshToken string  `json:"refresh_token"`
 	ExpiresAt    float64 `json:"expires_at"`
+	Scope        string  `json:"scope"`
 }
