@@ -73,7 +73,7 @@ The Instagram handler's mechanic — the 1:1 port of `instagram.rs` (feature-gat
 _Avoid_: kkinstagram rewrite, rewriter
 
 **Athlete**:
-A monitored Strava user who authorized the tugbot Strava app through the one-time OAuth consent (the redirect is served at `tugbot.wizards.town/strava/callback` — an in-process listener caddy proxies; the `localhost` flow stays valid via Strava's independent localhost whitelist; see **Onboarding**). Lives as a row in `strava_athletes` (label, Strava id, rotating tokens, `last_polled_at` cursor, nullable per-athlete thread, `needs_reauth`). Growing the set is purely operational (dashboard self-upgrade to 10 athletes + one onboarding per person — self-serve via **Onboarding**, or the manual runbook SQL) — never a code change.
+A monitored Strava user who authorized the tugbot Strava app through the one-time OAuth consent (the redirect is served at `tugbot.wizards.town/strava/callback` — an in-process listener caddy proxies; the `localhost` flow stays valid via Strava's independent localhost whitelist; see **Onboarding**). Lives as a row in `strava_athletes` (label, Strava id, rotating tokens, `last_polled_at` cursor, nullable per-athlete thread, `needs_reauth`). Growing the set is purely operational (the app is on the 10-athlete tier via the self-serve dashboard upgrade + one onboarding per person — self-serve via **Onboarding**, or the manual runbook SQL) — never a code change.
 _Avoid_: user (when about the Strava side), player, authorized user
 
 **Onboarding**:
