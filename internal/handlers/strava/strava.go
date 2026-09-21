@@ -805,7 +805,15 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 	}
 	content := authorizeURL(s.app.Cfg.StravaClientID, state) + " — this link expires in an hour."
 	// The disabled-clause (the command itself is NOT gated on the flag).
-	if !features.IsEnabled(context.Background(), s.app.Pool, FeatureKey) {
+	// CheckEnabled, not IsEnabled: IsEnabled silently returns false on ANY
+	// DB error, so a transient pool blip would append the clause on a
+	// perfectly valid link. On a DB error append nothing — the link is
+	// still valid and the row is still inserted (the command is ungated).
+	enabled, flagErr := features.CheckEnabled(context.Background(), s.app.Pool, FeatureKey)
+	switch {
+	case flagErr != nil:
+		slog.Warn("strava feature flag check failed", "module", "strava", "error", flagErr)
+	case !enabled:
 		content += " (the strava feature is disabled — you'll be tracked once it's enabled)"
 	}
 	// Ephemeral stays false — the reply lands in the thread (where the
@@ -855,9 +863,9 @@ func resolveLabel(rowLabel, existingLabel, firstname, username string) string {
 }
 
 // onboardingPage renders the full HTML page (the same shape the retired
-// sidecar rendered). All three fields are escaped. The page never carries
+// sidecar rendered). Both fields are escaped. The page never carries
 // secrets: the code is single-use and the tokens are never rendered.
-func onboardingPage(status int, title, body string) []byte {
+func onboardingPage(title, body string) []byte {
 	var b strings.Builder
 	b.WriteString("<!doctype html>\n<html><head><meta charset=\"utf-8\">" +
 		"<style>body{font-family:monospace}</style></head><body>\n")
@@ -894,37 +902,54 @@ func (s *Strava) OnboardingHandler() http.Handler {
 		// 1. Route guard: only GET /strava/callback.
 		if r.Method != http.MethodGet || r.URL.Path != "/strava/callback" {
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write(onboardingPage(http.StatusNotFound, "Not found", ""))
+			_, _ = w.Write(onboardingPage("Not found", ""))
 			return
 		}
 		render := func(status int, title, body string) {
 			w.WriteHeader(status)
-			_, _ = w.Write(onboardingPage(status, title, body))
+			_, _ = w.Write(onboardingPage(title, body))
 		}
 		// 2. Throttle — 10 per rolling 60 s, BEFORE any DB work. Key = the
-		// first hop of X-Forwarded-For (caddy sets it — behind the proxy
+		// LAST hop of X-Forwarded-For — caddy's default reverse_proxy
+		// PRESERVES an inbound client-supplied XFF and APPENDS the
+		// trusted client IP at the END of the chain, so the first hop is
+		// attacker-controlled (an internet client rotating its own XFF
+		// would get a fresh bucket per request); behind the proxy
 		// r.RemoteAddr is always caddy's own address, so RemoteAddr alone
-		// would be one global bucket for every athlete); fall back to
+		// would be one global bucket for every athlete. Fall back to
 		// r.RemoteAddr when the header is absent. Pinned semantics: at
 		// onboarding scale (a handful of humans/hour) the 10/min budget is
 		// deliberate and sufficient even if it collapses to a global bucket
 		// for a direct (non-proxied) hit.
 		key := r.RemoteAddr
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i >= 0 {
-				key = strings.TrimSpace(xff[:i])
-			} else {
-				key = strings.TrimSpace(xff)
+			hops := strings.Split(xff, ",")
+			for i := len(hops) - 1; i >= 0; i-- {
+				if hop := strings.TrimSpace(hops[i]); hop != "" {
+					key = hop
+					break
+				}
 			}
 		}
 		now := time.Now()
 		thMu.Lock()
+		// Sweep: delete entries whose window has lapsed — without this
+		// every unique key ever seen leaks an entry forever (attacker-
+		// controlled unbounded growth on an unauthenticated port). The map
+		// is small at onboarding scale, so a full sweep under the mutex is
+		// cheap.
+		for k, e := range thState {
+			if !e.windowStart.IsZero() && now.Sub(e.windowStart) >= throttleWindow {
+				delete(thState, k)
+			}
+		}
 		e := thState[key]
 		if e.windowStart.IsZero() || now.Sub(e.windowStart) >= throttleWindow {
 			e = throttleEntry{windowStart: now} // lazy pruning: the stale entry resets
 		}
 		if e.count >= throttleLimit {
 			thMu.Unlock()
+			w.Header().Set("Retry-After", "60")
 			render(http.StatusTooManyRequests, "Too many requests", "Too many requests — try again later")
 			return
 		}
@@ -1008,7 +1033,7 @@ func (s *Strava) OnboardingHandler() http.Handler {
 		// 6. Scope check.
 		if !scopeHasReadAll(scope) {
 			markFailed("strava onboarding scope missing")
-			slog.Warn("strava onboarding scope missing", "module", "strava", "state", state, "error", "consent lacked activity:read_all")
+			slog.Warn("strava onboarding scope missing", "module", "strava", "state", state, "reason", "consent lacked activity:read_all")
 			render(http.StatusBadRequest, "Insufficient scope", "consent lacked activity:read_all — use the link /strava posts")
 			return
 		}
@@ -1091,7 +1116,14 @@ func (s *Strava) OnboardingHandler() http.Handler {
 // startup, not at the next SIGTERM); a clean cancel returns nil (never
 // leaking context.Canceled or http.ErrServerClosed).
 func (s *Strava) Start(ctx context.Context) error {
-	hs := &http.Server{Addr: stravaOnboardAddr, Handler: s.OnboardingHandler()}
+	hs := &http.Server{
+		Addr:    stravaOnboardAddr,
+		Handler: s.OnboardingHandler(),
+		// ReadHeaderTimeout: a slowloris against the all-interfaces :8643
+		// directly (bypassing caddy) could otherwise hold connections
+		// indefinitely.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	// Capacity 1: the single ListenAndServe result (the bind error or the
 	// server-closed termination) is exactly once, and a buffered send
 	// never blocks the goroutine on any path.

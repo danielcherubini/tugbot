@@ -555,10 +555,14 @@ func run() {
 
 	// Strava onboarding callback (decision 0012): Start blocks until the
 	// ctx cancels and returns nil on a clean cancel (the mcp.Server.Start
-	// template), so eg.Wait() stays clean on SIGTERM. Anything else is the
-	// startup-failure class (port-in-use and friends) — that must be
-	// FATAL (slog.Error + os.Exit(1)), NOT degenerate into the SIGTERM
-	// slog.Warn path (which would swallow the bind failure and continue).
+	// template), so eg.Wait() stays clean on SIGTERM. Deliberate
+	// divergence from the adjacent MCP arm: this arm passes egCtx (tied
+	// to the errgroup) rather than the shared ctx — behaviorally
+	// identical here (every arm returns nil), but the principled choice.
+	// Anything else is the startup-failure class (port-in-use and
+	// friends) — that must be FATAL (slog.Error + os.Exit(1)), NOT
+	// degenerate into the SIGTERM slog.Warn path (which would swallow
+	// the bind failure and continue).
 	eg.Go(func() error {
 		if err := h.strava.Start(egCtx); err != nil {
 			// Start returns nil on clean ctx-cancel; anything else is a

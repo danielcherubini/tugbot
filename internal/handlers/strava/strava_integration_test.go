@@ -1198,24 +1198,6 @@ func TestStravaDetailGoneSkipsDeterministic(t *testing.T) {
 		t.Errorf("pass 2: detail calls = %d, want still 1 (a seen 'skipped' row is never re-fetched)", n)
 	}
 	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
-		t.Errorf("pass 1: cursor = %v, want advanced to %v as a normal disposition", got, startG)
-	}
-
-	// ---- pass 2: G is re-listed (the −1h overlap window); detailFn still ERRs
-	// GONE: the row stays skipped, detail is NOT re-invoked, cursor untouched ----
-	if err := s.iteration(ctx); err != nil {
-		t.Fatalf("pass 2: %v", err)
-	}
-	if status, _ := seenRow(t, pool, aid, 1); status != statusSkipped {
-		t.Errorf("pass 2: G row = %q, want still skipped", status)
-	}
-	if n := len(caps.posts); n != 0 {
-		t.Errorf("pass 2: captured %d posts, want zero", n)
-	}
-	if n := stub.detailCalls; n != 1 {
-		t.Errorf("pass 2: detail calls = %d, want still 1 (a seen 'skipped' row is never re-fetched)", n)
-	}
-	if got := cursorAt(t, pool, aid); !got.Equal(startG) {
 		t.Errorf("pass 2: cursor = %v, want unchanged (%v) — nothing newly dispositioned", got, startG)
 	}
 }

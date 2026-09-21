@@ -1,8 +1,11 @@
 package strava
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -369,24 +372,151 @@ func TestResolveLabel(t *testing.T) {
 // handler (no app, no pool — the throttle state is closure-local to
 // OnboardingHandler and fires at the request edge before any app/pool
 // access): 10 requests from one client pass (any status, but not 429), the
-// 11th gets 429. Key = the X-Forwarded-For first hop, falling back to
-// RemoteAddr when the header is absent (absent here — the specified keying).
+// 11th gets 429. Key = the LAST hop of X-Forwarded-For — caddy's
+// reverse_proxy PRESERVES an inbound client-supplied XFF and APPENDS the
+// trusted client IP at the END of the chain, so the first hop is
+// attacker-controlled — falling back to RemoteAddr when the header is
+// absent.
 func TestOnboardingThrottle(t *testing.T) {
 	s := &Strava{}
 	h := s.OnboardingHandler()
-	doReq := func() int {
+	doReq := func(xff string) int {
 		req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
 		req.RemoteAddr = "1.2.3.4:9999"
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	for i := 0; i < 10; i++ {
-		if code := doReq(); code == http.StatusTooManyRequests {
-			t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+	t.Run("RemoteAddr fallback (no XFF header)", func(t *testing.T) {
+		for i := 0; i < 10; i++ {
+			if code := doReq(""); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
 		}
+		if code := doReq(""); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429", code)
+		}
+	})
+	t.Run("XFF last-hop keying", func(t *testing.T) {
+		s2 := &Strava{}
+		h2 := s2.OnboardingHandler()
+		doReq2 := func(xff string) int {
+			req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
+			req.RemoteAddr = "1.2.3.4:9999"
+			req.Header.Set("X-Forwarded-For", xff)
+			rec := httptest.NewRecorder()
+			h2.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		// Two requests with different XFF values → separate buckets, both
+		// pass.
+		if code := doReq2("1.1.1.1"); code == http.StatusTooManyRequests {
+			t.Fatalf("first 1.1.1.1 request got 429, want it to pass")
+		}
+		if code := doReq2("2.2.2.2"); code == http.StatusTooManyRequests {
+			t.Fatalf("first 2.2.2.2 request got 429, want it to pass (a separate bucket)")
+		}
+		// 11 requests with the SAME XFF value → the 11th is 429.
+		for i := 0; i < 10; i++ {
+			if code := doReq2("3.3.3.3"); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq2("3.3.3.3"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429", code)
+		}
+	})
+	t.Run("XFF multi-hop: the LAST hop is the key", func(t *testing.T) {
+		// A client rotating its own first hop (the inbound XFF caddy
+		// preserves) must NOT get a fresh bucket per request — the
+		// trusted proxy's appended hop (last) is the key. 11 requests,
+		// distinct first hops, same last hop → the 11th is 429.
+		s3 := &Strava{}
+		h3 := s3.OnboardingHandler()
+		doReq3 := func(xff string) int {
+			req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
+			req.RemoteAddr = "1.2.3.4:9999"
+			req.Header.Set("X-Forwarded-For", xff)
+			rec := httptest.NewRecorder()
+			h3.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		for i := 0; i < 10; i++ {
+			if code := doReq3(fmt.Sprintf("10.0.0.%d, 4.4.4.4", i)); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq3("10.0.0.99, 4.4.4.4"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429 (the last hop is the key — a rotated first hop is NOT a fresh bucket)", code)
+		}
+	})
+}
+
+// TestStartBindFailure pins Start's fail-fast path: a bind failure
+// (address in use) is returned promptly WITHOUT any ctx cancel — the
+// errgroup arm's os.Exit(1) fires at startup, not at the next SIGTERM.
+func TestStartBindFailure(t *testing.T) {
+	// Occupy the port for the duration of the test.
+	l, err := net.Listen("tcp", ":8643")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
 	}
-	if code := doReq(); code != http.StatusTooManyRequests {
-		t.Fatalf("request 11 got %d, want 429", code)
+	t.Cleanup(func() { _ = l.Close() })
+
+	s := &Strava{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Start() on a bound port = nil, want an error (not a panic)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not fail fast on a bound port (blocked without any ctx cancel)")
+	}
+}
+
+// TestStartNilOnCancel pins Start's clean-cancel contract (the
+// mcp.Server.Start template, mirrored by mcp's TestStartNilOnCancel): a
+// clean ctx-cancel shutdown returns nil — NOT context.Canceled, NOT
+// http.ErrServerClosed — well under the 10 s shutdown grace.
+func TestStartNilOnCancel(t *testing.T) {
+	s := &Strava{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+
+	// Let the listener come up (:8643 must accept before cancel).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("tcp", "127.0.0.1:8643")
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	start := time.Now()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start() after cancel = %v (%T), want nil", err, err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("Start() took %v after cancel, want well under the 10 s shutdown grace", elapsed)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("Start() did not return within 12s of cancel (shutdown grace must be ≤10s)")
 	}
 }
