@@ -15,6 +15,7 @@ import (
 	"html"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -772,11 +773,19 @@ func (s *Strava) HandleInteraction(i *discordgo.Interaction) Response {
 	if s.app.Cfg.StravaClientID == "" || s.app.Cfg.StravaClientSecret == "" {
 		return Response{Content: "strava is not configured on this bot — the owner needs to set the client credentials first"}
 	}
-	// Extract the label: first option (if any), string value.
+	// Extract the label: the first option whose name is "label" (a name
+	// match, not Options[0] — a future second option must not be
+	// silently misread; no matching option → empty label), string value.
 	var label string
-	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok && len(data.Options) > 0 {
-		if v, ok := data.Options[0].Value.(string); ok {
-			label = sanitizeLabel(v)
+	if data, ok := i.Data.(discordgo.ApplicationCommandInteractionData); ok {
+		for _, opt := range data.Options {
+			if opt.Name != "label" {
+				continue
+			}
+			if v, ok := opt.Value.(string); ok {
+				label = sanitizeLabel(v)
+			}
+			break
 		}
 	}
 	state, err := newState()
@@ -875,8 +884,8 @@ func onboardingPage(title, body string) []byte {
 	return []byte(b.String())
 }
 
-// throttleEntry is one client's rolling window (10 per 60 s; the entry
-// resets when its window lapses).
+// throttleEntry is one client's fixed 60 s window (10 per window; the
+// entry resets fully when the window lapses).
 type throttleEntry struct {
 	count       int
 	windowStart time.Time
@@ -909,18 +918,19 @@ func (s *Strava) OnboardingHandler() http.Handler {
 			w.WriteHeader(status)
 			_, _ = w.Write(onboardingPage(title, body))
 		}
-		// 2. Throttle — 10 per rolling 60 s, BEFORE any DB work. Key = the
-		// LAST hop of X-Forwarded-For — caddy's default reverse_proxy
-		// PRESERVES an inbound client-supplied XFF and APPENDS the
-		// trusted client IP at the END of the chain, so the first hop is
-		// attacker-controlled (an internet client rotating its own XFF
-		// would get a fresh bucket per request); behind the proxy
-		// r.RemoteAddr is always caddy's own address, so RemoteAddr alone
-		// would be one global bucket for every athlete. Fall back to
-		// r.RemoteAddr when the header is absent. Pinned semantics: at
-		// onboarding scale (a handful of humans/hour) the 10/min budget is
-		// deliberate and sufficient even if it collapses to a global bucket
-		// for a direct (non-proxied) hit.
+		// 2. Throttle — 10 per fixed 60 s window (resets at lapse), BEFORE
+		// any DB work. Key = the LAST hop of X-Forwarded-For — caddy's
+		// default reverse_proxy PRESERVES an inbound client-supplied XFF
+		// and APPENDS the trusted client IP at the END of the chain, so
+		// the first hop is attacker-controlled (an internet client
+		// rotating its own XFF would get a fresh bucket per request);
+		// behind the proxy r.RemoteAddr is always caddy's own address, so
+		// RemoteAddr alone would be one global bucket for every athlete.
+		// Fall back to r.RemoteAddr when the header is absent. Guarantee:
+		// the per-IP throttle holds BEHIND the trusted proxy (caddy
+		// appends the client IP); on the direct (non-proxied) path the
+		// hardening is ReadHeaderTimeout + the cheap route guard + the
+		// port-stripped fallback bucket.
 		key := r.RemoteAddr
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			hops := strings.Split(xff, ",")
@@ -930,6 +940,12 @@ func (s *Strava) OnboardingHandler() http.Handler {
 					break
 				}
 			}
+		} else if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			// Direct path: the source port is ephemeral — a raw
+			// RemoteAddr would be a fresh bucket per connection and the
+			// 10/min limit would never fire. Strip the port (fall back
+			// to the raw RemoteAddr on error).
+			key = host
 		}
 		now := time.Now()
 		thMu.Lock()
@@ -939,12 +955,21 @@ func (s *Strava) OnboardingHandler() http.Handler {
 		// is small at onboarding scale, so a full sweep under the mutex is
 		// cheap.
 		for k, e := range thState {
-			if !e.windowStart.IsZero() && now.Sub(e.windowStart) >= throttleWindow {
+			if now.Sub(e.windowStart) >= throttleWindow {
 				delete(thState, k)
 			}
 		}
 		e := thState[key]
 		if e.windowStart.IsZero() || now.Sub(e.windowStart) >= throttleWindow {
+			// Hard cap: a single-window burst of unique keys can balloon
+			// the map past the sweep's steady-state bound — past 10 000
+			// stored entries a NEW key is throttled, not inserted.
+			if len(thState) > 10000 {
+				thMu.Unlock()
+				w.Header().Set("Retry-After", "60")
+				render(http.StatusTooManyRequests, "Too many requests", "Too many requests — try again later")
+				return
+			}
 			e = throttleEntry{windowStart: now} // lazy pruning: the stale entry resets
 		}
 		if e.count >= throttleLimit {

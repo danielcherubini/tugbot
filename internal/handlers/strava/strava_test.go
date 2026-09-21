@@ -429,6 +429,51 @@ func TestOnboardingThrottle(t *testing.T) {
 			t.Fatalf("request 11 got %d, want 429", code)
 		}
 	})
+	t.Run("RemoteAddr fallback: rotating ports (port stripped)", func(t *testing.T) {
+		// 11 requests, SAME host, 11 distinct ephemeral source ports → the
+		// 11th is 429. The port is stripped: a raw RemoteAddr would be a
+		// fresh bucket per connection and the 10/min limit would never
+		// fire on the direct path.
+		s4 := &Strava{}
+		h4 := s4.OnboardingHandler()
+		doReq4 := func(remote string) int {
+			req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
+			req.RemoteAddr = remote
+			rec := httptest.NewRecorder()
+			h4.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		for i := 0; i < 10; i++ {
+			if code := doReq4(fmt.Sprintf("1.2.3.4:%d", 40000+i)); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq4("1.2.3.4:40010"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429 (the port is stripped — a rotated port is NOT a fresh bucket)", code)
+		}
+	})
+	t.Run("hard cap: 10 001 unique keys pass, the 10 002nd is 429", func(t *testing.T) {
+		// A single-window burst of unique keys can't balloon the map: past
+		// 10 000 stored entries a NEW key is throttled, not inserted (the
+		// 60 s sweep bounds steady-state growth only).
+		s5 := &Strava{}
+		h5 := s5.OnboardingHandler()
+		doReq5 := func(xff string) int {
+			req := httptest.NewRequest(http.MethodGet, "/strava/callback", nil)
+			req.Header.Set("X-Forwarded-For", xff)
+			rec := httptest.NewRecorder()
+			h5.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		for i := 0; i < 10001; i++ {
+			if code := doReq5(fmt.Sprintf("10.0.%d.%d", i/256, i%256)); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (a fresh bucket under the cap)", i+1)
+			}
+		}
+		if code := doReq5("10.9.9.9"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 10 002 got %d, want 429 (the hard cap — a new key is not inserted past 10 000 entries)", code)
+		}
+	})
 	t.Run("XFF multi-hop: the LAST hop is the key", func(t *testing.T) {
 		// A client rotating its own first hop (the inbound XFF caddy
 		// preserves) must NOT get a fresh bucket per request — the
