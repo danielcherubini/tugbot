@@ -1,12 +1,12 @@
 ---
 status: live
-last-verified: 2026-09-19
-verified-by: verified 2026-09-19 at the handler-wiring ship (Task 6 — the `strava` handler joins the `handlers` struct + `newHandlers` + the errgroup, "thirteen" → "fourteen" reword, `.env.example` doc, this feature doc): `gofmt -l .` silent; `go build ./...` ok; `go vet ./...` ok; `make lint` 0 issues; `go test ./... -count=1` all 21 packages ok (the DB-touching tests self-skip without PG); the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green — all 21 packages ok (incl. `internal/handlers/strava`'s 15 DB integration tests, `internal/dbmigrate`, `internal/features`, `cmd/tugbot`) with 0 skips under the override; `go run ./cmd/tugbot --selftest` logs exactly `selftest: Discord session and all fourteen handlers and the MCP server constructed` (exit 0)
+last-verified: 2026-09-21
+verified-by: verified 2026-09-21 at the self-serve-onboarding ship (Task 4 — the `/strava` command + the `:8643` in-process callback + the selftest clause + this feature doc): `gofmt -l .` silent; `go build ./...` ok; `go vet ./...` ok; `make lint` 0 issues; `go test ./... -count=1` all 21 packages ok (the DB-touching tests self-skip without PG); the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green — all 21 packages ok (incl. `internal/handlers/strava`'s DB integration tests, `internal/dbmigrate`, `internal/features`, `cmd/tugbot`) with 0 skips under the override; `go run ./cmd/tugbot --selftest` logs exactly `selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback constructed` (exit 0)
 ---
 
 # Strava activity posting
 
-The strava handler (the fourteenth, `internal/handlers/strava`) polls the Strava v3 API every 15 minutes per configured athlete and posts the family's new activities into the shared Discord thread. It is a background loop only — no message event handlers, no slash command. Failures are log-only per athlete (a per-athlete pass failure — a 401 to the reauth pause, a detail 429/5xx to the per-activity `pending` arm — never skips the other athletes; the one exception is a list-endpoint 429, which defers the remaining athletes of that tick to the next one, since Strava's 15-minute rate window is app-wide — the 15-minute ticker is the backoff); the only persistent side effect besides posts is the per-athlete seen/cursor state.
+The strava handler (the fourteenth, `internal/handlers/strava`) polls the Strava v3 API every 15 minutes per configured athlete and posts the family's new activities into the shared Discord thread. The posting is a background loop only — no message event handlers — but onboarding is self-serve: the athlete runs the `/strava` slash command in their thread, consents via the posted link, and the bot's in-process `:8643` callback completes the flow (decision 0012; see Runtime surface). Failures are log-only per athlete (a per-athlete pass failure — a 401 to the reauth pause, a detail 429/5xx to the per-activity `pending` arm — never skips the other athletes; the one exception is a list-endpoint 429, which defers the remaining athletes of that tick to the next one, since Strava's 15-minute rate window is app-wide — the 15-minute ticker is the backoff); the only persistent side effect besides posts is the per-athlete seen/cursor state.
 
 ## Mechanics
 
@@ -23,16 +23,27 @@ The three dispositions on `strava_seen_activities.status`: `pending` (unprocesse
 
 ## Setup
 
+### Primary: the self-serve flow (the `/strava` command)
+
 1. **Register the app** at <https://www.strava.com/settings/api> → `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` go in `.env`.
 2. **More than one athlete:** the free tier is 1 athlete — a self-serve dashboard upgrade raises the cap to **10**, no application review needed.
-3. **Per athlete, one-time OAuth consent** (in the operator's browser, `localhost` redirect):
+3. **The athlete runs `/strava`** in the thread they want posts to go to (optionally `label:<name>` — the post's display name; omitted, the post falls to their Strava first name). The bot posts an authorize link in the thread (the link expires in an hour). The command is NOT gated on the feature flag — onboarding is valid while the feature is off (a disabled flag appends "you'll be tracked once it's enabled" to the reply, and the row just sits until it's enabled).
+4. **The athlete clicks the posted link, logs into their Strava, and Accepts `activity:read_all`.** The redirect lands on `tugbot.wizards.town/strava/callback`, which renders "Done — {label} is set up": the bot has already exchanged the code, verified the `activity:read_all` scope (a lesser-scope consent renders an "Insufficient scope" page instead — the scope note in the Fallback below), upserted the athlete row (token pair + `target_thread_id` = the command's thread + `needs_reauth = false`), and confirmed in the thread.
+5. **The next 15-minute tick picks them up** (NULL cursor → the 24 h first-enable lookback).
+6. **Enable the flag:** `UPDATE features SET enabled = true WHERE name = 'strava';`
+
+### Fallback: the manual flow
+
+Kept for operators without a thread (or for re-auth without re-running the command).
+
+1. **Per athlete, one-time OAuth consent** (in the operator's browser, `localhost` redirect — the redirect target no longer needs anything listening: Strava whitelists `localhost` regardless of the declared domain, so the browser shows a connection-refused page and the code is in the address bar):
 
    ```
    https://www.strava.com/oauth/authorize?client_id=<STRAVA_CLIENT_ID>&redirect_uri=http://localhost:8080/&response_type=code&scope=activity:read_all&approval_prompt=auto
    ```
 
    **The consent MUST be requested with scope `activity:read_all`** — a lesser scope (e.g. `activity:read`) filters the athlete's own 'Only You'/private activities out of the list endpoint, so a private run rides straight into the no-target `skipped` arm. Ensure the `scope` parameter is actually on the URL above (a consent with no `scope` defaults to the lowest scope).
-4. **One SQL insert** per athlete (the consent's code → access/refresh tokens via the OAuth token request, or pre-extracted):
+2. **One SQL insert** per athlete (the consent's code → access/refresh tokens via the OAuth token request, or pre-extracted):
 
    ```sql
    INSERT INTO strava_athletes
@@ -44,7 +55,7 @@ The three dispositions on `strava_seen_activities.status`: `pending` (unprocesse
    ```
 
    `last_polled_at` is intentionally left `NULL` — the first poll does the 24 h lookback. `target_thread_id` is nullable (NULL → the `STRAVA_SHARED_THREAD_ID` fallback; neither → activities are `skipped`).
-5. **Enable the flag:** `UPDATE features SET enabled = true WHERE name = 'strava';`
+3. **Enable the flag:** `UPDATE features SET enabled = true WHERE name = 'strava';`
 
 ## Re-auth
 
@@ -54,7 +65,11 @@ A 401 / `invalid_grant` on the token refresh aborts **this athlete's pass** (the
 UPDATE strava_athletes SET needs_reauth = true WHERE id = <athlete_row_id>;
 ```
 
-The **cursor is preserved** (the transaction that carries it is not committed), so no activity is lost to the stall. To fix: re-run the same consent in the operator's browser (step Setup 3, same `scope=activity:read_all` URL), swap in the new tokens, and clear the flag:
+The **cursor is preserved** (the transaction that carries it is not committed), so no activity is lost to the stall. A `needs_reauth = true` row is excluded from every pass until the flag is cleared, so the abort is sticky but recoverable without a redeploy.
+
+**To fix — the self-serve path (primary):** the athlete re-runs `/strava` in their (new) thread and re-consents via the posted link. The callback's upsert refreshes the token pair, clears `needs_reauth`, moves `target_thread_id` to the newest thread, and lands the resolved label — an explicit command label overrides (new or existing athlete); an omitted one keeps the stored label (a re-consent never silently relabels a custom label). The confirm in the thread reads "🔄 {label}'s Strava authorization was refreshed."
+
+**To fix — the manual path (fallback):** re-run the same consent in the operator's browser (Setup Fallback step 1, same `scope=activity:read_all` URL), swap in the new tokens, and clear the flag:
 
 ```sql
 UPDATE strava_athletes
@@ -62,8 +77,6 @@ SET needs_reauth = false, access_token = '<new_access>', refresh_token = '<new_r
     token_expires_at = to_timestamp(<NEW_TOKEN_EXPIRES_EPOCH>)
 WHERE id = <athlete_row_id>;
 ```
-
-A `needs_reauth = true` row is excluded from every pass until the flag is cleared, so the abort is sticky but recoverable without a redeploy.
 
 ## Rate budget
 
@@ -84,6 +97,10 @@ DELETE FROM strava_athletes WHERE id = <athlete_row_id>;
 ```
 
 The `strava_seen_activities` rows are removed by the FK (`REFERENCES strava_athletes(id) ON DELETE CASCADE`) — no manual seen cleanup.
+
+## Runtime surface (the `:8643` callback)
+
+The consent redirect is served at `tugbot.wizards.town/strava/callback` — an in-process `:8643` listener in the bot (decision 0012: a deliberate deviation from the zero-public-surface constraint; the surface is one unauthenticated GET, guarded by the 128-bit `state`, single-use codes, the atomic claim, and a 10/min per-IP throttle). The caddy block for `tugbot.wizards.town` is scoped to `handle /strava/callback` (everything else 404s) and proxies to the bot host's `:8643`. The earlier standalone `strava-callback` sidecar (box-local, `:8080`) is retired — its source was never in the repo, and the consent surface now lives in the process that owns the feature. The `localhost` consent flow stays valid independently (Strava whitelists `localhost` regardless of the declared domain — the Fallback's manual consent needs nothing listening).
 
 ## Webhooks
 
