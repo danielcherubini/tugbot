@@ -196,9 +196,10 @@ func parseMCPPort(v string) (int, error) {
 	return p, nil
 }
 
-// parseStravaPoll — like parseMCPPort: unset → 15; below 15 → 15 (slog.Warn);
+// parseStravaPoll — like parseMCPPort: unset → 15; below 5 → 5 (slog.Warn);
 // set-but-non-numeric → LoadError (fail loud: a malformed value fails the WHOLE
-// config load, by design — documented blast radius).
+// config load, by design — documented blast radius). 5–14 is accepted as-is (the
+// 10-min cadence is a legal value).
 func parseStravaPoll(v string) (int, error) {
 	if v == "" {
 		return 15, nil
@@ -207,9 +208,9 @@ func parseStravaPoll(v string) (int, error) {
 	if err != nil {
 		return 0, &LoadError{problems: []string{"STRAVA_POLL_MINUTES is not a valid minute count: " + v}}
 	}
-	if n < 15 {
-		slog.Warn("STRAVA_POLL_MINUTES below 15 — using 15", "module", "config")
-		return 15, nil
+	if n < 5 {
+		slog.Warn("STRAVA_POLL_MINUTES below 5 — using 5", "module", "config")
+		return 5, nil
 	}
 	return n, nil
 }

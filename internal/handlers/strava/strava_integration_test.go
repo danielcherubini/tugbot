@@ -494,39 +494,85 @@ func TestStravaPendingHoldAndRetry(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. a stuck pending is dropped at 5 full cycles (skipped, no post ever)
+// 4. a stuck pending is dropped by AGE (>= 75 min via dispositioned_at) —
+//    cadence-independent; NOT by a full-cycle retry count
 // ---------------------------------------------------------------------------
 
-// TestStravaPendingDropsAt5 pins the dropAfterRetries branch: six iterations
-// against a forever-processing activity land on skipped/retries-5 with zero
-// posts.
-func TestStravaPendingDropsAt5(t *testing.T) {
-	pool := setupStravaTestDB(t)
-	now := time.Now().UTC()
-	WINDOW := muTime(now.Add(-2 * time.Hour))
-	startA := muTime(now.Add(-90 * time.Minute))
+// TestStravaPendingDropsAfter75m pins the time-based pending-drop: a 'pending'
+// row is dropped (skipped) once it has been pending for >= 75 min (via
+// dispositioned_at, cadence-independent) — NOT by a full-cycle retry count.
+// The retries column is retained as an observability counter of re-fetch cycles.
+func TestStravaPendingDropsAfter75m(t *testing.T) {
+	t.Run("dropped by age", func(t *testing.T) {
+		pool := setupStravaTestDB(t)
+		now := time.Now().UTC()
+		WINDOW := muTime(now.Add(-2 * time.Hour))
+		startA := muTime(now.Add(-90 * time.Minute))
 
-	aid := seedAthlete(t, pool, 9001, WINDOW, 6*time.Hour)
-	stub := &stubStrava{
-		listFn: func(_ time.Time) ([]Summary, error) {
-			return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
-		},
-		detailFn: func(_ int64) (Activity, error) { return processingAct(1, startA), nil },
-	}
-	s, caps := newTestStrava(t, pool, stub, 9001)
-
-	ctx := context.Background()
-	for i := 1; i <= 6; i++ {
-		if err := s.iteration(ctx); err != nil {
-			t.Fatalf("iteration %d: %v", i, err)
+		aid := seedAthlete(t, pool, 9001, WINDOW, 6*time.Hour)
+		stub := &stubStrava{
+			listFn: func(_ time.Time) ([]Summary, error) {
+				return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
+			},
+			detailFn: func(_ int64) (Activity, error) { return processingAct(1, startA), nil },
 		}
-	}
-	if status, retries := seenRow(t, pool, aid, 1); status != statusSkipped || retries != 5 {
-		t.Errorf("A row = %q retries %d, want skipped/5 (dropped at the new value >= 5)", status, retries)
-	}
-	if len(caps.posts) != 0 {
-		t.Errorf("captured %d posts, want zero", len(caps.posts))
-	}
+		s, caps := newTestStrava(t, pool, stub, 9001)
+		ctx := context.Background()
+
+		// Pass 1 creates the pending row (dispositioned_at = now, fresh).
+		if err := s.iteration(ctx); err != nil {
+			t.Fatalf("pass 1: %v", err)
+		}
+		// Simulate a pending row stuck for 80 min (>= the 75-min threshold).
+		if _, err := pool.Exec(ctx,
+			`UPDATE strava_seen_activities SET dispositioned_at = now() - interval '80 minutes'
+				 WHERE strava_athletes_id=$1 AND strava_activity_id=$2`, aid, 1); err != nil {
+			t.Fatalf("backdate dispositioned_at: %v", err)
+		}
+		// Pass 2 re-fetches the carried pending: age >= 75 min → dropped.
+		if err := s.iteration(ctx); err != nil {
+			t.Fatalf("pass 2: %v", err)
+		}
+		if status, _ := seenRow(t, pool, aid, 1); status != statusSkipped {
+			t.Errorf("A row = %q, want skipped (dropped by age >= 75 min)", status)
+		}
+		if len(caps.posts) != 0 {
+			t.Errorf("captured %d posts, want zero", len(caps.posts))
+		}
+	})
+
+	t.Run("fresh row not dropped after 6 cycles", func(t *testing.T) {
+		pool := setupStravaTestDB(t)
+		now := time.Now().UTC()
+		WINDOW := muTime(now.Add(-2 * time.Hour))
+		startA := muTime(now.Add(-90 * time.Minute))
+
+		aid := seedAthlete(t, pool, 9001, WINDOW, 6*time.Hour)
+		stub := &stubStrava{
+			listFn: func(_ time.Time) ([]Summary, error) {
+				return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
+			},
+			detailFn: func(_ int64) (Activity, error) { return processingAct(1, startA), nil },
+		}
+		s, caps := newTestStrava(t, pool, stub, 9001)
+		ctx := context.Background()
+
+		// Six iterations against a forever-processing activity — MORE than the
+		// old 5-cycle threshold. The row's dispositioned_at stays fresh (age
+		// ~0 < 75 min), so it must NOT be dropped: the age, not the cycle
+		// count, is the trigger.
+		for i := 1; i <= 6; i++ {
+			if err := s.iteration(ctx); err != nil {
+				t.Fatalf("iteration %d: %v", i, err)
+			}
+		}
+		if status, retries := seenRow(t, pool, aid, 1); status != statusPending {
+			t.Errorf("A row = %q retries %d, want pending (NOT dropped — fresh row, age < 75 min)", status, retries)
+		}
+		if len(caps.posts) != 0 {
+			t.Errorf("captured %d posts, want zero", len(caps.posts))
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

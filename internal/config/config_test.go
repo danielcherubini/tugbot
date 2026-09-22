@@ -420,17 +420,28 @@ func TestLoadConfigMalformedStravaPoll(t *testing.T) {
 }
 
 func TestLoadConfigStravaPollBelowFloor(t *testing.T) {
-	// A human typo like 5 is a usable intent: floored to 15 (slog.Warn),
-	// not a hard error.
-	vars := validEnv()
-	vars["STRAVA_POLL_MINUTES"] = "5"
-	setEnv(t, vars)
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("LoadConfig() error = %v, want nil", err)
-	}
-	if cfg.StravaPollMinutes != 15 {
-		t.Errorf("StravaPollMinutes = %d, want 15 (floored from 5)", cfg.StravaPollMinutes)
+	// A human typo like 2 is a usable intent: floored to 5 (slog.Warn), not a
+	// hard error. 5–14 is accepted as-is (the 10-min cadence becomes a legal
+	// value).
+	for _, tc := range []struct {
+		in   string
+		want int
+	}{
+		{"2", 5},   // below the floor → floored to 5
+		{"10", 10}, // in range → accepted as-is
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			vars := validEnv()
+			vars["STRAVA_POLL_MINUTES"] = tc.in
+			setEnv(t, vars)
+			cfg, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v, want nil", err)
+			}
+			if cfg.StravaPollMinutes != tc.want {
+				t.Errorf("StravaPollMinutes = %d, want %d", cfg.StravaPollMinutes, tc.want)
+			}
+		})
 	}
 }
 

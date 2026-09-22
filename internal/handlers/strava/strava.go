@@ -47,9 +47,13 @@ var familySet = map[string]struct{}{
 // tokenRefreshLead is how far before token expiry a refresh fires.
 const tokenRefreshLead = time.Hour
 
-// dropAfterRetries is the full-cycle count at which a stuck 'pending' activity
-// is dropped (skipped) — it never gets a post.
-const dropAfterRetries = 5
+// pendingDropAfter is the AGE at which a stuck 'pending' activity is dropped
+// (skipped) — it never gets a post. A 'pending' row is dropped once it has
+// been pending for >= 75 min: cadence-independent, via dispositioned_at (the
+// first-creation timestamp, schema DEFAULT now(), never updated). The retries
+// column is retained as an observability counter of re-fetch cycles — it is no
+// longer the drop trigger.
+const pendingDropAfter = 75 * time.Minute
 
 // firstPollLookback is the lookback for a first-time poll (NULL cursor).
 const firstPollLookback = 24 * time.Hour
@@ -403,7 +407,7 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 			if errors.As(err, &egone) {
 				// Terminal state (like the off-family detail resolution): dispose
 				// 'skipped' in the SAME UPDATE — do NOT increment retries; the
-				// 5-cycle budget stays for genuinely stuck/transient fetches.
+				// 75-min age budget stays for genuinely stuck/transient fetches.
 				slog.Warn("strava pending activity is gone (404) → skipped", "module", "strava", "label", a.label, "id", c.activityID)
 				out = fetchGone()
 			} else {
@@ -411,11 +415,13 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 				if errors.As(err, &erl) {
 					slog.Info("strava detail (retry) rate limited", "module", "strava", "id", c.activityID, "retry_after", erl.RetryAfter)
 				}
-				// fetch failed again → increment; drop at the new value >= 5.
+				// fetch failed again → increment (observability counter); drop by
+				// age (>= 75 min via dispositioned_at).
 				out = fetchTransient()
 			}
 		} else if isProcessing(detail) {
-			// still processing → increment; drop at the new value >= 5.
+			// still processing → increment (observability counter); drop by age
+			// (>= 75 min via dispositioned_at).
 			out = fetchProcessing(detail)
 		} else {
 			out = fetchReady(detail)
@@ -427,10 +433,10 @@ func (s *Strava) passForAthlete(ctx context.Context, a *athleteRow) error {
 			// target → 'skipped' in the SAME UPDATE, no retries increment.
 			updates = append(updates, seenUpdate{c.activityID, statusSkipped, nil})
 		case statusPending:
-			// fetch failed again / still processing → increment; drop at the
-			// new value >= 5.
+			// fetch failed again / still processing → increment (observability
+			// counter); drop by age (>= 75 min via dispositioned_at).
 			newRetries := c.retries + 1
-			if newRetries >= dropAfterRetries {
+			if time.Since(c.dispositionedAt) >= pendingDropAfter {
 				updates = append(updates, seenUpdate{c.activityID, statusSkipped, &newRetries})
 			} else {
 				updates = append(updates, seenUpdate{c.activityID, "", &newRetries})
@@ -653,14 +659,15 @@ func (s *Strava) loadSeenIDs(ctx context.Context, athleteID int32) (map[int64]st
 
 // pendRow is a carried 'pending' row (snapshot at pass start).
 type pendRow struct {
-	activityID int64
-	startDate  time.Time
-	retries    int
+	activityID      int64
+	startDate       time.Time
+	retries         int
+	dispositionedAt time.Time
 }
 
 func (s *Strava) loadCarriedPending(ctx context.Context, athleteID int32) ([]pendRow, error) {
 	rows, err := s.app.Pool.Query(ctx,
-		`SELECT strava_activity_id, start_date, retries FROM strava_seen_activities
+		`SELECT strava_activity_id, start_date, retries, dispositioned_at FROM strava_seen_activities
 		 WHERE strava_athletes_id=$1 AND status='pending'`, athleteID)
 	if err != nil {
 		return nil, err
@@ -669,7 +676,7 @@ func (s *Strava) loadCarriedPending(ctx context.Context, athleteID int32) ([]pen
 	var out []pendRow
 	for rows.Next() {
 		var r pendRow
-		if err := rows.Scan(&r.activityID, &r.startDate, &r.retries); err != nil {
+		if err := rows.Scan(&r.activityID, &r.startDate, &r.retries, &r.dispositionedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -1473,12 +1480,14 @@ func (s *Strava) WebhookHandler() http.Handler {
 				token = s.app.Cfg.StravaWebhookVerifyToken
 			}
 			if token != "" && subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("hub.verify_token")), []byte(token)) == 1 {
+				slog.Info("strava webhook: verification handshake — challenge echoed", "module", "strava")
 				body, _ := json.Marshal(map[string]string{"hub.challenge": r.URL.Query().Get("hub.challenge")})
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(body)
 				return
 			}
+			slog.Warn("strava webhook: verification handshake — verify_token mismatch — 403", "module", "strava")
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
