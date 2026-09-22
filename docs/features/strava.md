@@ -119,9 +119,9 @@ The consent redirect is served at `tugbot.wizards.town/strava/callback` — an i
    ```
    (`callback_url` is ≤255 chars.)
 3. **Strava immediately GETs the callback** with `hub.mode=subscribe`, `hub.challenge`, and `hub.verify_token`; the bot echoes the challenge (200 + `{"hub.challenge":"<echoed>"}`) and the subscription is active. A wrong/absent `verify_token` 403s the handshake and the subscription stays inactive.
-4. **Record the returned subscription id here:** `<n>` (fill at rollout).
+4. **Record the returned subscription id here:** `373524` (registered 2026-09-22, HTTP 201; the verification chain was verified end-to-end at rollout — POST no-op 200, handshake echo 200, wrong-token 403 no-echo, 404 catchall — and the subscription lists from Strava with the correct `callback_url`).
 
-**Caddy.** The existing block for `tugbot.wizards.town` is scoped `handle /strava/callback → 10.0.0.44:8643` (everything else 404s). Add a second route (rollout step — the mux on `:8643` serves both paths):
+**Caddy.** The block for `tugbot.wizards.town` is scoped `handle /strava/callback` + `handle /strava/webhook` → `10.0.0.44:8643` (everything else 404s — the mux on `:8643` serves both paths; the webhook route was added at the 2026-09-22 rollout):
 
 ```
 handle /strava/webhook { reverse_proxy 10.0.0.44:8643 }
