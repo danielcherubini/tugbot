@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"github.com/danielcherubini/tugbot/internal/app"
+	"github.com/danielcherubini/tugbot/internal/config"
 )
 
 // TestMentionSuppressionPayload pins the zero-empty-JSON suppression that the
@@ -564,4 +568,366 @@ func TestStartNilOnCancel(t *testing.T) {
 	case <-time.After(12 * time.Second):
 		t.Fatal("Start() did not return within 12s of cancel (shutdown grace must be ≤10s)")
 	}
+}
+
+// webhookTestStrava is the unit-test construction: a real *app.App with a
+// real *config.Config but a NIL pool — loadAthleteByStravaID's nil-pool
+// guard returns an explicit error (a nil *pgxpool.Pool receiver would
+// PANIC on QueryRow), so every DB-touching arm takes the graceful
+// DB-failure arm (log + 200, no job).
+func webhookTestStrava(verifyToken string) *Strava {
+	return &Strava{app: &app.App{Cfg: &config.Config{StravaWebhookVerifyToken: verifyToken}}}
+}
+
+// TestWebhookRouteGuard pins the webhook handler's route guard: only
+// /strava/webhook proceeds (both methods — Strava POSTs events and GETs the
+// verification challenge); anything else 404s (the onboarding route is NOT
+// served by the webhook handler).
+func TestWebhookRouteGuard(t *testing.T) {
+	h := webhookTestStrava("").WebhookHandler()
+	do := func(method, target string) int {
+		req := httptest.NewRequest(method, target, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := do(http.MethodGet, "/"); code != http.StatusNotFound {
+		t.Errorf("GET / = %d, want 404", code)
+	}
+	if code := do(http.MethodPost, "/strava/callback"); code != http.StatusNotFound {
+		t.Errorf("POST /strava/callback = %d, want 404 (the webhook handler serves only /strava/webhook)", code)
+	}
+	if code := do(http.MethodPost, "/"); code != http.StatusNotFound {
+		t.Errorf("POST / = %d, want 404", code)
+	}
+	if code := do(http.MethodDelete, "/strava/webhook"); code != http.StatusNotFound {
+		t.Errorf("DELETE /strava/webhook = %d, want 404 (only POST events + GET verification)", code)
+	}
+}
+
+// TestRoutesMux pins the routes() mux: /strava/callback is the onboarding
+// handler (its GET-only guard 404s a POST — behavior-preserving),
+// /strava/webhook is the webhook handler (a create event 200s via the
+// nil-pool DB-failure arm), and everything else 404s (mux default).
+func TestRoutesMux(t *testing.T) {
+	m := webhookTestStrava("").routes()
+	do := func(method, target, body string) int {
+		var r *http.Request
+		if body == "" {
+			r = httptest.NewRequest(method, target, nil)
+		} else {
+			r = httptest.NewRequest(method, target, strings.NewReader(body))
+		}
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	if code := do(http.MethodPost, "/strava/callback", ""); code != http.StatusNotFound {
+		t.Errorf("POST /strava/callback = %d, want 404 (the onboarding handler's GET-only guard is unchanged)", code)
+	}
+	if code := do(http.MethodPost, "/strava/webhook", `{"aspect_type":"create","object_type":"activity","object_id":1,"owner_id":1}`); code != http.StatusOK {
+		t.Errorf("POST /strava/webhook = %d, want 200 (the nil-pool DB-failure arm — never 5xx on a webhook)", code)
+	}
+	if code := do(http.MethodGet, "/", ""); code != http.StatusNotFound {
+		t.Errorf("GET / = %d, want 404 (mux default)", code)
+	}
+}
+
+// TestWebhookVerifyTokenEcho pins the verification handshake's three arms:
+// a matching non-empty token → 200 + the exact hub.challenge echoed as JSON;
+// a mismatch → 403 with the challenge NOT echoed (no oracle); an empty
+// config token → 403 (feature off — absent/empty = the verification GET
+// 403s); a GET without hub.mode=subscribe → 404.
+func TestWebhookVerifyTokenEcho(t *testing.T) {
+	do := func(tokenCfg, target string) (int, string) {
+		rec := httptest.NewRecorder()
+		webhookTestStrava(tokenCfg).WebhookHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		return rec.Code, rec.Body.String()
+	}
+	t.Run("matching token -> 200 + echoed challenge", func(t *testing.T) {
+		code, body := do("sekret", "/strava/webhook?hub.mode=subscribe&hub.verify_token=sekret&hub.challenge=abc123")
+		if code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", code)
+		}
+		if body != `{"hub.challenge":"abc123"}` {
+			t.Errorf("body = %q, want the exact echoed challenge JSON {\"hub.challenge\":\"abc123\"}", body)
+		}
+	})
+	t.Run("mismatching token -> 403, no echo", func(t *testing.T) {
+		code, body := do("sekret", "/strava/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=abc123")
+		if code != http.StatusForbidden {
+			t.Fatalf("code = %d, want 403", code)
+		}
+		if strings.Contains(body, "abc123") {
+			t.Errorf("body = %q, want the challenge NOT echoed on a mismatch (no oracle)", body)
+		}
+	})
+	t.Run("empty config -> 403 (feature off)", func(t *testing.T) {
+		code, body := do("", "/strava/webhook?hub.mode=subscribe&hub.verify_token=&hub.challenge=abc123")
+		if code != http.StatusForbidden {
+			t.Fatalf("code = %d, want 403 (absent token = verification disabled — an empty match is NOT enabled)", code)
+		}
+		if strings.Contains(body, "abc123") {
+			t.Errorf("body = %q, want no echo", body)
+		}
+	})
+	t.Run("GET without hub.mode=subscribe -> 404", func(t *testing.T) {
+		code, _ := do("sekret", "/strava/webhook?hub.verify_token=sekret&hub.challenge=abc123")
+		if code != http.StatusNotFound {
+			t.Fatalf("code = %d, want 404", code)
+		}
+	})
+}
+
+// TestWebhookEventClassification pins the POST classification arms with the
+// nil-pool construction (loadAthleteByStravaID returns the explicit
+// nil-guard error → the graceful DB-failure arm): create/update → 200 + no
+// job; delete → 200 no-op (out of scope); unparseable body / unknown
+// object_type → 200 no-op (never 5xx — Strava retries non-200s up to 3
+// times; we want the event dropped, not replayed). The full enqueue
+// assertions live in the PG integration tests (they need a real athlete
+// row to get past the DB-failure arm).
+func TestWebhookEventClassification(t *testing.T) {
+	captured := make(chan webhookJob)
+	s := webhookTestStrava("")
+	s.workerFn = func(_ context.Context, j webhookJob) { captured <- j }
+	h := s.WebhookHandler()
+	do := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/strava/webhook", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	noJob := func() {
+		select {
+		case j := <-captured:
+			t.Errorf("job captured: %+v, want none (the nil-pool DB-failure arm enqueues nothing)", j)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Run("create -> 200 + no job (nil-pool DB-failure arm)", func(t *testing.T) {
+		if code := do(`{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`); code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", code)
+		}
+		noJob()
+	})
+	t.Run("update -> 200 + no job", func(t *testing.T) {
+		if code := do(`{"aspect_type":"update","object_type":"activity","object_id":555,"owner_id":777}`); code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", code)
+		}
+		noJob()
+	})
+	t.Run("delete -> 200 + no job (out of scope)", func(t *testing.T) {
+		if code := do(`{"aspect_type":"delete","object_type":"activity","object_id":555,"owner_id":777}`); code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", code)
+		}
+		noJob()
+	})
+	t.Run("unparseable body -> 200 + no job", func(t *testing.T) {
+		if code := do(`{not json`); code != http.StatusOK {
+			t.Fatalf("code = %d, want 200 (never 5xx on a webhook)", code)
+		}
+		noJob()
+	})
+	t.Run("unknown object_type -> 200 + no job", func(t *testing.T) {
+		if code := do(`{"aspect_type":"create","object_type":"bogus","object_id":555,"owner_id":777}`); code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", code)
+		}
+		noJob()
+	})
+}
+
+// TestWebhookStringShapedIDs pins the LENIENT acceptance: a STRING-shaped
+// id (not the documented numeric shape) still parses — a string create
+// event for a known owner reaches the nil-pool DB-failure arm (200 + no
+// job) rather than the unparseable-id arm: the flexID decode of the string
+// shape is what lets a string id through (asserted via the log stream —
+// the DB-failure arm's "athlete lookup failed" line is present and NO
+// unparseable-id line is).
+func TestWebhookStringShapedIDs(t *testing.T) {
+	var logBuf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prev)
+
+	captured := make(chan webhookJob)
+	s := webhookTestStrava("")
+	s.workerFn = func(_ context.Context, j webhookJob) { captured <- j }
+	h := s.WebhookHandler()
+	req := httptest.NewRequest(http.MethodPost, "/strava/webhook",
+		strings.NewReader(`{"aspect_type":"create","object_type":"activity","object_id":"555","owner_id":"777"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("string-shaped ids = %d, want 200 (a string id still parses — the lenient acceptance)", rec.Code)
+	}
+	select {
+	case j := <-captured:
+		t.Errorf("job captured: %+v, want none (the nil-pool DB-failure arm enqueues nothing)", j)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The parse SUCCEEDED — the classification reached the nil-pool
+	// DB-failure arm ("athlete lookup failed"), NOT the unparseable-id arm
+	// (a string-shaped id decodes to a real value; a non-parsing value
+	// would decode to 0 → the unparseable arm).
+	if !strings.Contains(logBuf.String(), "athlete lookup failed") {
+		t.Errorf("log = %q, want the DB-failure arm (\"athlete lookup failed\") — not the unparseable-id arm", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), "unparseable") {
+		t.Errorf("log = %q, want NO unparseable-id line (the string id parsed)", logBuf.String())
+	}
+}
+
+// TestFlexIDShapes pins the flexID edge shapes the fix claims decode to 0
+// WITHOUT erroring the whole body: a JSON number, a JSON string, a literal
+// 0, and the unparseable shapes (a non-numeric string, a bool, null, an
+// object, a float) all decode to 0 with a nil error — a bad id never fails
+// the body (only genuinely malformed JSON fails the top-level Decode and
+// takes the 200 no-op arm). The raw wire bytes are captured too (the
+// unparseable-id log shows the raw value, not the always-0 parsed value).
+func TestFlexIDShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    int64
+		wantRaw string
+	}{
+		{"number", `555`, 555, `555`},
+		{"string", `"555"`, 555, `"555"`},
+		{"zero", `0`, 0, `0`},
+		{"garbage-string", `"abc"`, 0, `"abc"`},
+		{"bool", `true`, 0, `true`},
+		{"null", `null`, 0, `null`},
+		{"object", `{}`, 0, `{}`},
+		{"float", `134815.0`, 0, `134815.0`},
+		{"empty-string", `""`, 0, `""`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var f flexID
+			if err := json.Unmarshal([]byte(tc.in), &f); err != nil {
+				t.Fatalf("json.Unmarshal(%s) = %v, want nil (a bad id never fails the body)", tc.in, err)
+			}
+			if got := f.Int64(); got != tc.want {
+				t.Errorf("flexID = %d, want %d", got, tc.want)
+			}
+			if got := f.raw; got != tc.wantRaw {
+				t.Errorf("flexID.raw = %q, want %q (the raw wire value is captured for the no-op log)", got, tc.wantRaw)
+			}
+		})
+	}
+	t.Run("empty-input-direct-call", func(t *testing.T) {
+		var f flexID
+		// A direct call with empty input must not panic (b[0] on empty input
+		// would panic; unreachable via encoding/json, which never passes an
+		// empty slice) and decodes to 0.
+		if err := f.UnmarshalJSON(nil); err != nil {
+			t.Fatalf("UnmarshalJSON(nil) = %v, want nil", err)
+		}
+		if got := f.Int64(); got != 0 {
+			t.Errorf("flexID = %d, want 0", got)
+		}
+	})
+}
+
+// TestWebhookThrottle pins the webhook handler's OWN throttle (its own
+// closure-local map — the onboarding handler's map stays untouched; two
+// independent throttle maps, one per route) with the same edge semantics as
+// TestOnboardingThrottle: 10 requests from one client pass (200 via the
+// nil-pool DB-failure arm, but not 429), the 11th gets 429. Key = the LAST
+// hop of X-Forwarded-For, falling back to the port-stripped RemoteAddr.
+func TestWebhookThrottle(t *testing.T) {
+	// ONE handler per subtest (the throttle state is closure-local to the
+	// WebhookHandler factory — a fresh factory call is a fresh map, so the
+	// 429 would never fire). The factory also starts the workers once
+	// (workerOnce) — harmless here (no jobs are enqueued: nil pool).
+	newReq := func(xff, remote string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/strava/webhook", strings.NewReader(`{"aspect_type":"create","object_type":"activity","object_id":1,"owner_id":1}`))
+		if remote != "" {
+			r.RemoteAddr = remote
+		}
+		if xff != "" {
+			r.Header.Set("X-Forwarded-For", xff)
+		}
+		return r
+	}
+	doReq := func(h http.Handler, xff, remote string) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(xff, remote))
+		return rec.Code
+	}
+	t.Run("RemoteAddr fallback (no XFF header)", func(t *testing.T) {
+		h := webhookTestStrava("").WebhookHandler()
+		for i := 0; i < 10; i++ {
+			if code := doReq(h, "", "1.2.3.4:9999"); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq(h, "", "1.2.3.4:9999"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429", code)
+		}
+	})
+	t.Run("XFF last-hop keying", func(t *testing.T) {
+		h := webhookTestStrava("").WebhookHandler()
+		// Two requests with different XFF values → separate buckets, both pass.
+		if code := doReq(h, "1.1.1.1", ""); code == http.StatusTooManyRequests {
+			t.Fatalf("first 1.1.1.1 request got 429, want it to pass")
+		}
+		if code := doReq(h, "2.2.2.2", ""); code == http.StatusTooManyRequests {
+			t.Fatalf("first 2.2.2.2 request got 429, want it to pass (a separate bucket)")
+		}
+		// 11 requests with the SAME XFF value → the 11th is 429.
+		for i := 0; i < 10; i++ {
+			if code := doReq(h, "3.3.3.3", ""); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq(h, "3.3.3.3", ""); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429", code)
+		}
+	})
+	t.Run("RemoteAddr fallback: rotating ports (port stripped)", func(t *testing.T) {
+		// 11 requests, SAME host, 11 distinct ephemeral source ports → the
+		// 11th is 429 (a raw RemoteAddr would be a fresh bucket per
+		// connection and the 10/min limit would never fire on the direct
+		// path).
+		h := webhookTestStrava("").WebhookHandler()
+		for i := 0; i < 10; i++ {
+			if code := doReq(h, "", fmt.Sprintf("1.2.3.4:%d", 40000+i)); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq(h, "", "1.2.3.4:40010"); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429 (the port is stripped — a rotated port is NOT a fresh bucket)", code)
+		}
+	})
+	t.Run("hard cap: 10 001 unique keys pass, the 10 002nd is 429", func(t *testing.T) {
+		// A single-window burst of unique keys can't balloon the map: past
+		// 10 000 stored entries a NEW key is throttled, not inserted (the
+		// 60 s sweep bounds steady-state growth only).
+		h := webhookTestStrava("").WebhookHandler()
+		for i := 0; i < 10001; i++ {
+			if code := doReq(h, fmt.Sprintf("10.0.%d.%d", i/256, i%256), ""); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (a fresh bucket under the cap)", i+1)
+			}
+		}
+		if code := doReq(h, "10.9.9.9", ""); code != http.StatusTooManyRequests {
+			t.Fatalf("request 10 002 got %d, want 429 (the hard cap — a new key is not inserted past 10 000 entries)", code)
+		}
+	})
+	t.Run("XFF multi-hop: the LAST hop is the key", func(t *testing.T) {
+		// A client rotating its own first hop (the inbound XFF caddy
+		// preserves) must NOT get a fresh bucket per request — the trusted
+		// proxy's appended hop (last) is the key. 11 requests, distinct
+		// first hops, same last hop → the 11th is 429.
+		h := webhookTestStrava("").WebhookHandler()
+		for i := 0; i < 10; i++ {
+			if code := doReq(h, fmt.Sprintf("10.0.0.%d, 4.4.4.4", i), ""); code == http.StatusTooManyRequests {
+				t.Fatalf("request %d got 429, want it to pass (the 10/min budget)", i+1)
+			}
+		}
+		if code := doReq(h, "10.0.0.99, 4.4.4.4", ""); code != http.StatusTooManyRequests {
+			t.Fatalf("request 11 got %d, want 429 (the last hop is the key — a rotated first hop is NOT a fresh bucket)", code)
+		}
+	})
 }

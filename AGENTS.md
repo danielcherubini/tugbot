@@ -26,7 +26,7 @@ self-skip in CI and only run locally:
 ```bash
 make db-up   # docker compose up -d postgres (credentials postgres:postgres, database `tugbot`)
 TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...
-go run ./cmd/tugbot --selftest   # must log "selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback constructed", exit 0
+go run ./cmd/tugbot --selftest   # must log "selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback and the strava webhook constructed", exit 0
 ```
 
 - The DB-touching tests default to a `tugbot_test` URL and self-skip without the

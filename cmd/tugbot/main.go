@@ -322,7 +322,15 @@ func runSelftest() int {
 		slog.Error("Failed to construct the strava onboarding callback", "module", "main")
 		return 1
 	}
-	slog.Info("selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback constructed", "module", "main")
+	// The webhook handler is CONSTRUCTED (its handler's construction
+	// step); Start is NOT called here — production wiring is the
+	// errgroup arm (the same Start serves both routes). The check
+	// mirrors the OnboardingHandler check (kept for symmetry).
+	if h.strava.WebhookHandler() == nil {
+		slog.Error("Failed to construct the strava webhook", "module", "main")
+		return 1
+	}
+	slog.Info("selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback and the strava webhook constructed", "module", "main")
 	return 0
 }
 

@@ -1,7 +1,7 @@
 ---
 status: live
-last-verified: 2026-09-21
-verified-by: verified 2026-09-21 at the self-serve-onboarding ship (Task 4 — the `/strava` command + the `:8643` in-process callback + the selftest clause + this feature doc): `gofmt -l .` silent; `go build ./...` ok; `go vet ./...` ok; `make lint` 0 issues; `go test ./... -count=1` all 21 packages ok (the DB-touching tests self-skip without PG); the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green — all 21 packages ok (incl. `internal/handlers/strava`'s DB integration tests, `internal/dbmigrate`, `internal/features`, `cmd/tugbot`) with 0 skips under the override; `go run ./cmd/tugbot --selftest` logs exactly `selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback constructed` (exit 0)
+last-verified: 2026-09-22
+verified-by: re-verified 2026-09-22 at the strava-webhooks ship (Tasks 1–4 — `decideActivity` extracted and shared by poll + webhook, the `/strava/webhook` route + verification handshake + event classification + job queue + 2 workers on `:8643`, the worker body (fetch + 401 refresh-and-retry arm + `start_date` rule + rows-affected-gated per-event transaction + post-after-commit), the selftest webhook clause, and this live Webhooks section): `gofmt -l .` silent; `go build ./...` ok; `go vet ./...` ok; `make lint` 0 issues; `go test ./... -count=1` all packages ok (the DB-touching tests self-skip without PG); the DB-touching gate `make db-up` + `TUGBOT_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/tugbot go test -p 1 -count=1 ./...` green with 0 skips under the override; `go run ./cmd/tugbot --selftest` logs exactly `selftest: Discord session and all fourteen handlers and the MCP server and the strava onboarding callback and the strava webhook constructed` (exit 0)
 ---
 
 # Strava activity posting
@@ -104,4 +104,37 @@ The consent redirect is served at `tugbot.wizards.town/strava/callback` — an i
 
 ## Webhooks
 
-Deferred, and treated as additive if ever added: `strava_seen_activities` (`UNIQUE (strava_athletes_id, strava_activity_id)`) already absorbs webhook duplicate-event (the seen table is the dedupe of either source), and the poll loop stays the source of truth (a webhook would merely narrow the first-sight latency, not replace the cursor). Revisit only if sub-minute freshness is wanted.
+**What it is:** the webhook is an **early trigger**, not a replacement for the poll. Strava POSTs `activity/create` / `activity/update` events to `tugbot.wizards.town/strava/webhook` (a route on the existing `:8643` mux, served by the strava handler — the handler count stays fourteen). Each event carries the athlete's Strava id (`owner_id`); the bot maps it to `strava_athletes` (an **unknown `owner_id` is a cheap no-op** — log + 200), classifies the event, and queues a job for 2 workers: one detail fetch (`GET /activities/{id}`) and the post through the **shared `decideActivity`** (the same decision the poll path makes — Task 1's extraction). The **15-minute poll is the mandatory backstop** (decision 0013): the webhook has **no delivery guarantee** (duplicates and losses are both possible; Strava retries a non-200 callback up to 3 times, and the callback must answer 200 within 2 s — the bot ACKs the edge fast and does the fetch in the worker). A lost webhook event is recovered by the next poll pass; a duplicate is absorbed by the rows-affected gate below.
+
+**Registration (one-time operational step).** The Strava webhook API is **app-level** — one subscription per app, registered with `client_id` / `client_secret`, NOT per-athlete. Registration is **not idempotent** (re-registering requires a `DELETE` first — see the remedies).
+
+1. **Set `STRAVA_WEBHOOK_VERIFY_TOKEN` in `.env` and restart the bot** — the verification handshake needs it: absent/empty, the verification GET 403s and the subscription never activates (a subscription can be registered WITHOUT a `verify_token` and Strava will still deliver events, but the bot cannot then distinguish the verification GET from an event — so set the token BEFORE registering).
+2. **Register the subscription:**
+   ```
+   curl -X POST https://www.strava.com/api/v3/push_subscriptions \
+     -d client_id=<STRAVA_CLIENT_ID> \
+     -d client_secret=<STRAVA_CLIENT_SECRET> \
+     -d callback_url=https://tugbot.wizards.town/strava/webhook \
+     -d verify_token=<STRAVA_WEBHOOK_VERIFY_TOKEN>
+   ```
+   (`callback_url` is ≤255 chars.)
+3. **Strava immediately GETs the callback** with `hub.mode=subscribe`, `hub.challenge`, and `hub.verify_token`; the bot echoes the challenge (200 + `{"hub.challenge":"<echoed>"}`) and the subscription is active. A wrong/absent `verify_token` 403s the handshake and the subscription stays inactive.
+4. **Record the returned subscription id here:** `<n>` (fill at rollout).
+
+**Caddy.** The existing block for `tugbot.wizards.town` is scoped `handle /strava/callback → 10.0.0.44:8643` (everything else 404s). Add a second route (rollout step — the mux on `:8643` serves both paths):
+
+```
+handle /strava/webhook { reverse_proxy 10.0.0.44:8643 }
+```
+
+**Standing remedies.**
+
+- **Re-registration** (change `callback_url` / `verify_token`): registration is NOT idempotent — `DELETE https://www.strava.com/api/v3/push_subscriptions/{id}?client_id=<…>&client_secret=<…>` first, then re-POST the registration above.
+- **Health check:** `GET https://www.strava.com/api/v3/push_subscriptions?client_id=<…>&client_secret=<…>` lists the subscription.
+- **Deauthorization:** a webhook event (`athlete/update` with `updates.authorized: "false"`) — the bot sets `needs_reauth` on the athlete row (the re-consent path above self-heals it).
+- **The 401 → refresh-and-retry arm** (worker side): a merely expired token refreshes and the detail fetch retries; a genuinely revoked one (`invalid_grant`) sets `needs_reauth` and the job no-ops the rest of the pass for that athlete.
+- **Rate-limited detail fetch:** a 429 is a transient no-row arm (the row is left for the poll's `pending` mechanics — see Rate budget).
+
+**The accepted residual race.** The poll path snapshots `loadSeenIDs` before its detail fetches and appends posts *before* executing its `INSERT`s, so it cannot cheaply adopt the rows-affected gate without a restructure (out of scope — it would change pinned poll semantics). If a webhook event and a poll pass race on the same activity within the pass's window, a **double post is possible** (narrow window; the row state is still consistent). The webhook-vs-webhook case (the likely case — Strava's documented duplicate deliveries arrive close together) is **fully closed** by the rows-affected gate: the second event's per-event transaction inserts 0 rows and no-ops the post.
+
+**Rate budget.** Webhook-triggered detail fetches are **ordinary read API calls** (no special rate treatment) — a burst of N events = N read calls. The 10-athlete tier's 200/15-min read cap absorbs realistic bursts: the poll is ~10–20 read calls per 15-minute window, so a webhook burst of ~180 or fewer stays under the cap. A pathological burst is rate-limited by Strava's 429, which the worker treats as a transient no-row arm (the row is left for the poll's `pending` mechanics — the backstop still posts it).

@@ -125,7 +125,7 @@ type stubStrava struct {
 	mu            sync.Mutex
 	listFn        func(after time.Time) ([]Summary, error)
 	detailFn      func(id int64) (Activity, error)
-	refreshFn     func() error
+	refreshFn     func() (string, string, time.Time, error)
 	listCalls     int
 	detailCalls   int
 	refreshCalls  int
@@ -167,10 +167,9 @@ func (s *stubStrava) RefreshToken(_ context.Context, _, _, _ string) (string, st
 	if fn == nil {
 		return "tok", "rtok", time.Now().UTC().Add(6 * time.Hour), nil
 	}
-	if err := fn(); err != nil {
-		return "", "", time.Time{}, err
-	}
-	return "tok2", "rtok2", time.Now().UTC().Add(6 * time.Hour), nil
+	// The scripted pair (the 401 case returns ErrUnauthorized{}; the success
+	// case scripts the ROTATED pair so the persistence is assertable).
+	return fn()
 }
 
 func (s *stubStrava) GetAthlete(_ context.Context, _ string) (Athlete, error) {
@@ -614,7 +613,7 @@ func TestStravaNeedsReauthPauseResume(t *testing.T) {
 
 	aid := seedAthlete(t, pool, 9001, WINDOW, 30*time.Minute) // inside the 1h refresh lead
 	stub := &stubStrava{
-		refreshFn: func() error { return ErrUnauthorized{Why: "test"} },
+		refreshFn: func() (string, string, time.Time, error) { return "", "", time.Time{}, ErrUnauthorized{Why: "test"} },
 		listFn:    nil,
 	}
 	s, caps := newTestStrava(t, pool, stub, 9001)
@@ -648,7 +647,9 @@ func TestStravaNeedsReauthPauseResume(t *testing.T) {
 		now.Add(6*time.Hour), aid); err != nil {
 		t.Fatalf("re-auth update: %v", err)
 	}
-	stub.refreshFn = func() error { return nil }
+	stub.refreshFn = func() (string, string, time.Time, error) {
+		return "tok", "rtok", time.Now().UTC().Add(6 * time.Hour), nil
+	}
 	stub.listFn = func(after time.Time) ([]Summary, error) {
 		return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
 	}
@@ -892,8 +893,10 @@ func TestStravaList429AbortsIteration(t *testing.T) {
 	aidA := seedAthlete2(t, pool, "AG", 1, 9001, W_A, 6*time.Hour)    // valid token: no refresh path
 	aidB := seedAthlete2(t, pool, "BG", 2, 9001, W_B, 30*time.Minute) // inside the 1h refresh lead
 	stub := &stubStrava{
-		listFn:    func(_ time.Time) ([]Summary, error) { return nil, ErrRateLimited{RetryAfter: "900"} },
-		refreshFn: func() error { return nil },
+		listFn: func(_ time.Time) ([]Summary, error) { return nil, ErrRateLimited{RetryAfter: "900"} },
+		refreshFn: func() (string, string, time.Time, error) {
+			return "tok", "rtok", time.Now().UTC().Add(6 * time.Hour), nil
+		},
 	}
 	s, caps := newTestStrava(t, pool, stub, 9001)
 	ctx := context.Background()
@@ -1088,7 +1091,9 @@ func TestStravaRefreshRotatedPersistence(t *testing.T) {
 		t.Fatalf("seed tokens: %v", err)
 	}
 	stub := &stubStrava{
-		refreshFn: func() error { return nil }, // success → the ROTATED pair (tok2, rtok2, now+6h)
+		refreshFn: func() (string, string, time.Time, error) {
+			return "tok2", "rtok2", time.Now().UTC().Add(6 * time.Hour), nil
+		}, // success → the ROTATED pair (tok2, rtok2, now+6h)
 		listFn: func(_ time.Time) ([]Summary, error) {
 			return []Summary{{ID: 1, SportType: "Run", StartDate: startA}}, nil
 		},
@@ -1904,5 +1909,1040 @@ func TestOnboardingTickCleanup(t *testing.T) {
 	}
 	if _, ok := onboardingStatus(t, pool, liveState); !ok {
 		t.Errorf("live onboarding row deleted, want it to remain")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Webhook (task 2: the synchronous surface — the worker body is the stub;
+// Task 3 replaces it. The job is captured at the worker seam (s.workerFn)
+// — NEVER the raw s.jobs channel, which the two live workers actively
+// consume and would race; the seam capture also survives Task 3's real
+// body unchanged).
+// ---------------------------------------------------------------------------
+
+// doWebhook drives one POST /strava/webhook through a FRESH WebhookHandler
+// (fresh closure-local throttle map per call — the throttle tests call the
+// factory once and reuse the handler).
+func doWebhook(t *testing.T, s *Strava, body string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/strava/webhook", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.WebhookHandler().ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestWebhookEnqueuesJob pins the full enqueue path (a real athlete row —
+// the unit tests can't get past the nil-pool DB-failure arm): a create
+// event for a known athlete enqueues a job (captured at the worker seam)
+// with the athlete row + activity id, and 200s.
+func TestWebhookEnqueuesJob(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	captured := make(chan webhookJob)
+	s.workerFn = func(_ context.Context, j webhookJob) { captured <- j }
+	if code := doWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	select {
+	case j := <-captured:
+		if j.actID != 555 {
+			t.Errorf("actID = %d, want 555 (the payload's object_id)", j.actID)
+		}
+		if j.ath == nil || j.ath.label != "Web" {
+			t.Errorf("ath = %+v, want the seeded row (label Web)", j.ath)
+		}
+		if j.aspect != "create" {
+			t.Errorf("aspect = %q, want create (the log-only diagnostic)", j.aspect)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no job captured within 5s (the worker seam should observe the enqueued job)")
+	}
+}
+
+// TestWebhookNumericPayloadEndToEnd pins the DOCUMENTED wire shape end-to-end
+// (JSON NUMBERS — the shape Strava actually sends, per
+// docs/research/strava-webhooks.md — NOT strings): a numeric create event
+// for a known athlete enqueues a job with the right activity id + athlete
+// row. (The string-shaped unit test pins the lenient acceptance; this is
+// the shape the wire carries — a string-only decode would silently 200-no-op
+// every real delivery, masked by the poll backstop.)
+func TestWebhookNumericPayloadEndToEnd(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	captured := make(chan webhookJob)
+	s.workerFn = func(_ context.Context, j webhookJob) { captured <- j }
+	if code := doWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`); code != http.StatusOK {
+		t.Fatalf("numeric create event = %d, want 200", code)
+	}
+	select {
+	case j := <-captured:
+		if j.actID != 555 {
+			t.Errorf("actID = %d, want 555 (the payload's numeric object_id)", j.actID)
+		}
+		if j.ath == nil || j.ath.label != "Web" {
+			t.Errorf("ath = %+v, want the seeded row (label Web)", j.ath)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no job captured within 5s (the documented numeric payload must reach the worker — a string-only decode would silently no-op it on the wire)")
+	}
+}
+
+// TestWebhookQueueFull pins the non-blocking enqueue: a SATURATED 32-cap
+// queue (the 2 workers each PARKED on the first job they consume, the
+// remaining sends filling the queue) DROPS the event with a log — 200, no
+// panic, and the job is NOT added (len stays at cap — the default: arm
+// fired; a blocking-send regression would HANG the POST, caught by the
+// timeout). The poll backstop covers the drop.
+func TestWebhookQueueFull(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	// Park the worker body BEFORE the first startWorkers() (the factory
+	// runs on the WebhookHandler call below): the worker loop consumes
+	// ONE job and THEN calls the body, so each parked worker HOLDS one
+	// job — cap+2 sends land deterministically (2 held by the parked
+	// workers, the remaining cap filling the queue; the last send can
+	// only complete once a worker has taken one, and a parked worker
+	// takes at most one until the ctx is done).
+	ctx, cancel := context.WithCancel(context.Background())
+	s.serverCtx = ctx // test-scoped: the parked workers exit on cancel (no goroutine leak)
+	t.Cleanup(cancel)
+	s.workerFn = func(ctx context.Context, _ webhookJob) { <-ctx.Done() }
+	h := s.WebhookHandler()
+	for i := 0; i < cap(s.jobs)+2; i++ {
+		s.jobs <- webhookJob{}
+	}
+	if n := len(s.jobs); n != cap(s.jobs) {
+		t.Fatalf("queue not saturated: len = %d, want %d (cap) — the 2 parked workers must hold exactly 2 jobs", n, cap(s.jobs))
+	}
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/strava/webhook", strings.NewReader(`{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req) // a full queue must DROP (the non-blocking send) — no panic, 200
+		done <- rec.Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("full-queue event = %d, want 200 (the enqueue is non-blocking — a full queue drops with a log)", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the event HUNG with a full queue — the enqueue must be non-blocking (a blocking send would block the 200)")
+	}
+	if n := len(s.jobs); n != cap(s.jobs) {
+		t.Errorf("len = %d after the event, want %d (cap) — the job was NOT added (the default: drop arm fired)", n, cap(s.jobs))
+	}
+}
+
+// TestWebhook200BeforeWork pins the ACK contract: with the worker body
+// BLOCKED before the first startWorkers(), the POST still 200s — the 200
+// goes out BEFORE any worker work (Strava expects 200 within 2 s; the work
+// is async). If the handler waited for the worker, the request would hang.
+func TestWebhook200BeforeWork(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	// Block the worker body BEFORE the first startWorkers() (the factory
+	// runs on the WebhookHandler call below): the worker consumes the job
+	// and blocks in the body, so the response can only arrive if the 200
+	// is sent before any worker work.
+	ctx, cancel := context.WithCancel(context.Background())
+	s.serverCtx = ctx // test-scoped: the parked workers exit on cancel (no goroutine leak)
+	t.Cleanup(cancel)
+	s.workerFn = func(ctx context.Context, _ webhookJob) { <-ctx.Done() }
+	h := s.WebhookHandler()
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/strava/webhook", strings.NewReader(`{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		done <- rec.Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("event = %d, want 200 (the ACK is the 2 s contract — sent before any worker work)", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response did not arrive while the worker is blocked — the 200 must go out BEFORE any worker work")
+	}
+}
+
+// TestWebhookDeauthSetsFlag pins the deauth arm: an athlete update carrying
+// authorized: "false" (the exact string) sets needs_reauth=TRUE (one small
+// write, inside the 2 s budget); a duplicate is idempotent (still TRUE, no
+// error). An AMBIGUOUS shape (a boolean, not the string "false") is a 200
+// no-op — the poll's 401 arm handles it; we do NOT guess.
+func TestWebhookDeauthSetsFlag(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, _ := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	seedAthlete2(t, pool, "Amb", 778, 43, time.Time{}, 6*time.Hour)
+	if _, _, _, _, needsReauth, ok := athleteRowState(t, pool, 777); !ok || needsReauth {
+		t.Fatalf("seed state: needsReauth = %v (ok %v), want the fresh false flag", needsReauth, ok)
+	}
+	deauth := `{"aspect_type":"update","object_type":"athlete","owner_id":777,"updates":{"authorized":"false"}}`
+	if code := doWebhook(t, s, deauth); code != http.StatusOK {
+		t.Fatalf("deauth event = %d, want 200", code)
+	}
+	if _, _, _, _, needsReauth, ok := athleteRowState(t, pool, 777); !ok || !needsReauth {
+		t.Fatalf("needs_reauth = %v (ok %v), want TRUE after the deauth event", needsReauth, ok)
+	}
+	// Duplicate: still TRUE, no error (idempotent).
+	if code := doWebhook(t, s, deauth); code != http.StatusOK {
+		t.Fatalf("duplicate deauth event = %d, want 200 (idempotent)", code)
+	}
+	if _, _, _, _, needsReauth, _ := athleteRowState(t, pool, 777); !needsReauth {
+		t.Fatal("needs_reauth = false after the duplicate, want still TRUE")
+	}
+	// Ambiguous shape: a BOOLEAN authorized (not the string "false") is a
+	// 200 no-op — the flag is untouched (we do NOT guess the shape).
+	if code := doWebhook(t, s, `{"aspect_type":"update","object_type":"athlete","owner_id":778,"updates":{"authorized":false}}`); code != http.StatusOK {
+		t.Fatalf("ambiguous deauth event = %d, want 200", code)
+	}
+	if _, _, _, _, needsReauth, _ := athleteRowState(t, pool, 778); needsReauth {
+		t.Fatal("needs_reauth = true on an ambiguous shape, want the flag untouched (no guessing)")
+	}
+}
+
+// TestWebhookUnknownOwnerNoop pins the unknown-owner arm: a create event for
+// an owner_id with NO strava_athletes row is a 200 no-op — no row is
+// created, no job is enqueued, no post goes out (the poll backstop covers
+// the gap; we never invent athletes from a webhook).
+func TestWebhookUnknownOwnerNoop(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	s, caps := newTestStrava(t, pool, &stubStrava{}, 0)
+	seedAthlete2(t, pool, "Web", 777, 42, time.Time{}, 6*time.Hour)
+	captured := make(chan webhookJob, 1)
+	s.workerFn = func(_ context.Context, j webhookJob) { captured <- j }
+	if code := doWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":999999}`); code != http.StatusOK {
+		t.Fatalf("unknown-owner event = %d, want 200 (a no-op, never 5xx)", code)
+	}
+	select {
+	case <-captured:
+		t.Fatal("a job was captured, want none (unknown owner → no row → no job)")
+	case <-time.After(200 * time.Millisecond):
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM strava_athletes WHERE strava_athlete_id = 999999`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("strava_athletes rows for the unknown owner = %d, want 0 (no row is created)", n)
+	}
+	if len(caps.posts) != 0 {
+		t.Fatalf("posts = %d, want 0 (no post for an unknown owner)", len(caps.posts))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The webhook worker body (task 3): the fetch + the start_date rule + the
+// per-event transaction (the rows-affected gate) + the post, against a real
+// PG. The workerFn seam (task 2) is the capture mechanism — the test sets
+// s.workerFn to a fn that runs the REAL body (s.workerBody) inline in the
+// worker goroutine and signals completion; the body is the production code
+// path (the seam is the completion signal, not a test double).
+// ---------------------------------------------------------------------------
+
+// installRealWorker sets s.workerFn to a fn that runs the real worker body
+// inline (in the worker goroutine) and signals each completion on the
+// returned channel. Call it BEFORE the first WebhookHandler() (the factory
+// starts the workers; the worker reads s.workerFn at consumption, so the
+// set happens-before the first job).
+func installRealWorker(s *Strava) chan struct{} {
+	done := make(chan struct{}, 8)
+	s.workerFn = func(ctx context.Context, j webhookJob) {
+		s.workerBody(ctx, j)
+		done <- struct{}{}
+	}
+	return done
+}
+
+// waitForJob waits for one completed worker job (bounded deadline — a hang
+// fails the test).
+func waitForJob(t *testing.T, done chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker job did not complete within 5s")
+	}
+}
+
+// postWebhook drives one POST /strava/webhook (a fresh handler) and waits
+// for the (real-body) worker job to complete.
+func postWebhook(t *testing.T, s *Strava, body string, done chan struct{}) int {
+	t.Helper()
+	code := doWebhook(t, s, body)
+	waitForJob(t, done)
+	return code
+}
+
+// seenStartDate reads a seen row's start_date (zero when the row is absent).
+func seenStartDate(t *testing.T, pool *pgxpool.Pool, athleteID int32, activityID int64) time.Time {
+	t.Helper()
+	var v time.Time
+	err := pool.QueryRow(context.Background(),
+		`SELECT start_date FROM strava_seen_activities WHERE strava_athletes_id=$1 AND strava_activity_id=$2`,
+		athleteID, activityID).Scan(&v)
+	if err != nil {
+		return time.Time{}
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// 1. a create event for a known athlete → the activity is posted (the 2-line
+//    post) and a 'posted' seen row exists with start_date = the detail's
+//    StartDate; the cursor is untouched (the webhook never writes it).
+// ---------------------------------------------------------------------------
+
+func TestWebhookPostsNewFamily(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	sent := caps.byThread("42")
+	if len(caps.posts) != 1 || len(sent) != 1 {
+		t.Fatalf("captured %d posts, want exactly 1 on 42", len(caps.posts))
+	}
+	const want = "Web finished 42.3 km Run\nhttps://www.strava.com/activities/555"
+	if sent[0].msg != want {
+		t.Errorf("post = %q, want %q", sent[0].msg, want)
+	}
+	if status, _ := seenRow(t, pool, aid, 555); status != statusPosted {
+		t.Errorf("row = %q, want %q", status, statusPosted)
+	}
+	if got := seenStartDate(t, pool, aid, 555); !got.Equal(startA) {
+		t.Errorf("row start_date = %v, want the detail's StartDate %v", got, startA)
+	}
+	// The webhook NEVER writes the cursor (the poll's watermark).
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v) — the webhook path never writes last_polled_at", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2. a create event TWICE (two POSTs, same activity id) → exactly ONE post
+//    (the second worker's INSERT is a DO NOTHING → 0 rows → no post — the
+//    rows-affected gate, the concurrency-safe dedupe).
+// ---------------------------------------------------------------------------
+
+func TestWebhookDedupe(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+	body := `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`
+
+	if code := postWebhook(t, s, body, done); code != http.StatusOK {
+		t.Fatalf("first event = %d, want 200", code)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Fatalf("after the first event: %d posts, want exactly 1", n)
+	}
+	// The duplicate delivery (Strava's documented duplicates arrive close
+	// together): the second worker's INSERT is a DO NOTHING → 0 rows → no
+	// post (the rows-affected gate — the unique constraint does the work,
+	// the rows-affected check is the gate).
+	if code := postWebhook(t, s, body, done); code != http.StatusOK {
+		t.Fatalf("duplicate event = %d, want 200", code)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("after the duplicate = %d posts, want still 1 (the second worker's INSERT is a DO NOTHING → 0 rows → no post)", n)
+	}
+	if n := seenCount(t, pool, aid); n != 1 {
+		t.Errorf("seen rows = %d, want exactly 1", n)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPosted || retries != 0 {
+		t.Errorf("row = %q retries %d, want posted/0 (the terminal row is never overwritten)", status, retries)
+	}
+	if n := stub.detailCalls; n != 2 {
+		t.Errorf("detail calls = %d, want 2 (both workers fetch; the dedupe is at the WRITE, not the fetch)", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 3. a create event, then an update event for the same id AFTER the first
+//    posted → the second is ABSORBED (the terminal row → no re-post, no
+//    re-evaluation — the no-re-post / no-re-evaluation invariant).
+// ---------------------------------------------------------------------------
+
+func TestWebhookCreateAfterPostedAbsorbed(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Fatalf("after the create: %d posts, want exactly 1", n)
+	}
+	if status, _ := seenRow(t, pool, aid, 555); status != statusPosted {
+		t.Fatalf("row = %q, want posted (the create event posted it)", status)
+	}
+	// Then the update event: ABSORBED (the terminal row → no re-post, no
+	// re-evaluation — the row is never overwritten).
+	if code := postWebhook(t, s, `{"aspect_type":"update","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("update event = %d, want 200", code)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("after the update = %d posts, want still 1 (the terminal row absorbs — no re-post)", n)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPosted || retries != 0 {
+		t.Errorf("row = %q retries %d, want posted/0 (the terminal row is never overwritten)", status, retries)
+	}
+	if n := stub.detailCalls; n != 2 {
+		t.Errorf("detail calls = %d, want 2 (the update is fetched; the ABSORPTION is at the write)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. a create event → pending (stub isProcessing), then an update event →
+//    the pending row RESOLVES to posted (the pending→terminal UPDATE path),
+//    one post; start_date stays the first-creation value.
+// ---------------------------------------------------------------------------
+
+func TestWebhookUpdateResolvesPending(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return processingAct(id, startA), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	// The create event → a pending row, no post.
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPending || retries != 0 {
+		t.Fatalf("row = %q retries %d, want pending/0 (still processing)", status, retries)
+	}
+	if got := seenStartDate(t, pool, aid, 555); got.IsZero() || !got.Equal(startA) {
+		t.Fatalf("row start_date = %v, want the detail's StartDate %v (never the zero time — the start_date rule)", got, startA)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Fatalf("after the create: %d posts, want zero (pending)", n)
+	}
+	// The update event → the pending row resolves to posted (the
+	// pending→terminal UPDATE path), one post.
+	stub.detailFn = func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil }
+	if code := postWebhook(t, s, `{"aspect_type":"update","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("update event = %d, want 200", code)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPosted || retries != 0 {
+		t.Errorf("row = %q retries %d, want posted/0 (resolved on its first re-fetch)", status, retries)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("after the update = %d posts, want exactly 1 (the pending→terminal resolution posts)", n)
+	}
+	if got := seenStartDate(t, pool, aid, 555); !got.Equal(startA) {
+		t.Errorf("row start_date = %v, want UNCHANGED %v (the UPDATE does not touch it — set at first creation)", got, startA)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 5. a 401 AND a 401 refresh (genuinely revoked — the REFRESH failure is
+//    what sets the flag, per the refresh-and-retry arm) → needs_reauth=TRUE,
+//    no seen row, no post, the cursor unchanged. No further retries inside
+//    the worker (the next event or the next poll tick is the retry).
+// ---------------------------------------------------------------------------
+
+func TestWebhook401RefreshFailsSetsFlag(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) { return Activity{}, ErrUnauthorized{Why: "revoked"} },
+		refreshFn: func() (string, string, time.Time, error) {
+			return "", "", time.Time{}, ErrUnauthorized{Why: "invalid_grant"}
+		},
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	if !needsReauthAt(t, pool, aid) {
+		t.Error("needs_reauth = false, want TRUE (the refresh 401s — genuinely revoked — the refresh failure is what sets the flag)")
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (no seen row on the 401 arm)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v) — the 401 arm never writes last_polled_at", got, WINDOW)
+	}
+	if n := stub.detailCalls; n != 1 {
+		t.Errorf("detail calls = %d, want exactly 1 (no further retries inside the worker — the next event or the next poll tick is the retry)", n)
+	}
+	if n := stub.refreshCalls; n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. a 401 with a SUCCEEDING refresh (an EXPIRED token — the bot was down
+//    >= 6h; Strava tokens last 6h — NOT a revoked one: a bare flag would
+//    conflate the two and permanently disable the athlete until manual
+//    re-consent) → refresh + retry ONCE → the fetch succeeds, the post
+//    happens, needs_reauth stays FALSE, and the ROTATED refresh token is
+//    persisted in the athlete row (or the token chain dies).
+// ---------------------------------------------------------------------------
+
+func TestWebhook401RefreshSucceeds(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	var fetches int
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) {
+			fetches++
+			if fetches == 1 {
+				return Activity{}, ErrUnauthorized{Why: "expired"} // the 401 → refresh + retry
+			}
+			return readyAct(id, startA, 42300), nil // the retry succeeds
+		},
+		refreshFn: func() (string, string, time.Time, error) {
+			return "waccess", "wrefresh", time.Now().UTC().Add(6 * time.Hour), nil
+		},
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	if n := fetches; n != 2 {
+		t.Fatalf("detail fetches = %d, want exactly 2 (the 401 + the ONE retry — the loop guard)", n)
+	}
+	if n := stub.refreshCalls; n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+	if needsReauthAt(t, pool, aid) {
+		t.Error("needs_reauth = true, want FALSE (an expired token refreshes — it is not revoked)")
+	}
+	// The ROTATED pair persisted (the new refresh token MUST be
+	// re-persisted or the token chain dies).
+	_, access, refresh, _, _, ok := athleteRowState(t, pool, 777)
+	if !ok {
+		t.Fatal("no athlete row")
+	}
+	if access != "waccess" {
+		t.Errorf("access_token = %q, want 'waccess' (the NEW access token — the exact column)", access)
+	}
+	if refresh != "wrefresh" {
+		t.Errorf("refresh_token = %q, want the ROTATED 'wrefresh' (the chain dies without it)", refresh)
+	}
+	var expiresAt time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT token_expires_at FROM strava_athletes WHERE id=$1`, aid).Scan(&expiresAt); err != nil {
+		t.Fatalf("read token_expires_at: %v", err)
+	}
+	want := time.Now().UTC().Add(6 * time.Hour) // the stub's returned expiry
+	d := expiresAt.Sub(want)
+	if d < 0 {
+		d = -d
+	}
+	if d > 5*time.Minute {
+		t.Errorf("token_expires_at = %v, want ≈ now+6h (%v)", expiresAt, want)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("captured %d posts, want exactly 1 (the retry fetch succeeded → the post happens)", n)
+	}
+	if status, _ := seenRow(t, pool, aid, 555); status != statusPosted {
+		t.Errorf("row = %q, want posted", status)
+	}
+	got := cursorAt(t, pool, aid)
+	if !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6b. a 401 where a CONCURRENT rotation (the poll's step-a, another worker
+//     — the near-expiry window) rotates the stored refresh token between the
+//     worker's snapshot and the worker's refresh → the refresh 401s
+//     (invalid_grant — Strava answers 401 for the rotated-away token) but
+//     the athlete is HEALTHY → NO needs_reauth flag (a spurious flag would
+//     disable a healthy athlete until manual re-consent: loadAthletes filters
+//     flagged rows out). The invariant: a failed refresh whose refresh_token
+//     no longer matches the stored one → NO flag.
+// ---------------------------------------------------------------------------
+
+func TestWebhook401ConcurrentRotationNoFlag(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	// Pre-set the stored refresh token to X (the "before" value — the seed's
+	// 'rtok' would work too; X is explicit about the rotation X → Y).
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE strava_athletes SET refresh_token = 'X' WHERE id = $1`, aid); err != nil {
+		t.Fatalf("pre-set refresh token: %v", err)
+	}
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) { return Activity{}, ErrUnauthorized{Why: "expired"} },
+		refreshFn: func() (string, string, time.Time, error) {
+			// The "other source" (the poll's step-a / another worker) rotates
+			// the stored pair X → Y between the worker's snapshot and the
+			// worker's refresh — the deterministic simulation of the race.
+			if _, err := pool.Exec(context.Background(),
+				`UPDATE strava_athletes SET refresh_token = 'Y' WHERE id = $1`, aid); err != nil {
+				return "", "", time.Time{}, err
+			}
+			// The worker's refresh with the rotated-away X then fails
+			// (invalid_grant — Strava answers 401 for a rotated-away token).
+			return "", "", time.Time{}, ErrUnauthorized{Why: "invalid_grant"}
+		},
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	// The stored refresh token (Y) no longer equals the value the failed
+	// attempt used (X) → someone else already rotated it → NO flag (the
+	// athlete is healthy — a spurious flag would disable it until manual
+	// re-consent).
+	if needsReauthAt(t, pool, aid) {
+		t.Error("needs_reauth = true, want FALSE (the stored token rotated concurrently — the 401 was a stale-snapshot artifact, not a revocation)")
+	}
+	// The stored token is the CONCURRENT source's Y (the worker's FAILED
+	// refresh persisted nothing — only a SUCCESS refresh persists the pair).
+	_, _, refresh, _, _, ok := athleteRowState(t, pool, 777)
+	if !ok {
+		t.Fatal("no athlete row")
+	}
+	if refresh != "Y" {
+		t.Errorf("refresh_token = %q, want 'Y' (the concurrent source's rotation — the failed refresh persisted nothing)", refresh)
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (no seen row on the 401 arm)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v) — the 401 arm never writes last_polled_at", got, WINDOW)
+	}
+	if n := stub.detailCalls; n != 1 {
+		t.Errorf("detail calls = %d, want exactly 1 (no further retries inside the worker)", n)
+	}
+	if n := stub.refreshCalls; n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6c. a 401 where the refresh SUCCEEDS (an EXPIRED token — refresh + retry)
+//     but the RETRY fetch 401s (the explicit loop guard — the refresh did not
+//     cure it) → the same arm as a 401 refresh: lastRefresh = newRefresh (the
+//     value the worker JUST persisted — the stored token still equals it when
+//     no concurrent rotation landed after the persist) → the atomic UPDATE …
+//     WHERE refresh_token = newRefresh matches → needs_reauth=TRUE (the token
+//     is genuinely revoked — the refresh did not cure the 401). The ROTATED
+//     refresh token is persisted (or the token chain dies).
+// ---------------------------------------------------------------------------
+
+func TestWebhook401RetryFailsSetsFlag(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	// Pre-set the stored refresh token to X (the seed's 'rtok' would work too;
+	// X is explicit about the rotation X → newRefresh the worker persists).
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE strava_athletes SET refresh_token = 'X' WHERE id = $1`, aid); err != nil {
+		t.Fatalf("pre-set refresh token: %v", err)
+	}
+	var fetches int
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) {
+			fetches++
+			return Activity{}, ErrUnauthorized{Why: "revoked"} // 401 on BOTH the first + the retry
+		},
+		refreshFn: func() (string, string, time.Time, error) {
+			return "waccess", "wrefresh", time.Now().UTC().Add(6 * time.Hour), nil
+		},
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	// The worker reloaded ath (refresh_token = X), the refresh SUCCEEDED → the
+	// worker persisted the ROTATED pair (refresh_token = newRefresh = 'wrefresh'),
+	// then the RETRY fetch 401s → reauthWebhook(ctx, ath, newRefresh): the stored
+	// token IS newRefresh (the worker just persisted it) → the atomic UPDATE …
+	// WHERE refresh_token = newRefresh matches (RowsAffected == 1) → flag set.
+	if !needsReauthAt(t, pool, aid) {
+		t.Error("needs_reauth = false, want TRUE (the refresh did not cure the 401 — the retry also 401s → genuinely revoked)")
+	}
+	// The ROTATED refresh token is persisted (the chain dies without it).
+	_, access, refresh, _, _, ok := athleteRowState(t, pool, 777)
+	if !ok {
+		t.Fatal("no athlete row")
+	}
+	if refresh != "wrefresh" {
+		t.Errorf("refresh_token = %q, want 'wrefresh' (the ROTATED newRefresh the worker persisted — the chain dies without it)", refresh)
+	}
+	if access != "waccess" {
+		t.Errorf("access_token = %q, want 'waccess' (the NEW access token)", access)
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (no seen row on the 401 arm)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v) — the 401 arm never writes last_polled_at", got, WINDOW)
+	}
+	if n := fetches; n != 2 {
+		t.Errorf("detail calls = %d, want exactly 2 (the 401 + the ONE retry — the loop guard)", n)
+	}
+	if n := stub.refreshCalls; n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6d. a 401 where the refresh SUCCEEDS and the RETRY fetch 401s, but a
+//     CONCURRENT rotation (the poll's step-a, another worker) rotates the
+//     stored refresh token to a THIRD value Z AFTER the worker persisted
+//     newRefresh → the atomic UPDATE … WHERE refresh_token = newRefresh
+//     matches 0 rows (the stored token is now Z, not newRefresh) → NO
+//     needs_reauth flag (the athlete is HEALTHY — a spurious flag would disable
+//     it until manual re-consent: loadAthletes filters flagged rows out).
+// ---------------------------------------------------------------------------
+
+func TestWebhook401RetryFailsConcurrentRotationNoFlag(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	// Pre-set the stored refresh token to X (the seed's 'rtok' would work too;
+	// X is explicit about the rotation X → newRefresh → Z).
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE strava_athletes SET refresh_token = 'X' WHERE id = $1`, aid); err != nil {
+		t.Fatalf("pre-set refresh token: %v", err)
+	}
+	var fetches int
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) {
+			fetches++
+			if fetches == 1 {
+				return Activity{}, ErrUnauthorized{Why: "expired"} // the 401 → refresh + retry
+			}
+			// The RETRY (fetch 2) lands AFTER the worker persisted newRefresh:
+			// a concurrent source (the poll's step-a / another worker) rotates
+			// the stored pair to a THIRD value Z — the deterministic simulation
+			// of the race — then the retry 401s.
+			if _, err := pool.Exec(context.Background(),
+				`UPDATE strava_athletes SET refresh_token = 'Z' WHERE id = $1`, aid); err != nil {
+				return Activity{}, err
+			}
+			return Activity{}, ErrUnauthorized{Why: "revoked"}
+		},
+		refreshFn: func() (string, string, time.Time, error) {
+			return "waccess", "wrefresh", time.Now().UTC().Add(6 * time.Hour), nil
+		},
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	// The worker persisted newRefresh ('wrefresh'), then the concurrent source
+	// rotated the stored token to Z (the retry call), then the retry 401s →
+	// reauthWebhook(ctx, ath, newRefresh): the stored token is now Z, NOT
+	// newRefresh → the atomic UPDATE … WHERE refresh_token = newRefresh matches
+	// 0 rows → NO flag (the athlete is healthy — a spurious flag would disable
+	// it until manual re-consent).
+	if needsReauthAt(t, pool, aid) {
+		t.Error("needs_reauth = true, want FALSE (the stored token rotated concurrently to Z after the persist — the 401 was a stale-snapshot artifact, not a revocation)")
+	}
+	// The stored token is the CONCURRENT source's Z (it landed AFTER the
+	// worker persisted newRefresh — the worker's persist is the loser's write).
+	_, _, refresh, _, _, ok := athleteRowState(t, pool, 777)
+	if !ok {
+		t.Fatal("no athlete row")
+	}
+	if refresh != "Z" {
+		t.Errorf("refresh_token = %q, want 'Z' (the concurrent source's rotation — it landed after the worker persisted newRefresh)", refresh)
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (no seen row on the 401 arm)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v) — the 401 arm never writes last_polled_at", got, WINDOW)
+	}
+	if n := fetches; n != 2 {
+		t.Errorf("detail calls = %d, want exactly 2 (the 401 + the ONE retry — the loop guard)", n)
+	}
+	if n := stub.refreshCalls; n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7. a 404 (gone) → NO seen row (the start_date rule: a gone outcome has no
+//    valid detail — a zero start_date on a pending row would poison the poll
+//    cursor's min(pending) hold), no post, 200. The poll's gone arm creates
+//    the skipped row on its next tick (the backstop, decision 0013).
+// ---------------------------------------------------------------------------
+
+func TestWebhookGoneNoRow(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) { return Activity{}, ErrGone{} },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200 (a gone outcome is a 200 — the poll backstop covers it)", code)
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (a gone outcome has no valid detail — the start_date rule)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8. a 429 (transient) → NO seen row (same rule; the poll's 429 arm creates
+//    the pending row with the real summary start_date), no post, 200.
+// ---------------------------------------------------------------------------
+
+func TestWebhookTransientNoRow(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(_ int64) (Activity, error) { return Activity{}, ErrRateLimited{RetryAfter: "60"} },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200 (a transient outcome is a 200 — the poll backstop covers it)", code)
+	}
+	if n := seenCount(t, pool, aid); n != 0 {
+		t.Errorf("seen rows = %d, want zero (a transient outcome has no valid detail — the start_date rule)", n)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero", n)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", got, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 9. isProcessing → a pending row, no post, and start_date = the detail's
+//    StartDate (asserted NOT the zero time — the start_date rule pin).
+// ---------------------------------------------------------------------------
+
+func TestWebhookProcessingHolds(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return processingAct(id, startA), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+
+	if code := postWebhook(t, s, `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("create event = %d, want 200", code)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPending || retries != 0 {
+		t.Fatalf("row = %q retries %d, want pending/0 (still processing)", status, retries)
+	}
+	got := seenStartDate(t, pool, aid, 555)
+	if got.IsZero() {
+		t.Fatal("row start_date is the ZERO time — the start_date rule pin: a pending row's start_date is the detail's StartDate, never the zero time")
+	}
+	if !got.Equal(startA) {
+		t.Errorf("row start_date = %v, want the detail's StartDate %v", got, startA)
+	}
+	if n := len(caps.posts); n != 0 {
+		t.Errorf("captured %d posts, want zero (pending)", n)
+	}
+	if gotC := cursorAt(t, pool, aid); !gotC.Equal(WINDOW) {
+		t.Errorf("cursor = %v, want unchanged (%v)", gotC, WINDOW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10. the poll path posts an activity (the existing poll test machinery),
+//     then a webhook update event for the same id → ABSORBED (no re-post —
+//     cross-source dedupe via the terminal row).
+// ---------------------------------------------------------------------------
+
+func TestWebhookNoRepostAcrossSources(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		listFn: func(_ time.Time) ([]Summary, error) {
+			return []Summary{{ID: 555, SportType: "Run", StartDate: startA}}, nil
+		},
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+
+	// The poll path posts the activity (the existing poll test machinery).
+	if err := s.iteration(context.Background()); err != nil {
+		t.Fatalf("poll pass: %v", err)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Fatalf("poll pass: %d posts, want exactly 1", n)
+	}
+	if status, _ := seenRow(t, pool, aid, 555); status != statusPosted {
+		t.Fatalf("row = %q, want posted (the poll posted it)", status)
+	}
+	// Then the webhook update event for the same id → ABSORBED (cross-source
+	// dedupe via the terminal row — no re-post, no re-evaluation).
+	done := installRealWorker(s)
+	if code := postWebhook(t, s, `{"aspect_type":"update","object_type":"activity","object_id":555,"owner_id":777}`, done); code != http.StatusOK {
+		t.Fatalf("update event = %d, want 200", code)
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("total posts = %d, want still 1 (the webhook's terminal row absorbs — no re-post)", n)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPosted || retries != 0 {
+		t.Errorf("row = %q retries %d, want posted/0 (the terminal row is never overwritten)", status, retries)
+	}
+	if n := stub.detailCalls; n != 2 {
+		t.Errorf("detail calls = %d, want 2 (the poll fetch + the webhook fetch — the ABSORPTION is at the write)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. two goroutines POST the same create event SIMULTANEOUSLY (both workers
+//     fetch the detail, both attempt the INSERT) → exactly ONE post (the
+//     rows-affected gate — the concurrency-safe dedupe under READ COMMITTED:
+//     the second worker's INSERT is a DO NOTHING → 0 rows → no double post).
+// ---------------------------------------------------------------------------
+
+func TestWebhookConcurrentDuplicates(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete2(t, pool, "Web", 777, 42, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 42300), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 0)
+	done := installRealWorker(s)
+	body := `{"aspect_type":"create","object_type":"activity","object_id":555,"owner_id":777}`
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = doWebhook(t, s, body)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < 2; i++ {
+		waitForJob(t, done) // both jobs completed (one posts, one is deduped)
+	}
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("event %d = %d, want 200", i, c)
+		}
+	}
+	if n := len(caps.posts); n != 1 {
+		t.Errorf("captured %d posts, want exactly 1 (the rows-affected gate — the concurrency-safe dedupe under READ COMMITTED: the second worker's INSERT is a DO NOTHING → 0 rows → no double post)", n)
+	}
+	if n := seenCount(t, pool, aid); n != 1 {
+		t.Errorf("seen rows = %d, want exactly 1", n)
+	}
+	if status, retries := seenRow(t, pool, aid, 555); status != statusPosted || retries != 0 {
+		t.Errorf("row = %q retries %d, want posted/0", status, retries)
+	}
+	if n := stub.detailCalls; n != 2 {
+		t.Errorf("detail calls = %d, want 2 (both workers fetch; the dedupe is at the write)", n)
 	}
 }

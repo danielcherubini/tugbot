@@ -60,6 +60,13 @@ type Config struct {
 	// value fails the whole config load, by design).
 	StravaPollMinutes int
 
+	// StravaWebhookVerifyToken (STRAVA_WEBHOOK_VERIFY_TOKEN) is the Strava
+	// webhook verification token (the hub.verify_token the subscribe GET
+	// must carry to be echoed). Optional: absent/empty = the verification
+	// GET 403s (feature off); set = the handshake is enabled. A plain string
+	// like StravaSharedThreadID — NO LoadError path.
+	StravaWebhookVerifyToken string
+
 	// MCPPort is the MCP bridge's Streamable-HTTP listen port, read from
 	// TUGBOT_MCP_PORT. Always-on (no enabled flag). Default: 8642. Unlike
 	// the ID-list vars (whose malformed parts are skipped), a mistyped port
@@ -151,20 +158,21 @@ func LoadConfig() (*Config, error) {
 	derpies := parseIDList(os.Getenv("TUGBOT_DERPIES_USER_IDS"))
 
 	return &Config{
-		Token:                 token,
-		ApplicationID:         appIDStr,
-		DatabaseURL:           dbURL,
-		AdminUserID:           adminUserID,
-		CooldownExemptUserIDs: exempt,
-		SlowUserIDs:           slow,
-		DerpiesUserIDs:        derpies,
-		StravaClientID:        os.Getenv("STRAVA_CLIENT_ID"),
-		StravaClientSecret:    os.Getenv("STRAVA_CLIENT_SECRET"),
-		StravaSharedThreadID:  parseID(os.Getenv("STRAVA_SHARED_THREAD_ID")),
-		StravaPollMinutes:     stravaPoll,
-		MCPPort:               mcpPort,
-		SkillsDir:             parseSkillsDir(os.Getenv("TUGBOT_SKILLS_DIR")),
-		LogLevel:              parseLogLevel(os.Getenv("RUST_LOG")),
+		Token:                    token,
+		ApplicationID:            appIDStr,
+		DatabaseURL:              dbURL,
+		AdminUserID:              adminUserID,
+		CooldownExemptUserIDs:    exempt,
+		SlowUserIDs:              slow,
+		DerpiesUserIDs:           derpies,
+		StravaClientID:           os.Getenv("STRAVA_CLIENT_ID"),
+		StravaClientSecret:       os.Getenv("STRAVA_CLIENT_SECRET"),
+		StravaSharedThreadID:     parseID(os.Getenv("STRAVA_SHARED_THREAD_ID")),
+		StravaPollMinutes:        stravaPoll,
+		StravaWebhookVerifyToken: os.Getenv("STRAVA_WEBHOOK_VERIFY_TOKEN"),
+		MCPPort:                  mcpPort,
+		SkillsDir:                parseSkillsDir(os.Getenv("TUGBOT_SKILLS_DIR")),
+		LogLevel:                 parseLogLevel(os.Getenv("RUST_LOG")),
 	}, nil
 }
 

@@ -21,20 +21,21 @@ func setEnv(t *testing.T, vars map[string]string) {
 // Note: t.Setenv cannot unset; we point them at "".
 func validEnv() map[string]string {
 	return map[string]string{
-		"DISCORD_TOKEN":            "tok",
-		"APPLICATION_ID":           "12345",
-		"DATABASE_URL":             "postgres://u:p@localhost:5432/db",
-		"ADMIN_USER_ID":            "",
-		"COOLDOWN_EXEMPT_USER_IDS": "",
-		"SLOW_USER_IDS":            "",
-		"TUGBOT_DERPIES_USER_IDS":  "",
-		"TUGBOT_SKILLS_DIR":        "",
-		"RUST_LOG":                 "",
-		"TUGBOT_MCP_PORT":          "",
-		"STRAVA_CLIENT_ID":         "",
-		"STRAVA_CLIENT_SECRET":     "",
-		"STRAVA_SHARED_THREAD_ID":  "",
-		"STRAVA_POLL_MINUTES":      "",
+		"DISCORD_TOKEN":               "tok",
+		"APPLICATION_ID":              "12345",
+		"DATABASE_URL":                "postgres://u:p@localhost:5432/db",
+		"ADMIN_USER_ID":               "",
+		"COOLDOWN_EXEMPT_USER_IDS":    "",
+		"SLOW_USER_IDS":               "",
+		"TUGBOT_DERPIES_USER_IDS":     "",
+		"TUGBOT_SKILLS_DIR":           "",
+		"RUST_LOG":                    "",
+		"TUGBOT_MCP_PORT":             "",
+		"STRAVA_CLIENT_ID":            "",
+		"STRAVA_CLIENT_SECRET":        "",
+		"STRAVA_SHARED_THREAD_ID":     "",
+		"STRAVA_POLL_MINUTES":         "",
+		"STRAVA_WEBHOOK_VERIFY_TOKEN": "",
 	}
 }
 
@@ -345,7 +346,7 @@ func TestLoadConfigMalformedMCPPort(t *testing.T) {
 }
 
 func TestLoadConfigStravaDefaults(t *testing.T) {
-	// All four strava vars unset: the handler no-ops; LoadConfig must
+	// All five strava vars unset: the handler no-ops; LoadConfig must
 	// still succeed (selftest-safe — no required-status change).
 	vars := validEnv()
 	setEnv(t, vars)
@@ -365,6 +366,9 @@ func TestLoadConfigStravaDefaults(t *testing.T) {
 	if cfg.StravaPollMinutes != 15 {
 		t.Errorf("StravaPollMinutes = %d, want 15 (unset default)", cfg.StravaPollMinutes)
 	}
+	if cfg.StravaWebhookVerifyToken != "" {
+		t.Errorf("StravaWebhookVerifyToken = %q, want empty (unset)", cfg.StravaWebhookVerifyToken)
+	}
 }
 
 func TestLoadConfigStravaSet(t *testing.T) {
@@ -373,6 +377,7 @@ func TestLoadConfigStravaSet(t *testing.T) {
 	vars["STRAVA_CLIENT_SECRET"] = "xyz"
 	vars["STRAVA_SHARED_THREAD_ID"] = "100"
 	vars["STRAVA_POLL_MINUTES"] = "30"
+	vars["STRAVA_WEBHOOK_VERIFY_TOKEN"] = "v-token"
 	setEnv(t, vars)
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -389,6 +394,9 @@ func TestLoadConfigStravaSet(t *testing.T) {
 	}
 	if cfg.StravaPollMinutes != 30 {
 		t.Errorf("StravaPollMinutes = %d, want 30", cfg.StravaPollMinutes)
+	}
+	if cfg.StravaWebhookVerifyToken != "v-token" {
+		t.Errorf("StravaWebhookVerifyToken = %q, want %q", cfg.StravaWebhookVerifyToken, "v-token")
 	}
 }
 
