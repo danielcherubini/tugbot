@@ -1,5 +1,12 @@
 
 
+## 2026-10-01
+
+### strava: 0.0 km activities are skipped, never posted (the distance floor)
+- Observed (2026-10-01, Discord): a battery of `X finished 0.0 km Ride` / `0.0 km VirtualRide` posts — degenerate activities (a virtual ride with no recorded route, a test upload, a sensor glitch) where Strava reports a zero distance. The family gate admitted them (Ride / VirtualRide are in-family) and `formatNoun`'s non-finite/negative zeroing turned the distance into a literal `0.0 km` post.
+- Changed: `decideActivity` (the one decision function shared by the poll path AND the webhook worker) gains a distance floor after the in-family gate: a ready detail whose distance is below **50 m** (or non-finite — NaN / +/-Inf) is dispositioned `skipped` with the new `zero-distance` reason, never posted. The 50 m value is the exact `0.0 km` display boundary: `formatNoun`'s < 100 km branch is `%.1f km`, and `%.1f` rounds anything under 50 m to `0.0` (50 m itself prints `0.1 km` — the float64 0.05 is stored slightly above 0.05 and rounds up), so the floor is precisely "would not print 0.0 km". The gate is on the DETAIL's distance (the list `Summary` carries no distance — a 0 m activity still costs one detail fetch, the same profile as an out-of-family family hit). A carried `pending` row whose detail arrives 0 m is skipped terminal in the same UPDATE (no `retries` increment — the 75-min age budget stays for genuinely stuck fetches), and the webhook worker's per-event transaction persists the skip identically (the shared `decideActivity` is the single decision point; the poll's step-c no-target log and the webhook's disposition log surface the reason unchanged).
+- Code: `internal/handlers/strava/decide.go` (`reasonZeroDistance` + `minPostDistanceM` + `hasPostableDistance` + the new `decideActivity` arm), `decide_test.go` (+5: the 0 m VirtualRide pin, the 49 m / 50 m boundary pins, the NaN and +Inf non-finite pins), `strava_test.go` (TestFormatNoun +2 boundary cases), `strava_integration_test.go` (+1: the 0 m activity is skipped with no post and the cursor advances — a skip is terminal, not a hold). Docs: `docs/features/strava.md` (the per-new-activity, carried-pending, and dispositions paragraphs).
+
 ## 2026-09-21
 
 ### strava: self-serve onboarding — /strava command + :8643 in-process callback (decision 0012)

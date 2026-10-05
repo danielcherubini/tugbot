@@ -5,6 +5,7 @@
 package strava
 
 import (
+	"math"
 	"testing"
 
 	"github.com/danielcherubini/tugbot/internal/app"
@@ -114,6 +115,65 @@ func TestDecideReadyEmptySportType(t *testing.T) {
 	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: ""}), 42)
 	if d.status != statusSkipped || d.reason != reasonOutOfFamily || d.post != nil {
 		t.Fatalf("d = %+v, want skipped / reason %q / nil post", d, reasonOutOfFamily)
+	}
+}
+
+// TestDecideReadyZeroDistance pins the distance floor: a ready in-family
+// detail with distance 0 (the degenerate virtual-ride / test-upload class
+// — the "0.0 km Ride" post) → skipped/"zero-distance", no post.
+func TestDecideReadyZeroDistance(t *testing.T) {
+	s := newDecideStrava(9001)
+	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: "VirtualRide", Distance: 0}), 42)
+	if d.status != statusSkipped || d.reason != reasonZeroDistance || d.post != nil {
+		t.Fatalf("d = %+v, want skipped / reason %q / nil post", d, reasonZeroDistance)
+	}
+}
+
+// TestDecideReadySubFloorDistance pins the floor's lower edge: 49 m (the
+// largest value that formats as "0.0 km" — formatNoun's < 100 km branch
+// is %.1f, and 0.049 rounds to 0.0) → skipped/"zero-distance".
+func TestDecideReadySubFloorDistance(t *testing.T) {
+	s := newDecideStrava(9001)
+	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: "Ride", Distance: 49}), 42)
+	if d.status != statusSkipped || d.reason != reasonZeroDistance || d.post != nil {
+		t.Fatalf("d = %+v, want skipped / reason %q / nil post", d, reasonZeroDistance)
+	}
+}
+
+// TestDecideReadyAtFloorDistance pins the floor's upper edge: exactly 50 m
+// (the smallest value that does NOT format as "0.0 km" — it prints
+// "0.1 km") → posted, with the post's noun reflecting the 50 m distance.
+func TestDecideReadyAtFloorDistance(t *testing.T) {
+	s := newDecideStrava(9001)
+	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: "Ride", Title: "Short", Distance: 50}), 42)
+	if d.status != statusPosted || d.reason != "" || d.post == nil {
+		t.Fatalf("d = %+v, want posted / reason '' / non-nil post", d)
+	}
+	want := buildPost("Matt", `"Short" (0.1 km Ride)`, "42")
+	if d.post.message != want {
+		t.Errorf("post.message = %q, want %q", d.post.message, want)
+	}
+}
+
+// TestDecideReadyNaNDistance pins the non-finite arm: a NaN distance
+// (would format as "0.0 km" via formatNoun's zeroing) → skipped/
+// "zero-distance".
+func TestDecideReadyNaNDistance(t *testing.T) {
+	s := newDecideStrava(9001)
+	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: "Run", Distance: math.NaN()}), 42)
+	if d.status != statusSkipped || d.reason != reasonZeroDistance || d.post != nil {
+		t.Fatalf("d = %+v, want skipped / reason %q / nil post", d, reasonZeroDistance)
+	}
+}
+
+// TestDecideReadyInfDistance pins the non-finite arm: a +Inf distance
+// (would format as "0.0 km" via formatNoun's zeroing) → skipped/
+// "zero-distance".
+func TestDecideReadyInfDistance(t *testing.T) {
+	s := newDecideStrava(9001)
+	d := s.decideActivity(athWithTarget(42), fetchReady(Activity{ID: 123, SportType: "Run", Distance: math.Inf(1)}), 42)
+	if d.status != statusSkipped || d.reason != reasonZeroDistance || d.post != nil {
+		t.Fatalf("d = %+v, want skipped / reason %q / nil post", d, reasonZeroDistance)
 	}
 }
 

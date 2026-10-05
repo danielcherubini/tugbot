@@ -157,6 +157,11 @@ func TestFormatNoun(t *testing.T) {
 		{"142 km MountainBikeRide", act(142000, "MountainBikeRide"), "142 km MountainBikeRide"},
 		{"143 km round half up", act(142500, "MountainBikeRide"), "143 km MountainBikeRide"},
 		{"99.8 km Ride (under-100 branch)", act(99800, "Ride"), "99.8 km Ride"},
+		// the distance floor's display boundary: the float64 50 m = 0.05 km
+		// is stored slightly ABOVE 0.05 (0.05000000000000000277…), so it
+		// rounds UP to 0.1; 49 m = 0.049 rounds to 0.0.
+		{"50 m → 0.1 km (floor boundary)", act(50, "Ride"), "0.1 km Ride"},
+		{"49 m → 0.0 km (below the floor)", act(49, "Ride"), "0.0 km Ride"},
 		{"exactly 100.0 km flips branch", act(100000, "Ride"), "100 km Ride"},
 		// non-finite / negative → 0.0 (NaN, +Inf, negative all map to 0 metres).
 		{"NaN → 0.0 km", act(math.NaN(), "Run"), "0.0 km Run"},

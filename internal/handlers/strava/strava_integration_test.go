@@ -404,6 +404,40 @@ func TestStravaPassPostsNewFamily(t *testing.T) {
 	}
 }
 
+// TestStravaPassSkipsZeroDistance pins the distance floor end-to-end: a
+// ready in-family detail with distance 0 (the degenerate virtual-ride /
+// test-upload class) is dispositioned 'skipped' and NEVER posted — the
+// "0.0 km" post the filter exists to suppress. The cursor still advances
+// (a skip is a terminal disposition, not a pending hold).
+func TestStravaPassSkipsZeroDistance(t *testing.T) {
+	pool := setupStravaTestDB(t)
+	now := time.Now().UTC()
+	WINDOW := muTime(now.Add(-2 * time.Hour))
+	startA := muTime(now.Add(-90 * time.Minute))
+
+	aid := seedAthlete(t, pool, 9001, WINDOW, 6*time.Hour)
+	stub := &stubStrava{
+		listFn: func(_ time.Time) ([]Summary, error) {
+			return []Summary{{ID: 1, SportType: "VirtualRide", StartDate: startA}}, nil
+		},
+		detailFn: func(id int64) (Activity, error) { return readyAct(id, startA, 0), nil },
+	}
+	s, caps := newTestStrava(t, pool, stub, 9001)
+
+	if err := s.iteration(context.Background()); err != nil {
+		t.Fatalf("iteration: %v", err)
+	}
+	if len(caps.posts) != 0 {
+		t.Fatalf("captured %d posts, want 0 (the 0 m activity is never posted)", len(caps.posts))
+	}
+	if status, _ := seenRow(t, pool, aid, 1); status != statusSkipped {
+		t.Errorf("row = %q, want %q", status, statusSkipped)
+	}
+	if got := cursorAt(t, pool, aid); !got.Equal(startA) {
+		t.Errorf("cursor = %v, want %v (the skip is terminal, not a hold)", got, startA)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 2. re-posts never happen (the ON CONFLICT DO NOTHING dedupe)
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ package strava
 
 import (
 	"errors"
+	"math"
 )
 
 // The skipped reasons (the seen table's status CHECK values are pending /
@@ -15,10 +16,28 @@ import (
 // pending/posted — a decision value the caller persists, never a
 // decideActivity output the poll path writes).
 const (
-	reasonGone        = "gone"
-	reasonOutOfFamily = "out-of-family"
-	reasonNoTarget    = "no-target"
+	reasonGone         = "gone"
+	reasonOutOfFamily  = "out-of-family"
+	reasonNoTarget     = "no-target"
+	reasonZeroDistance = "zero-distance"
 )
+
+// minPostDistanceM is the distance floor for a postable activity (meters):
+// a ready in-family detail below it (or non-finite) is skipped
+// "zero-distance". The value is the exact "0.0 km" display boundary:
+// formatNoun's < 100 km branch prints %.1f km, and %.1f rounds any
+// distance under 50 m to "0.0" — so the floor is precisely "would not
+// print 0.0 km".
+const minPostDistanceM = 50.0
+
+// hasPostableDistance reports whether the detail's distance is a finite
+// value at or above minPostDistanceM. NaN fails the >= (it would format as
+// "0.0 km" via formatNoun's zeroing) and +/-Inf fail the IsInf arm (the
+// same "0.0 km" via formatNoun's zeroing) — one check covers all three
+// degenerate shapes, mirroring formatNoun's own guard.
+func hasPostableDistance(a Activity) bool {
+	return !math.IsInf(a.Distance, 0) && a.Distance >= minPostDistanceM
+}
 
 // fetchOutcome is the result of one GetActivity fetch: a ready detail or
 // the fetch error class (the client.go typed errors — no new error types).
@@ -88,9 +107,12 @@ func (s *Strava) resolveTarget(ath *athleteRow) int64 {
 //   - still processing → pending (no reason; isProcessing already true in
 //     the outcome).
 //   - ready → the in-family gate on the DETAIL's sport type:
-//     out-of-family → skipped/"out-of-family"; in-family → resolveTarget
-//     (per-athlete thread → STRAVA_SHARED_THREAD_ID → none): no target →
-//     skipped/"no-target"; target present → posted + the post item.
+//     out-of-family → skipped/"out-of-family"; in-family → the distance
+//     floor (a non-finite or < 50 m distance is skipped/"zero-distance" —
+//     it would format as "0.0 km" in the post); a postable distance →
+//     resolveTarget (per-athlete thread → STRAVA_SHARED_THREAD_ID →
+//     none): no target → skipped/"no-target"; target present → posted +
+//     the post item.
 //
 // DOCUMENTED UNIFICATION: the poll's step c (the post-fetch path)
 // historically did NOT re-gate the fetched detail's sport type (the family
@@ -117,6 +139,13 @@ func (s *Strava) decideActivity(ath *athleteRow, out fetchOutcome, actID int64) 
 	// retry gate it; an empty SportType is out-of-family).
 	if !family(out.detail.SportType) {
 		return disposition{status: statusSkipped, reason: reasonOutOfFamily}
+	}
+	// The distance floor: a ready in-family detail whose distance is below
+	// minPostDistanceM (or non-finite) is skipped "zero-distance" — it would
+	// format as "0.0 km" in the post (the degenerate virtual-ride /
+	// test-upload class), so it is never posted.
+	if !hasPostableDistance(out.detail) {
+		return disposition{status: statusSkipped, reason: reasonZeroDistance}
 	}
 	if target := s.resolveTarget(ath); target != 0 {
 		// the post link uses the CALLER's id (not the detail's echoed id —
